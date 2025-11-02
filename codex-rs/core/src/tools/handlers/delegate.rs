@@ -10,12 +10,12 @@ use crate::delegate_tool::DelegateToolEvent;
 use crate::delegate_tool::DelegateToolRequest;
 use crate::delegate_tool::DelegateToolRun;
 use crate::function_tool::FunctionCallError;
-use crate::openai_tools::JsonSchema;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
+use crate::tools::spec::JsonSchema;
 use crate::user_notification::UserNotification;
 use async_trait::async_trait;
 use codex_protocol::ConversationId;
@@ -266,6 +266,7 @@ impl ToolHandler for DelegateToolHandler {
 
             return Ok(ToolOutput::Function {
                 content,
+                content_items: None,
                 success: Some(true),
             });
         }
@@ -311,6 +312,7 @@ impl ToolHandler for DelegateToolHandler {
 
             return Ok(ToolOutput::Function {
                 content,
+                content_items: None,
                 success: Some(true),
             });
         }
@@ -332,6 +334,7 @@ impl ToolHandler for DelegateToolHandler {
 
         Ok(ToolOutput::Function {
             content,
+            content_items: None,
             success: Some(true),
         })
     }

@@ -19,10 +19,10 @@ use codex_core::delegate_tool::DelegateToolEvent as CoreDelegateToolEvent;
 use codex_core::delegate_tool::DelegateToolRequest;
 use codex_core::delegate_tool::DelegateToolRun;
 use codex_core::protocol::EventMsg;
-use codex_core::protocol::InputItem;
 use codex_core::protocol::Op;
 use codex_core::protocol::SessionConfiguredEvent;
 use codex_core::protocol::SessionSource;
+use codex_protocol::user_input::UserInput as InputItem;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
@@ -282,7 +282,7 @@ impl AgentOrchestrator {
 
         let loader = self.loader.clone();
         let auth_manager = self.auth_manager.clone();
-        let session_source = self.session_source;
+        let session_source = self.session_source.clone();
         let cli_overrides = self.cli_overrides.clone();
         let config_overrides = self.config_overrides.clone();
         let orchestrator = Arc::clone(self);

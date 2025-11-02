@@ -3,8 +3,6 @@ use crate::CodexAuth;
 use crate::codex::Codex;
 use crate::codex::CodexSpawnOk;
 use crate::codex::INITIAL_SUBMIT_ID;
-use crate::codex::compact::content_items_to_text;
-use crate::codex::compact::is_session_prefix_message;
 use crate::codex_conversation::CodexConversation;
 use crate::config::Config;
 use crate::delegate_tool::DelegateToolAdapter;
@@ -15,6 +13,7 @@ use crate::protocol::EventMsg;
 use crate::protocol::SessionConfiguredEvent;
 use crate::rollout::RolloutRecorder;
 use codex_protocol::ConversationId;
+use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::RolloutItem;
@@ -86,7 +85,7 @@ impl ConversationManager {
             auth_manager,
             self.delegate_adapter.clone(),
             InitialHistory::New,
-            self.session_source,
+            self.session_source.clone(),
         )
         .await?;
         self.finalize_spawn(codex, conversation_id).await
@@ -111,7 +110,10 @@ impl ConversationManager {
             }
         };
 
-        let conversation = Arc::new(CodexConversation::new(codex));
+        let conversation = Arc::new(CodexConversation::new(
+            codex,
+            session_configured.rollout_path.clone(),
+        ));
         self.conversations
             .write()
             .await
@@ -142,6 +144,16 @@ impl ConversationManager {
         auth_manager: Arc<AuthManager>,
     ) -> CodexResult<NewConversation> {
         let initial_history = RolloutRecorder::get_rollout_history(&rollout_path).await?;
+        self.resume_conversation_with_history(config, initial_history, auth_manager)
+            .await
+    }
+
+    pub async fn resume_conversation_with_history(
+        &self,
+        config: Config,
+        initial_history: InitialHistory,
+        auth_manager: Arc<AuthManager>,
+    ) -> CodexResult<NewConversation> {
         let CodexSpawnOk {
             codex,
             conversation_id,
@@ -150,7 +162,7 @@ impl ConversationManager {
             auth_manager,
             self.delegate_adapter.clone(),
             initial_history,
-            self.session_source,
+            self.session_source.clone(),
         )
         .await?;
         self.finalize_spawn(codex, conversation_id).await
@@ -191,7 +203,7 @@ impl ConversationManager {
             auth_manager,
             self.delegate_adapter.clone(),
             history,
-            self.session_source,
+            self.session_source.clone(),
         )
         .await?;
 
@@ -227,7 +239,7 @@ impl ConversationManager {
             auth_manager,
             self.delegate_adapter.clone(),
             forked_history,
-            self.session_source,
+            self.session_source.clone(),
         )
         .await?;
 
@@ -244,9 +256,11 @@ fn truncate_before_nth_user_message(history: InitialHistory, n: usize) -> Initia
     // Find indices of user message inputs in rollout order.
     let mut user_positions: Vec<usize> = Vec::new();
     for (idx, item) in items.iter().enumerate() {
-        if let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) = item
-            && role == "user"
-            && content_items_to_text(content).is_some_and(|text| !is_session_prefix_message(&text))
+        if let RolloutItem::ResponseItem(item @ ResponseItem::Message { .. }) = item
+            && matches!(
+                crate::event_mapping::parse_turn_item(item),
+                Some(TurnItem::UserMessage(_))
+            )
         {
             user_positions.push(idx);
         }

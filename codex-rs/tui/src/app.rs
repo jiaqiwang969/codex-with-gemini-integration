@@ -1,4 +1,3 @@
-use crate::UpdateAction;
 use crate::app_backtrack::BacktrackState;
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
@@ -15,12 +14,12 @@ use crate::render::highlight::highlight_bash_to_lines;
 use crate::resume_picker::ResumeSelection;
 use crate::tui;
 use crate::tui::TuiEvent;
+use crate::updates::UpdateAction;
 use codex_ansi_escape::ansi_escape_line;
 use codex_core::AuthManager;
 use codex_core::ConversationManager;
 use codex_core::config::Config;
-use codex_core::config::persist_model_selection;
-use codex_core::config::set_hide_full_access_warning;
+use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core::model_family::find_family_for_model;
 use codex_core::protocol::SessionConfiguredEvent;
 use codex_core::protocol::SessionSource;
@@ -54,7 +53,9 @@ use std::time::SystemTime;
 use tokio::select;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::task::JoinHandle;
-// use uuid::Uuid;
+
+#[cfg(not(debug_assertions))]
+use crate::history_cell::UpdateAvailableHistoryCell;
 
 #[derive(Debug, Clone)]
 pub struct AppExitInfo {
@@ -280,6 +281,8 @@ impl App {
         };
 
         let file_search = FileSearchManager::new(config.cwd.clone(), app_event_tx.clone());
+        #[cfg(not(debug_assertions))]
+        let upgrade_version = crate::updates::get_upgrade_version(&config);
 
         let mut app = Self {
             server: conversation_manager,
@@ -310,6 +313,18 @@ impl App {
         };
 
         app.cxresume_idle.trigger_immediate(&app.app_event_tx);
+
+        #[cfg(not(debug_assertions))]
+        if let Some(latest_version) = upgrade_version {
+            app.handle_event(
+                tui,
+                AppEvent::InsertHistoryCell(Box::new(UpdateAvailableHistoryCell::new(
+                    latest_version,
+                    crate::updates::get_update_action(),
+                ))),
+            )
+            .await?;
+        }
 
         let tui_events = tui.event_stream();
         tokio::pin!(tui_events);
@@ -558,15 +573,30 @@ impl App {
                     self.config.model_family = family;
                 }
             }
-            AppEvent::OpenReasoningPopup { model, presets } => {
-                self.chat_widget.open_reasoning_popup(model, presets);
+            AppEvent::OpenReasoningPopup { model } => {
+                self.chat_widget.open_reasoning_popup(model);
             }
             AppEvent::OpenFullAccessConfirmation { preset } => {
                 self.chat_widget.open_full_access_confirmation(preset);
             }
+            AppEvent::OpenFeedbackNote {
+                category,
+                include_logs,
+            } => {
+                self.chat_widget.open_feedback_note(category, include_logs);
+            }
+            AppEvent::OpenFeedbackConsent { category } => {
+                self.chat_widget.open_feedback_consent(category);
+            }
+            AppEvent::ShowWindowsAutoModeInstructions => {
+                self.chat_widget.open_windows_auto_mode_instructions();
+            }
             AppEvent::PersistModelSelection { model, effort } => {
                 let profile = self.active_profile.as_deref();
-                match persist_model_selection(&self.config.codex_home, profile, &model, effort)
+                match ConfigEditsBuilder::new(&self.config.codex_home)
+                    .with_profile(profile)
+                    .set_model(Some(model.as_str()), effort)
+                    .apply()
                     .await
                 {
                     Ok(()) => {
@@ -613,7 +643,11 @@ impl App {
                 self.chat_widget.set_full_access_warning_acknowledged(ack);
             }
             AppEvent::PersistFullAccessWarningAcknowledged => {
-                if let Err(err) = set_hide_full_access_warning(&self.config.codex_home, true) {
+                if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
+                    .set_hide_full_access_warning(true)
+                    .apply()
+                    .await
+                {
                     tracing::error!(
                         error = %err,
                         "failed to persist full access warning acknowledgement"

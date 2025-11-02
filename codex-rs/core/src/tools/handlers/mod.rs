@@ -1,6 +1,5 @@
 pub mod apply_patch;
 mod delegate;
-mod exec_stream;
 mod grep_files;
 mod list_dir;
 mod mcp;
@@ -17,7 +16,6 @@ pub use plan::PLAN_TOOL;
 pub use apply_patch::ApplyPatchHandler;
 pub use delegate::DELEGATE_TOOL;
 pub use delegate::DelegateToolHandler;
-pub use exec_stream::ExecStreamHandler;
 pub use grep_files::GrepFilesHandler;
 pub use list_dir::ListDirHandler;
 pub use mcp::McpHandler;

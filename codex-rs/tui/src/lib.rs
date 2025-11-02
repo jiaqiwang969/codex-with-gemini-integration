@@ -3,6 +3,7 @@
 // alternate‑screen mode starts; that file opts‑out locally via `allow`.
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![deny(clippy::disallowed_methods)]
+use additional_dirs::add_dir_warning_message;
 use app::App;
 pub use app::AppExitInfo;
 use codex_app_server_protocol::AuthMode;
@@ -12,6 +13,7 @@ use codex_core::BUILT_IN_OSS_MODEL_PROVIDER_ID;
 use codex_core::CodexAuth;
 use codex_core::INTERACTIVE_SESSION_SOURCES;
 use codex_core::RolloutRecorder;
+use codex_core::auth::enforce_login_restrictions;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
 use codex_core::find_conversation_path_by_id_str;
@@ -24,7 +26,6 @@ use codex_ollama::DEFAULT_OSS_MODEL;
 use codex_protocol::config_types::SandboxMode;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use std::fs::OpenOptions;
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::error;
@@ -33,6 +34,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::prelude::*;
 
+mod additional_dirs;
 mod app;
 mod app_backtrack;
 mod app_event;
@@ -40,7 +42,6 @@ mod app_event_sender;
 mod ascii_animation;
 mod bottom_pane;
 mod chatwidget;
-mod citation_regex;
 mod cli;
 mod clipboard_paste;
 mod color;
@@ -78,100 +79,13 @@ mod text_formatting;
 mod tui;
 mod ui_consts;
 mod update_prompt;
+pub mod updates;
 mod version;
-
-/// Update action the CLI should perform after the TUI exits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpdateAction {
-    /// Update via `npm install -g @openai/codex@latest`.
-    NpmGlobalLatest,
-    /// Update via `bun install -g @openai/codex@latest`.
-    BunGlobalLatest,
-    /// Update via `brew upgrade codex`.
-    BrewUpgrade,
-}
-
-impl UpdateAction {
-    /// Returns the list of command-line arguments for invoking the update.
-    pub fn command_args(&self) -> (&'static str, &'static [&'static str]) {
-        match self {
-            UpdateAction::NpmGlobalLatest => ("npm", &["install", "-g", "@openai/codex@latest"]),
-            UpdateAction::BunGlobalLatest => ("bun", &["install", "-g", "@openai/codex@latest"]),
-            UpdateAction::BrewUpgrade => ("brew", &["upgrade", "codex"]),
-        }
-    }
-
-    /// Returns string representation of the command-line arguments for invoking the update.
-    pub fn command_str(&self) -> String {
-        let (command, args) = self.command_args();
-        let args_str = args.join(" ");
-        format!("{command} {args_str}")
-    }
-}
 
 mod wrapping;
 
 #[cfg(test)]
 pub mod test_backend;
-
-#[cfg(test)]
-mod auth_tests {
-    use super::*;
-    use codex_core::auth::AuthDotJson;
-    use codex_core::auth::write_auth_json;
-    use codex_core::config::ConfigOverrides;
-    use codex_core::config::ConfigToml;
-    use tempfile::tempdir;
-
-    #[test]
-    fn login_status_uses_parent_codex_home_for_auth() {
-        let global_home = tempdir().expect("tempdir");
-        let auth_path = global_home.path().join("auth.json");
-        write_auth_json(
-            &auth_path,
-            &AuthDotJson {
-                openai_api_key: Some("sk-test".to_string()),
-                tokens: None,
-                last_refresh: None,
-            },
-        )
-        .expect("write auth.json");
-
-        let agent_home = tempdir().expect("tempdir");
-        let mut config = Config::load_from_base_config_with_overrides(
-            ConfigToml::default(),
-            ConfigOverrides::default(),
-            agent_home.path().to_path_buf(),
-        )
-        .expect("config");
-        config.model_provider.requires_openai_auth = true;
-
-        let status = get_login_status(&config, global_home.path());
-        assert!(matches!(status, LoginStatus::AuthMode(AuthMode::ApiKey)));
-    }
-
-    #[test]
-    fn shared_auth_manager_reads_parent_auth() {
-        let global_home = tempdir().expect("tempdir");
-        let auth_path = global_home.path().join("auth.json");
-        write_auth_json(
-            &auth_path,
-            &AuthDotJson {
-                openai_api_key: Some("sk-test".to_string()),
-                tokens: None,
-                last_refresh: None,
-            },
-        )
-        .expect("write auth.json");
-
-        let manager = AuthManager::shared(global_home.path().to_path_buf(), false);
-        let auth = manager.auth().expect("auth loaded");
-        assert!(matches!(auth.mode, AuthMode::ApiKey));
-    }
-}
-
-#[cfg(not(debug_assertions))]
-mod updates;
 
 use crate::onboarding::TrustDirectorySelection;
 use crate::onboarding::WSL_INSTRUCTIONS;
@@ -226,6 +140,7 @@ pub async fn run_main(
 
     // canonicalize the cwd
     let cwd = cli.cwd.clone().map(|p| p.canonicalize().unwrap_or(p));
+    let additional_dirs = cli.add_dir.clone();
 
     let overrides = ConfigOverrides {
         model,
@@ -237,12 +152,14 @@ pub async fn run_main(
         config_profile: cli.config_profile.clone(),
         codex_linux_sandbox_exe,
         base_instructions: None,
-        include_plan_tool: Some(true),
+        developer_instructions: None,
+        compact_prompt: None,
         include_delegate_tool: Some(true),
         include_apply_patch_tool: None,
-        include_view_image_tool: None,
         show_raw_agent_reasoning: cli.oss.then_some(true),
         tools_web_search_request: cli.web_search.then_some(true),
+        experimental_sandbox_command_assessment: None,
+        additional_writable_roots: additional_dirs,
     };
     let mut delegate_config_overrides = overrides.clone();
     delegate_config_overrides.include_delegate_tool = None;
@@ -268,6 +185,20 @@ pub async fn run_main(
     let allowed_agents = agent_context.allowed_agents().to_vec();
     let global_codex_home = agent_context.global_codex_home().to_path_buf();
     let config = agent_context.into_config();
+
+    if let Some(warning) = add_dir_warning_message(&cli.add_dir, &config.sandbox_policy) {
+        #[allow(clippy::print_stderr)]
+        {
+            eprintln!("Error adding directories: {warning}");
+            std::process::exit(1);
+        }
+    }
+
+    #[allow(clippy::print_stderr)]
+    if let Err(err) = enforce_login_restrictions(&config).await {
+        eprintln!("{err}");
+        std::process::exit(1);
+    }
 
     let active_profile = config.active_profile.clone();
     let log_dir = codex_core::config::log_dir(&config)?;
@@ -411,61 +342,15 @@ async fn run_ratatui_app(
         }
     }
 
-    // Show update banner in terminal history (instead of stderr) so it is visible
-    // within the TUI scrollback. Building spans keeps styling consistent.
-    #[cfg(not(debug_assertions))]
-    if let Some(latest_version) = updates::get_upgrade_version(&initial_config) {
-        use crate::history_cell::padded_emoji;
-        use crate::history_cell::with_border_with_inner_width;
-        use ratatui::style::Stylize as _;
-        use ratatui::text::Line;
-
-        let current_version = env!("CARGO_PKG_VERSION");
-
-        let mut content_lines: Vec<Line<'static>> = vec![
-            Line::from(vec![
-                padded_emoji("✨").bold().cyan(),
-                "Update available!".bold().cyan(),
-                " ".into(),
-                format!("{current_version} -> {latest_version}.").bold(),
-            ]),
-            Line::from(""),
-            Line::from("See full release notes:"),
-            Line::from(""),
-            Line::from(
-                "https://github.com/openai/codex/releases/latest"
-                    .cyan()
-                    .underlined(),
-            ),
-            Line::from(""),
-        ];
-
-        if let Some(update_action) = get_update_action() {
-            content_lines.push(Line::from(vec![
-                "Run ".into(),
-                update_action.command_str().cyan(),
-                " to update.".into(),
-            ]));
-        } else {
-            content_lines.push(Line::from(vec![
-                "See ".into(),
-                "https://github.com/openai/codex".cyan().underlined(),
-                " for installation options.".into(),
-            ]));
-        }
-
-        let viewport_width = tui.terminal.viewport_area.width as usize;
-        let inner_width = viewport_width.saturating_sub(4).max(1);
-        let mut lines = with_border_with_inner_width(content_lines, inner_width);
-        lines.push("".into());
-        tui.insert_history_lines(lines);
-    }
-
     // Initialize high-fidelity session event logging if enabled.
     session_log::maybe_init(&initial_config);
 
-    let mut auth_manager = AuthManager::shared(global_codex_home.clone(), false);
-    let login_status = get_login_status(&initial_config, &global_codex_home);
+    let mut auth_manager = AuthManager::shared(
+        initial_config.codex_home.clone(),
+        false,
+        initial_config.cli_auth_credentials_store_mode,
+    );
+    let login_status = get_login_status(&initial_config);
     let should_show_trust_screen = should_show_trust_screen(&initial_config);
     let should_show_windows_wsl_screen =
         cfg!(target_os = "windows") && !initial_config.windows_wsl_setup_acknowledged;
@@ -517,7 +402,11 @@ async fn run_ratatui_app(
             .await;
             allowed_agents = context.allowed_agents().to_vec();
             global_codex_home = context.global_codex_home().to_path_buf();
-            auth_manager = AuthManager::shared(global_codex_home.clone(), false);
+            auth_manager = AuthManager::shared(
+                global_codex_home.clone(),
+                false,
+                initial_config.cli_auth_credentials_store_mode,
+            );
             context.into_config()
         } else {
             initial_config
@@ -542,15 +431,31 @@ async fn run_ratatui_app(
             Some(path) => resume_picker::ResumeSelection::Resume(path),
             None => {
                 error!("Error finding conversation path: {id_str}");
-                resume_picker::ResumeSelection::StartFresh
+                restore();
+                session_log::log_session_end();
+                let _ = tui.terminal.clear();
+                if let Err(err) = writeln!(
+                    std::io::stdout(),
+                    "No saved session found with ID {id_str}. Run `codex resume` without an ID to choose from existing sessions."
+                ) {
+                    error!("Failed to write resume error message: {err}");
+                }
+                return Ok(AppExitInfo {
+                    token_usage: codex_core::protocol::TokenUsage::default(),
+                    conversation_id: None,
+                    update_action: None,
+                });
             }
         }
     } else if cli.resume_last {
+        let provider_filter = vec![config.model_provider_id.clone()];
         match RolloutRecorder::list_conversations(
             &config.codex_home,
             1,
             None,
             INTERACTIVE_SESSION_SOURCES,
+            Some(provider_filter.as_slice()),
+            &config.model_provider_id,
         )
         .await
         {
@@ -562,7 +467,13 @@ async fn run_ratatui_app(
             Err(_) => resume_picker::ResumeSelection::StartFresh,
         }
     } else if cli.resume_picker {
-        match resume_picker::run_resume_picker(&mut tui, &config.codex_home).await? {
+        match resume_picker::run_resume_picker(
+            &mut tui,
+            &config.codex_home,
+            &config.model_provider_id,
+        )
+        .await?
+        {
             resume_picker::ResumeSelection::Exit => {
                 restore();
                 session_log::log_session_end();
@@ -600,47 +511,6 @@ async fn run_ratatui_app(
     app_result
 }
 
-/// Get the update action from the environment.
-/// Returns `None` if not managed by npm, bun, or brew.
-#[cfg(not(debug_assertions))]
-pub(crate) fn get_update_action() -> Option<UpdateAction> {
-    let exe = std::env::current_exe().unwrap_or_default();
-    let managed_by_npm = std::env::var_os("CODEX_MANAGED_BY_NPM").is_some();
-    let managed_by_bun = std::env::var_os("CODEX_MANAGED_BY_BUN").is_some();
-    if managed_by_npm {
-        Some(UpdateAction::NpmGlobalLatest)
-    } else if managed_by_bun {
-        Some(UpdateAction::BunGlobalLatest)
-    } else if cfg!(target_os = "macos")
-        && (exe.starts_with("/opt/homebrew") || exe.starts_with("/usr/local"))
-    {
-        Some(UpdateAction::BrewUpgrade)
-    } else {
-        None
-    }
-}
-
-#[test]
-#[cfg(not(debug_assertions))]
-fn test_get_update_action() {
-    let prev = std::env::var_os("CODEX_MANAGED_BY_NPM");
-
-    // First: no npm var -> expect None (we do not run from brew in CI)
-    unsafe { std::env::remove_var("CODEX_MANAGED_BY_NPM") };
-    assert_eq!(get_update_action(), None);
-
-    // Then: with npm var -> expect NpmGlobalLatest
-    unsafe { std::env::set_var("CODEX_MANAGED_BY_NPM", "1") };
-    assert_eq!(get_update_action(), Some(UpdateAction::NpmGlobalLatest));
-
-    // Restore prior value to avoid leaking state
-    if let Some(v) = prev {
-        unsafe { std::env::set_var("CODEX_MANAGED_BY_NPM", v) };
-    } else {
-        unsafe { std::env::remove_var("CODEX_MANAGED_BY_NPM") };
-    }
-}
-
 #[expect(
     clippy::print_stderr,
     reason = "TUI should no longer be displayed, so we can write to stderr."
@@ -659,11 +529,12 @@ pub enum LoginStatus {
     NotAuthenticated,
 }
 
-fn get_login_status(config: &Config, auth_codex_home: &Path) -> LoginStatus {
+fn get_login_status(config: &Config) -> LoginStatus {
     if config.model_provider.requires_openai_auth {
         // Reading the OpenAI API key is an async operation because it may need
         // to refresh the token. Block on it.
-        match CodexAuth::from_codex_home(auth_codex_home) {
+        let codex_home = config.codex_home.clone();
+        match CodexAuth::from_auth_storage(&codex_home, config.cli_auth_credentials_store_mode) {
             Ok(Some(auth)) => LoginStatus::AuthMode(auth.mode),
             Ok(None) => LoginStatus::NotAuthenticated,
             Err(err) => {
@@ -695,14 +566,16 @@ async fn load_agent_context_or_exit(
 /// or if the current cwd project is already trusted. If not, we need to
 /// show the trust screen.
 fn should_show_trust_screen(config: &Config) -> bool {
-    if config.did_user_set_custom_approval_policy_or_sandbox_mode {
-        // if the user has overridden either approval policy or sandbox mode,
-        // skip the trust flow
-        false
-    } else {
-        // otherwise, skip iff the active project is trusted
-        !config.active_project.is_trusted()
+    if cfg!(target_os = "windows") {
+        // Native Windows cannot enforce sandboxed write access without WSL; skip the trust prompt entirely.
+        return false;
     }
+    if config.did_user_set_custom_approval_policy_or_sandbox_mode {
+        // Respect explicit approval/sandbox overrides made by the user.
+        return false;
+    }
+    // otherwise, skip iff the active project is trusted
+    !config.active_project.is_trusted()
 }
 
 fn should_show_onboarding(
@@ -730,4 +603,39 @@ fn should_show_login_screen(login_status: LoginStatus, config: &Config) -> bool 
     }
 
     login_status == LoginStatus::NotAuthenticated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_core::config::ConfigOverrides;
+    use codex_core::config::ConfigToml;
+    use codex_core::config::ProjectConfig;
+    use tempfile::TempDir;
+
+    #[test]
+    fn windows_skips_trust_prompt() -> std::io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let mut config = Config::load_from_base_config_with_overrides(
+            ConfigToml::default(),
+            ConfigOverrides::default(),
+            temp_dir.path().to_path_buf(),
+        )?;
+        config.did_user_set_custom_approval_policy_or_sandbox_mode = false;
+        config.active_project = ProjectConfig { trust_level: None };
+
+        let should_show = should_show_trust_screen(&config);
+        if cfg!(target_os = "windows") {
+            assert!(
+                !should_show,
+                "Windows trust prompt should always be skipped on native Windows"
+            );
+        } else {
+            assert!(
+                should_show,
+                "Non-Windows should still show trust prompt when project is untrusted"
+            );
+        }
+        Ok(())
+    }
 }
