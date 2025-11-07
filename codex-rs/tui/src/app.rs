@@ -455,32 +455,22 @@ impl App {
                         return Ok(true);
                     }
 
-                    // Auto-manage layout mode based on screen width
-                    let terminal_width = tui.terminal.size()?.width;
-                    if terminal_width < 100 && self.layout_mode == LayoutMode::Normal {
-                        // Auto-collapse on very narrow screens
-                        self.layout_mode = LayoutMode::Collapsed;
-                    } else if terminal_width >= 150 && self.layout_mode == LayoutMode::Collapsed {
-                        // Could auto-expand, but let user control this
-                        // self.layout_mode = LayoutMode::Normal;
-                    }
+                    // Always show session bar (no auto-collapse)
 
-                    // Update session bar with current conversation ID
+                    // Update session bar with current conversation ID and status derived from ChatWidget
                     let current_conv_id =
                         self.chat_widget.conversation_id().map(|id| id.to_string());
-                    self.session_bar.set_current_session(current_conv_id);
+                    self.session_bar
+                        .set_current_session(current_conv_id.clone());
+                    if let Some(id) = current_conv_id.clone() {
+                        let st = self.chat_widget.sidebar_status();
+                        self.session_bar.set_session_status(id, st);
+                    }
 
-                    // First, calculate heights based on whether session bar is visible
+                    // First, calculate areas (session bar always visible)
                     let terminal_area = tui.terminal.size()?;
-                    let (main_height, session_height) = if self.layout_mode == LayoutMode::Normal {
-                        // Reserve 4 lines for session bar (3 content + 1 separator)
-                        let session_h = 4u16;
-                        let main_h = terminal_area.height.saturating_sub(session_h);
-                        (main_h, session_h)
-                    } else {
-                        // No session bar
-                        (terminal_area.height, 0u16)
-                    };
+                    let session_height = 4u16; // 3 content + 1 separator
+                    let main_height = terminal_area.height.saturating_sub(session_height);
 
                     // Calculate the desired height for the inline viewport
                     // This should be the height ChatWidget needs within its allocated area
@@ -541,6 +531,16 @@ impl App {
 
     async fn handle_event(&mut self, tui: &mut tui::Tui, event: AppEvent) -> Result<bool> {
         match event {
+            AppEvent::UpdateSessionStatus { session_id, status } => {
+                self.session_bar.set_session_status(session_id, status);
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::UpdateCurrentSessionStatus { status } => {
+                if let Some(cur) = self.chat_widget.conversation_id() {
+                    self.session_bar.set_session_status(cur.to_string(), status);
+                    tui.frame_requester().schedule_frame();
+                }
+            }
             AppEvent::NewSession => {
                 let init = crate::chatwidget::ChatWidgetInit {
                     config: self.config.clone(),
@@ -1247,22 +1247,15 @@ impl App {
                     PanelFocus::Chat => {
                         self.panel_focus = PanelFocus::Sessions;
                         self.session_bar.set_focus(true);
+                        let current_id =
+                            self.chat_widget.conversation_id().map(|id| id.to_string());
+                        self.session_bar
+                            .reset_selection_for_focus(current_id.as_deref());
                     }
                 }
                 tui.frame_requester().schedule_frame();
             }
-            // F1 toggles sidebar
-            KeyEvent {
-                code: KeyCode::F(1),
-                kind: KeyEventKind::Press,
-                ..
-            } => {
-                self.layout_mode = match self.layout_mode {
-                    LayoutMode::Normal => LayoutMode::Collapsed,
-                    LayoutMode::Collapsed => LayoutMode::Normal,
-                };
-                tui.frame_requester().schedule_frame();
-            }
+            // F1 Toggle Bar disabled per product decision
             KeyEvent {
                 code: KeyCode::Char('t'),
                 modifiers: crossterm::event::KeyModifiers::CONTROL,
@@ -1281,9 +1274,12 @@ impl App {
                 kind: KeyEventKind::Press,
                 ..
             } => {
-                // Focus the session panel for quick search
+                // Focus sessions (bar is always visible now)
                 self.panel_focus = PanelFocus::Sessions;
                 self.session_bar.set_focus(true);
+                let current_id = self.chat_widget.conversation_id().map(|id| id.to_string());
+                self.session_bar
+                    .reset_selection_for_focus(current_id.as_deref());
                 tui.frame_requester().schedule_frame();
             }
             KeyEvent {
@@ -1335,11 +1331,34 @@ impl App {
                 kind: KeyEventKind::Press | KeyEventKind::Repeat,
                 ..
             } => {
+                // If in session tab mode, Esc exits selection without changing conversation
+                if self.panel_focus == PanelFocus::Sessions {
+                    self.panel_focus = PanelFocus::Chat;
+                    self.session_bar.set_focus(false);
+                    tui.frame_requester().schedule_frame();
+                    return;
+                }
                 if self.chat_widget.is_normal_backtrack_mode()
                     && self.chat_widget.composer_is_empty()
                 {
                     self.handle_backtrack_esc_key(tui);
                 } else {
+                    self.chat_widget.handle_key_event(key_event);
+                }
+            }
+            // Ctrl+C exits session tab mode (if active) without committing selection
+            KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: crossterm::event::KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            } => {
+                if self.panel_focus == PanelFocus::Sessions {
+                    self.panel_focus = PanelFocus::Chat;
+                    self.session_bar.set_focus(false);
+                    tui.frame_requester().schedule_frame();
+                } else {
+                    // Forward to chat (e.g., cancel in composer or ignore)
                     self.chat_widget.handle_key_event(key_event);
                 }
             }
@@ -1380,8 +1399,10 @@ impl App {
                                 tui.frame_requester().schedule_frame();
                             }
                             KeyCode::Enter => {
-                                // Load selected session
-                                if let Some(session) = self.session_bar.selected_session() {
+                                // Enter on New vs History session
+                                if self.session_bar.selected_is_new() {
+                                    self.app_event_tx.send(AppEvent::NewSession);
+                                } else if let Some(session) = self.session_bar.selected_session() {
                                     self.app_event_tx
                                         .send(AppEvent::ResumeSession(session.path.clone()));
                                 }

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -11,8 +12,10 @@ use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
 use ratatui::widgets::WidgetRef;
+use unicode_width::UnicodeWidthStr;
 
 use crate::cxresume_picker_widget::SessionInfo;
+use crate::cxresume_picker_widget::first_user_snippet;
 use crate::cxresume_picker_widget::get_cwd_sessions;
 use crate::cxresume_picker_widget::load_tumix_status_index;
 
@@ -22,6 +25,8 @@ pub struct SessionBar {
     sessions: Vec<SessionInfo>,
     /// Currently selected session index
     selected_index: usize,
+    /// Whether selection is on the special "新建" tab
+    selected_on_new: bool,
     /// Whether the bar has focus
     has_focus: bool,
     /// Session loading state
@@ -30,6 +35,10 @@ pub struct SessionBar {
     error: Option<String>,
     /// Current active session ID (if any)
     current_session_id: Option<String>,
+    /// Cached labels derived from first user message (by path)
+    label_cache: HashMap<PathBuf, String>,
+    /// Per-session status text (keyed by session id)
+    status_by_session: HashMap<String, String>,
 }
 
 impl SessionBar {
@@ -37,10 +46,13 @@ impl SessionBar {
         let mut bar = Self {
             sessions: Vec::new(),
             selected_index: 0,
+            selected_on_new: false,
             has_focus: false,
             loading: false,
             error: None,
             current_session_id: None,
+            label_cache: HashMap::new(),
+            status_by_session: HashMap::new(),
         };
 
         // Load sessions on creation
@@ -81,6 +93,21 @@ impl SessionBar {
                 if self.selected_index >= self.sessions.len() && !self.sessions.is_empty() {
                     self.selected_index = self.sessions.len() - 1;
                 }
+
+                // Compute labels lazily for visible sessions (cache by path)
+                for s in &self.sessions {
+                    if !self.label_cache.contains_key(&s.path) {
+                        if let Some(snippet) = first_user_snippet(&s.path, 5) {
+                            // Simple truncation to keep bar compact
+                            let short = if snippet.len() > 32 {
+                                format!("{}…", &snippet[..31])
+                            } else {
+                                snippet
+                            };
+                            self.label_cache.insert(s.path.clone(), short);
+                        }
+                    }
+                }
             }
             Err(e) => {
                 self.error = Some(e);
@@ -92,18 +119,49 @@ impl SessionBar {
 
     /// Get the currently selected session
     pub fn selected_session(&self) -> Option<&SessionInfo> {
-        self.sessions.get(self.selected_index)
+        if self.selected_on_new {
+            None
+        } else {
+            self.sessions.get(self.selected_index)
+        }
+    }
+
+    /// Is the special "新建" tab currently selected
+    pub fn selected_is_new(&self) -> bool {
+        self.selected_on_new
     }
 
     /// Move selection left
     pub fn select_previous(&mut self) {
+        if self.selected_on_new {
+            // already at the left-most before first session
+            return;
+        }
         if self.selected_index > 0 {
             self.selected_index -= 1;
+        } else {
+            // At first session; if a New tab exists, move to it
+            let has_new = self
+                .current_session_id
+                .as_deref()
+                .map(|id| !self.sessions.iter().any(|s| s.id == id))
+                .unwrap_or(true);
+            if has_new {
+                self.selected_on_new = true;
+            }
         }
     }
 
     /// Move selection right
     pub fn select_next(&mut self) {
+        if self.selected_on_new {
+            // Leave the New tab and go to the first session if any
+            self.selected_on_new = false;
+            if !self.sessions.is_empty() {
+                self.selected_index = 0;
+            }
+            return;
+        }
         if self.selected_index < self.sessions.len().saturating_sub(1) {
             self.selected_index += 1;
         }
@@ -124,23 +182,61 @@ impl SessionBar {
         self.current_session_id = session_id;
     }
 
+    /// Update status text for a specific session id
+    pub fn set_session_status(&mut self, session_id: String, status: String) {
+        self.status_by_session.insert(session_id, status);
+    }
+
+    /// Reset selection when the bar gains focus: select current if present, else select "新建".
+    pub fn reset_selection_for_focus(&mut self, current_session_id: Option<&str>) {
+        if let Some(id) = current_session_id {
+            if let Some(pos) = self.sessions.iter().position(|s| s.id == id) {
+                self.selected_index = pos;
+                self.selected_on_new = false;
+                return;
+            }
+        }
+        // Current not in history -> select New if visible
+        self.selected_on_new = true;
+        if !self.sessions.is_empty() {
+            self.selected_index = 0;
+        }
+    }
+
     /// Build the session bar line (similar to tmux status bar)
     ///
     /// Label format: [n]:<short-id> (no "历史/当前" words). The current session is
     /// highlighted by style only. A standalone "[0]:新建" is shown only when the
     /// current session is not present in history.
-    fn build_bar_line(&self, current_session_id: Option<&str>) -> Line<'static> {
+    fn build_bar_line(
+        &self,
+        current_session_id: Option<&str>,
+    ) -> (Line<'static>, Line<'static>, Option<u16>, Option<u16>, u16) {
         if let Some(error) = &self.error {
-            return Line::from(vec![
-                Span::styled(
-                    " Error: ",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(error.clone(), Style::default().fg(Color::Red)),
-            ]);
+            return (
+                Line::from(vec![
+                    Span::styled(
+                        " Error: ",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(error.clone(), Style::default().fg(Color::Red)),
+                ]),
+                Line::from(""),
+                None,
+                None,
+                0,
+            );
         }
 
-        let mut spans = Vec::new();
+        let mut left_spans = Vec::new();
+        let mut cur_x: u16 = 0;
+        let mut sel_start: Option<u16> = None;
+        let mut sel_end: Option<u16> = None;
+        let mut add_left =
+            |spans: &mut Vec<Span<'static>>, cur_x: &mut u16, text: String, style: Style| {
+                *cur_x = cur_x.saturating_add(UnicodeWidthStr::width(text.as_str()) as u16);
+                spans.push(Span::styled(text, style));
+            };
 
         // Determine whether the current session exists in history
         let current_in_history = current_session_id
@@ -149,82 +245,116 @@ impl SessionBar {
 
         // Only show a standalone "新建" when the current session is not in history
         if !current_in_history {
-            let new_style = if self.has_focus {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
+            // When focused and selection is on New, use green as follow-hint; otherwise gray/green as appropriate
+            let new_is_green = if self.has_focus {
+                self.selected_on_new
             } else {
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD)
+                true
             };
-            spans.push(Span::styled("[0]", new_style));
-            spans.push(Span::styled(":新建", new_style));
+            let new_style = if new_is_green {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            if self.has_focus && self.selected_on_new && sel_start.is_none() {
+                sel_start = Some(cur_x);
+            }
+            add_left(&mut left_spans, &mut cur_x, "[0]".to_string(), new_style);
+            add_left(&mut left_spans, &mut cur_x, ":新建".to_string(), new_style);
+            if self.has_focus && self.selected_on_new {
+                sel_end = Some(cur_x);
+            }
         }
 
         if self.sessions.is_empty() {
-            // Only show current session
-            spans.push(Span::from(" "));
-            spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
-            spans.push(Span::from(" "));
-            spans.push(Span::styled(
+            add_left(
+                &mut left_spans,
+                &mut cur_x,
+                " ".to_string(),
+                Style::default(),
+            );
+            left_spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+            add_left(
+                &mut left_spans,
+                &mut cur_x,
+                " ".to_string(),
+                Style::default(),
+            );
+            left_spans.push(Span::styled(
                 "No history",
                 Style::default().fg(Color::Yellow),
             ));
         } else {
-            // Session indicators (like tmux tabs)
             for (idx, session) in self.sessions.iter().enumerate() {
-                let display_idx = idx + 1; // Only for display
-                let is_selected = self.selected_index == idx; // selection uses real index
+                let display_idx = idx + 1;
+                let is_selected = self.selected_index == idx;
+                add_left(
+                    &mut left_spans,
+                    &mut cur_x,
+                    " ".to_string(),
+                    Style::default(),
+                );
 
-                // Tab separator
-                spans.push(Span::from(" "));
-
-                // Short id
                 let session_id = if session.id.len() > 8 {
                     format!("{}…", &session.id[..7])
                 } else {
                     session.id.clone()
                 };
 
-                // Check if this is the current active session (style only)
                 let is_current = current_session_id.map_or(false, |id| id == session.id);
-
-                let style = if is_selected {
-                    if self.has_focus {
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Gray)
-                            .add_modifier(Modifier::BOLD)
-                    }
-                } else if is_current {
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD)
+                // Green follows selection when focused; otherwise marks the current session.
+                let is_green = if self.has_focus {
+                    is_selected
+                } else {
+                    is_current
+                };
+                let style = if is_green {
+                    Style::default().fg(Color::Green)
                 } else {
                     Style::default().fg(Color::Gray)
                 };
 
-                spans.push(Span::styled(format!("[{}]", display_idx), style));
-                spans.push(Span::styled(format!(":{}", session_id), style));
+                let label_part = self
+                    .label_cache
+                    .get(&session.path)
+                    .cloned()
+                    .unwrap_or_else(|| String::new());
+                // Compose: <snippet> · <short-id> [· <status>]
+                let mut composed = if label_part.is_empty() {
+                    session_id.clone()
+                } else {
+                    format!("{} · {}", label_part, session_id)
+                };
+                if let Some(st) = self.status_by_session.get(&session.id) {
+                    // keep short; leave full text on the right for current
+                    if !st.is_empty() {
+                        composed.push_str(" · ");
+                        composed.push_str(st);
+                    }
+                }
 
-                // Add status indicators
+                if is_selected && sel_start.is_none() {
+                    sel_start = Some(cur_x);
+                }
+                add_left(
+                    &mut left_spans,
+                    &mut cur_x,
+                    format!("[{}]", display_idx),
+                    style,
+                );
+                add_left(&mut left_spans, &mut cur_x, format!(":{}", composed), style);
+                if is_selected {
+                    sel_end = Some(cur_x);
+                }
+
                 if session.tumix.is_some() {
-                    spans.push(Span::styled(
+                    left_spans.push(Span::styled(
                         "*",
                         Style::default().fg(Color::Rgb(191, 90, 242)),
                     ));
                 }
-
-                // Show message count for non-selected sessions
                 if !is_selected && session.message_count > 0 {
-                    spans.push(Span::styled(
+                    left_spans.push(Span::styled(
                         format!("({})", session.message_count),
                         Style::default().fg(Color::DarkGray),
                     ));
@@ -232,70 +362,74 @@ impl SessionBar {
             }
         }
 
-        // Right side: status and help
-        spans.push(Span::from(" "));
-        spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
-        spans.push(Span::from(" "));
-        spans.push(Span::styled("状态:", Style::default().fg(Color::Gray)));
-        spans.push(Span::from(" "));
-
+        // Build right side (status + help)
+        let mut right_spans: Vec<Span<'static>> = Vec::new();
+        right_spans.push(Span::raw(" 状态:"));
+        right_spans.last_mut().unwrap().style = Style::default().fg(Color::Gray);
+        right_spans.push(Span::raw(" "));
+        // Build primary status label and current session short name
         let (status_label, status_name) = if let Some(cur_id) = current_session_id {
-            // current in history or not — label is always "当前"
             let short_cur = if cur_id.len() > 8 {
                 format!("{}…", &cur_id[..7])
             } else {
                 cur_id.to_string()
             };
-            ("当前", short_cur)
+            let st = self
+                .status_by_session
+                .get(cur_id)
+                .cloned()
+                .unwrap_or_else(|| "就绪".to_string());
+            (st, short_cur)
         } else {
-            ("当前", "新建".to_string())
+            ("就绪".to_string(), "新建".to_string())
         };
-
-        spans.push(Span::styled(
-            status_label,
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::from("  "));
-        spans.push(Span::styled("会话:", Style::default().fg(Color::Gray)));
-        spans.push(Span::from(" "));
-        spans.push(Span::styled(status_name, Style::default()));
-
-        // Help
-        spans.push(Span::from(" "));
-        spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
-        spans.push(Span::from(" "));
+        let mut s = Span::raw(status_label);
+        s.style = Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD);
+        right_spans.push(s);
+        right_spans.push(Span::raw("  "));
+        let mut s2 = Span::raw("会话:");
+        s2.style = Style::default().fg(Color::Gray);
+        right_spans.push(s2);
+        right_spans.push(Span::raw(" "));
+        right_spans.push(Span::raw(status_name));
+        // (Removed duplicate trailing 状态: ... block to avoid showing two status fields)
+        right_spans.push(Span::raw(" │ "));
+        right_spans.last_mut().unwrap().style = Style::default().fg(Color::DarkGray);
         if self.has_focus {
-            spans.push(Span::styled(
-                "←/→",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::from(" Navigate "));
-            spans.push(Span::styled(
-                "Enter",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::from(" Open "));
-            spans.push(Span::styled(
-                "Tab",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::from(" Exit"));
+            let mut a = Span::raw("←/→");
+            a.style = Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD);
+            right_spans.push(a);
+            right_spans.push(Span::raw(" Navigate "));
+            let mut b = Span::raw("Enter");
+            b.style = Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD);
+            right_spans.push(b);
+            right_spans.push(Span::raw(" Open "));
+            let mut c = Span::raw("Tab");
+            c.style = Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD);
+            right_spans.push(c);
+            right_spans.push(Span::raw(" Exit"));
         } else {
-            spans.push(Span::styled("F1", Style::default().fg(Color::Gray)));
-            spans.push(Span::from(" Toggle Bar "));
-            spans.push(Span::styled("Ctrl+P", Style::default().fg(Color::Gray)));
-            spans.push(Span::from(" Sessions"));
+            let mut cp = Span::raw("Ctrl+P");
+            cp.style = Style::default().fg(Color::Gray);
+            right_spans.push(cp);
+            right_spans.push(Span::raw(" Sessions"));
         }
 
-        Line::from(spans)
+        (
+            Line::from(left_spans),
+            Line::from(right_spans),
+            sel_start,
+            sel_end,
+            cur_x,
+        )
     }
 }
 
@@ -319,8 +453,9 @@ impl WidgetRef for &SessionBar {
             height: area.height.saturating_sub(1),
         };
 
-        // Build the status bar line
-        let line = self.build_bar_line(self.current_session_id.as_deref());
+        // Build the status bar line and scrolling metadata
+        let (left_line, right_line, sel_start, sel_end, total_left_width) =
+            self.build_bar_line(self.current_session_id.as_deref());
 
         // Render with background color and padding
         let style = if self.has_focus {
@@ -345,9 +480,58 @@ impl WidgetRef for &SessionBar {
                 width: bar_area.width,
                 height: 1,
             };
-            Paragraph::new(vec![line])
+            // Measure right side width and allocate left/right areas
+            let right_width: u16 = right_line
+                .spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()) as u16)
+                .sum();
+
+            let left_width = render_area
+                .width
+                .saturating_sub(right_width.saturating_add(1));
+            let left_area = Rect {
+                x: render_area.x,
+                y: render_area.y,
+                width: left_width,
+                height: 1,
+            };
+
+            // Draw separator and right side pinned
+            if right_width > 0 && left_width < render_area.width {
+                let sep_x = render_area.x + left_width;
+                if sep_x < render_area.x + render_area.width {
+                    buf[(sep_x, render_area.y)]
+                        .set_symbol("│")
+                        .set_style(Style::default().fg(Color::DarkGray));
+                }
+                let right_area = Rect {
+                    x: render_area.x + render_area.width.saturating_sub(right_width),
+                    y: render_area.y,
+                    width: right_width,
+                    height: 1,
+                };
+                Paragraph::new(vec![right_line.clone()])
+                    .style(style)
+                    .render(right_area, buf);
+            }
+
+            // Compute horizontal scroll for left side: center selected when possible
+            let mut scroll_x: u16 = 0;
+            if let (Some(start), Some(end)) = (sel_start, sel_end) {
+                let sel_center = start.saturating_add(end).saturating_div(2);
+                let half = left_area.width.saturating_div(2);
+                let desired = sel_center.saturating_sub(half);
+                let max_scroll = total_left_width.saturating_sub(left_area.width);
+                scroll_x = desired.min(max_scroll);
+            } else if total_left_width > left_area.width {
+                scroll_x = total_left_width.saturating_sub(left_area.width);
+            }
+
+            Paragraph::new(vec![left_line])
                 .style(style)
-                .render(render_area, buf);
+                .scroll((0, scroll_x))
+                .render(left_area, buf);
         }
     }
 }

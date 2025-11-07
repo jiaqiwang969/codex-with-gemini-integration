@@ -154,6 +154,17 @@ pub(crate) enum AppEvent {
     OpenFeedbackConsent {
         category: FeedbackCategory,
     },
+
+    /// Update per-session runtime status (for UnifiedExec etc.).
+    UpdateSessionStatus {
+        session_id: String,
+        status: String,
+    },
+
+    /// Update runtime status for the current active conversation (id inferred in App).
+    UpdateCurrentSessionStatus {
+        status: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
