@@ -98,9 +98,10 @@ impl SessionBar {
                 for s in &self.sessions {
                     if !self.label_cache.contains_key(&s.path) {
                         if let Some(snippet) = first_user_snippet(&s.path, 5) {
-                            // Simple truncation to keep bar compact
-                            let short = if snippet.len() > 32 {
-                                format!("{}…", &snippet[..31])
+                            // Unicode-safe truncation to keep bar compact
+                            let short = if snippet.chars().count() > 10 {
+                                let truncated: String = snippet.chars().take(10).collect();
+                                format!("{}…", truncated)
                             } else {
                                 snippet
                             };
