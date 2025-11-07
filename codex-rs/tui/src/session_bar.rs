@@ -15,8 +15,8 @@ use ratatui::widgets::WidgetRef;
 use unicode_width::UnicodeWidthStr;
 
 use crate::cxresume_picker_widget::SessionInfo;
-use crate::cxresume_picker_widget::first_user_snippet;
 use crate::cxresume_picker_widget::get_cwd_sessions;
+use crate::cxresume_picker_widget::last_user_snippet;
 use crate::cxresume_picker_widget::load_tumix_status_index;
 
 /// Bottom session bar (similar to tmux)
@@ -96,8 +96,15 @@ impl SessionBar {
 
                 // Compute labels lazily for visible sessions (cache by path)
                 for s in &self.sessions {
-                    if !self.label_cache.contains_key(&s.path) {
-                        if let Some(snippet) = first_user_snippet(&s.path, 5) {
+                    // Always recompute for the current session so alias follows latest user message
+                    let must_update = self
+                        .current_session_id
+                        .as_ref()
+                        .map(|id| *id == s.id)
+                        .unwrap_or(false)
+                        || !self.label_cache.contains_key(&s.path);
+                    if must_update {
+                        if let Some(snippet) = last_user_snippet(&s.path, 5) {
                             // Unicode-safe truncation to keep bar compact
                             let short = if snippet.chars().count() > 10 {
                                 let truncated: String = snippet.chars().take(10).collect();
@@ -411,6 +418,12 @@ impl SessionBar {
                 .add_modifier(Modifier::BOLD);
             right_spans.push(b);
             right_spans.push(Span::raw(" Open "));
+            let mut xk = Span::raw("x");
+            xk.style = Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD);
+            right_spans.push(xk);
+            right_spans.push(Span::raw(" Delete "));
             let mut c = Span::raw("Tab");
             c.style = Style::default()
                 .fg(Color::Cyan)

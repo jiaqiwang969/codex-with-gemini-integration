@@ -1179,6 +1179,7 @@ impl ChatWidget {
     /// Create a ChatWidget attached to an existing conversation (e.g., a fork).
     pub(crate) fn new_from_existing(
         common: ChatWidgetInit,
+        conversation_id: String,
         conversation: std::sync::Arc<codex_core::CodexConversation>,
         session_configured: codex_core::protocol::SessionConfiguredEvent,
     ) -> Self {
@@ -1195,8 +1196,12 @@ impl ChatWidget {
         let mut rng = rand::rng();
         let placeholder = EXAMPLE_PROMPTS[rng.random_range(0..EXAMPLE_PROMPTS.len())].to_string();
 
-        let codex_op_tx =
-            spawn_agent_from_existing(conversation, session_configured, app_event_tx.clone());
+        let codex_op_tx = spawn_agent_from_existing(
+            conversation_id,
+            conversation,
+            session_configured,
+            app_event_tx.clone(),
+        );
 
         Self {
             app_event_tx: app_event_tx.clone(),

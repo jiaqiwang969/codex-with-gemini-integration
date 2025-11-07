@@ -293,6 +293,7 @@ impl App {
                 };
                 ChatWidget::new_from_existing(
                     init,
+                    resumed.conversation_id.to_string(),
                     resumed.conversation,
                     resumed.session_configured,
                 )
@@ -631,7 +632,20 @@ impl App {
                 self.chat_widget.on_commit_tick();
             }
             AppEvent::CodexEvent(event) => {
+                // Backward-compat (should not be used anymore): assume it's for current conversation
                 self.chat_widget.handle_codex_event(event);
+            }
+            AppEvent::CodexEventFor {
+                conversation_id,
+                event,
+            } => {
+                let current = self.chat_widget.conversation_id().map(|id| id.to_string());
+                // 仅当事件来源会话等于当前会话时才渲染；否则忽略（避免串线）
+                if current.as_deref() == Some(conversation_id.as_str()) || current.is_none() {
+                    self.chat_widget.handle_codex_event(event);
+                } else {
+                    // 非当前会话事件：忽略渲染。可在这里做轻量状态更新（如左侧标签），目前不做。
+                }
             }
             AppEvent::ConversationHistory(ev) => {
                 self.on_conversation_history_for_backtrack(tui, ev).await?;
@@ -1022,8 +1036,12 @@ impl App {
                 feedback: self.feedback.clone(),
             };
             let session_configured = expect_unique_session_configured(session.session_configured);
-            let mut chat_widget =
-                ChatWidget::new_from_existing(init, session.conversation, session_configured);
+            let mut chat_widget = ChatWidget::new_from_existing(
+                init,
+                conversation_id.clone(),
+                session.conversation,
+                session_configured,
+            );
             chat_widget.set_delegate_context(Some(session.summary.clone()));
             DelegateSessionState {
                 summary: session.summary,
@@ -1208,8 +1226,12 @@ impl App {
             feedback: self.feedback.clone(),
         };
 
-        self.chat_widget =
-            ChatWidget::new_from_existing(init, resumed.conversation, resumed.session_configured);
+        self.chat_widget = ChatWidget::new_from_existing(
+            init,
+            resumed.conversation_id.to_string(),
+            resumed.conversation,
+            resumed.session_configured,
+        );
         self.transcript_cells.clear();
         self.deferred_history_lines.clear();
         self.has_emitted_history_lines = false;
@@ -1410,6 +1432,17 @@ impl App {
                                 // Refresh sessions
                                 self.session_bar.refresh_sessions();
                                 tui.frame_requester().schedule_frame();
+                            }
+                            KeyCode::Char('x') => {
+                                // Delete selected history session rollout file (no confirmation)
+                                if !self.session_bar.selected_is_new() {
+                                    if let Some(session) = self.session_bar.selected_session() {
+                                        let _ = std::fs::remove_file(&session.path);
+                                        // Do NOT switch conversation; just refresh list
+                                        self.session_bar.refresh_sessions();
+                                        tui.frame_requester().schedule_frame();
+                                    }
+                                }
                             }
                             KeyCode::Esc | KeyCode::Tab => {
                                 // Return focus to chat

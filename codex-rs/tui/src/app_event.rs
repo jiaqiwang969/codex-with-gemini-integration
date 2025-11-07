@@ -19,6 +19,11 @@ use codex_core::protocol_config_types::ReasoningEffort;
 #[derive(Debug)]
 pub(crate) enum AppEvent {
     CodexEvent(Event),
+    /// Event tagged with its source conversation id for routing/guarding
+    CodexEventFor {
+        conversation_id: String,
+        event: Event,
+    },
 
     /// Start a new session.
     NewSession,

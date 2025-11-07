@@ -1260,6 +1260,34 @@ pub fn first_user_snippet(path: &PathBuf, max_words: usize) -> Option<String> {
     }
 }
 
+/// Return the last User message's first `max_words` words as a snippet label.
+/// Falls back to None if no user message is present or content is empty.
+pub fn last_user_snippet(path: &PathBuf, max_words: usize) -> Option<String> {
+    let data = collect_session_messages(path);
+    let last_user = data
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "User" && !m.content.trim().is_empty())?;
+    let mut words = last_user
+        .content
+        .split_whitespace()
+        .filter(|w| !w.is_empty());
+    let mut taken: Vec<&str> = Vec::new();
+    for _ in 0..max_words {
+        if let Some(w) = words.next() {
+            taken.push(w);
+        } else {
+            break;
+        }
+    }
+    if taken.is_empty() {
+        None
+    } else {
+        Some(taken.join(" "))
+    }
+}
+
 fn parse_new_format_message(json: &serde_json::Value) -> Option<ParsedMessage> {
     if json.get("type").and_then(|v| v.as_str()) != Some("event_msg") {
         return None;

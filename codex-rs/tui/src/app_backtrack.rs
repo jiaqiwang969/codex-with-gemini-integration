@@ -423,8 +423,12 @@ impl App {
             auth_manager: self.auth_manager.clone(),
             feedback: self.feedback.clone(),
         };
-        self.chat_widget =
-            crate::chatwidget::ChatWidget::new_from_existing(init, conv, session_configured);
+        self.chat_widget = crate::chatwidget::ChatWidget::new_from_existing(
+            init,
+            new_conv.conversation_id.to_string(),
+            conv,
+            session_configured,
+        );
         // Trim transcript up to the selected user message and re-render it.
         self.trim_transcript_for_backtrack(nth_user_message);
         self.render_transcript_once(tui);
