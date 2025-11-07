@@ -67,6 +67,7 @@ pub mod public_widgets;
 mod render;
 mod resume_picker;
 mod selection_list;
+mod session_bar;
 mod session_log;
 mod shimmer;
 mod slash_command;

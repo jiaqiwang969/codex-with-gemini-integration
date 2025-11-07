@@ -19,6 +19,11 @@ use codex_core::protocol_config_types::ReasoningEffort;
 #[derive(Debug)]
 pub(crate) enum AppEvent {
     CodexEvent(Event),
+    /// Event tagged with its source conversation id for routing/guarding
+    CodexEventFor {
+        conversation_id: String,
+        event: Event,
+    },
 
     /// Start a new session.
     NewSession,
@@ -153,6 +158,17 @@ pub(crate) enum AppEvent {
     /// Open the upload consent popup for feedback after selecting a category.
     OpenFeedbackConsent {
         category: FeedbackCategory,
+    },
+
+    /// Update per-session runtime status (for UnifiedExec etc.).
+    UpdateSessionStatus {
+        session_id: String,
+        status: String,
+    },
+
+    /// Update runtime status for the current active conversation (id inferred in App).
+    UpdateCurrentSessionStatus {
+        status: String,
     },
 }
 

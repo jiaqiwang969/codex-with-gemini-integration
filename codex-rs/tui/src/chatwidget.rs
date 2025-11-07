@@ -917,6 +917,9 @@ impl ChatWidget {
             None => (vec![ev.call_id.clone()], Vec::new(), false),
         };
 
+        // Sidebar status: Success/Failure summary
+        // 已移除事件发送，改为在 sidebar_status() 中实时计算
+
         let needs_new = self
             .active_cell
             .as_ref()
@@ -977,6 +980,9 @@ impl ChatWidget {
         };
         self.bottom_pane.push_approval_request(request);
         self.request_redraw();
+
+        // Sidebar status: Waiting for approval
+        // 已移除事件发送，改为在 sidebar_status() 中实时计算
     }
 
     pub(crate) fn handle_apply_patch_approval_now(
@@ -1032,6 +1038,9 @@ impl ChatWidget {
                 ev.is_user_shell_command,
             )));
         }
+
+        // Sidebar status: Running
+        // 已移除事件发送，改为在 sidebar_status() 中实时计算
 
         self.request_redraw();
     }
@@ -1170,6 +1179,7 @@ impl ChatWidget {
     /// Create a ChatWidget attached to an existing conversation (e.g., a fork).
     pub(crate) fn new_from_existing(
         common: ChatWidgetInit,
+        conversation_id: String,
         conversation: std::sync::Arc<codex_core::CodexConversation>,
         session_configured: codex_core::protocol::SessionConfiguredEvent,
     ) -> Self {
@@ -1186,8 +1196,12 @@ impl ChatWidget {
         let mut rng = rand::rng();
         let placeholder = EXAMPLE_PROMPTS[rng.random_range(0..EXAMPLE_PROMPTS.len())].to_string();
 
-        let codex_op_tx =
-            spawn_agent_from_existing(conversation, session_configured, app_event_tx.clone());
+        let codex_op_tx = spawn_agent_from_existing(
+            conversation_id,
+            conversation,
+            session_configured,
+            app_event_tx.clone(),
+        );
 
         Self {
             app_event_tx: app_event_tx.clone(),
@@ -2805,6 +2819,29 @@ impl ChatWidget {
 
     pub(crate) fn conversation_id(&self) -> Option<ConversationId> {
         self.conversation_id
+    }
+
+    /// A lightweight status string for the sidebar, derived from existing UI state.
+    /// Currently distinguishes between "运行中" and "就绪" based on Exec activity.
+    pub(crate) fn sidebar_status(&self) -> String {
+        // 检查底部状态指示器或活跃 Exec
+        if self.bottom_pane.status_widget().is_some() {
+            return "运行中".to_string();
+        }
+
+        // 检查 ExecCell/运行中命令
+        let exec_active = self
+            .active_cell
+            .as_ref()
+            .and_then(|c| c.as_any().downcast_ref::<ExecCell>())
+            .map(|c| c.is_active())
+            .unwrap_or(false);
+        if exec_active || !self.running_commands.is_empty() {
+            return "运行中".to_string();
+        }
+
+        // Fallback
+        "就绪".to_string()
     }
 
     pub(crate) fn add_delegate_completion(

@@ -191,7 +191,7 @@ pub struct SessionInfo {
 }
 
 #[derive(Default)]
-struct TumixStatusIndex {
+pub struct TumixStatusIndex {
     by_session: HashMap<String, TimedIndicator>,
     by_path: HashMap<PathBuf, TimedIndicator>,
 }
@@ -246,7 +246,7 @@ impl TumixStatusIndex {
         }
     }
 
-    fn lookup(&self, session_id: &str, path: &Path) -> Option<TumixIndicator> {
+    pub fn lookup(&self, session_id: &str, path: &Path) -> Option<TumixIndicator> {
         if let Some(entry) = self.by_session.get(session_id) {
             return Some(entry.indicator.clone());
         }
@@ -1180,7 +1180,7 @@ struct ParsedSessionData {
     total_tokens: Option<usize>,
 }
 
-fn collect_session_messages(path: &PathBuf) -> ParsedSessionData {
+pub fn collect_session_messages(path: &PathBuf) -> ParsedSessionData {
     let mut data = ParsedSessionData::default();
     let file = match fs::File::open(path) {
         Ok(file) => file,
@@ -1231,6 +1231,61 @@ fn collect_session_messages(path: &PathBuf) -> ParsedSessionData {
     }
 
     data
+}
+
+/// Return the first User message's first `max_words` words as a snippet label.
+/// Falls back to None if no user message is present or content is empty.
+pub fn first_user_snippet(path: &PathBuf, max_words: usize) -> Option<String> {
+    let data = collect_session_messages(path);
+    let first_user = data
+        .messages
+        .iter()
+        .find(|m| m.role == "User" && !m.content.trim().is_empty())?;
+    let mut words = first_user
+        .content
+        .split_whitespace()
+        .filter(|w| !w.is_empty());
+    let mut taken: Vec<&str> = Vec::new();
+    for _ in 0..max_words {
+        if let Some(w) = words.next() {
+            taken.push(w);
+        } else {
+            break;
+        }
+    }
+    if taken.is_empty() {
+        None
+    } else {
+        Some(taken.join(" "))
+    }
+}
+
+/// Return the last User message's first `max_words` words as a snippet label.
+/// Falls back to None if no user message is present or content is empty.
+pub fn last_user_snippet(path: &PathBuf, max_words: usize) -> Option<String> {
+    let data = collect_session_messages(path);
+    let last_user = data
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "User" && !m.content.trim().is_empty())?;
+    let mut words = last_user
+        .content
+        .split_whitespace()
+        .filter(|w| !w.is_empty());
+    let mut taken: Vec<&str> = Vec::new();
+    for _ in 0..max_words {
+        if let Some(w) = words.next() {
+            taken.push(w);
+        } else {
+            break;
+        }
+    }
+    if taken.is_empty() {
+        None
+    } else {
+        Some(taken.join(" "))
+    }
 }
 
 fn parse_new_format_message(json: &serde_json::Value) -> Option<ParsedMessage> {
@@ -1566,7 +1621,7 @@ enum TumixStatusRaw {
     Failed,
 }
 
-fn load_tumix_status_index() -> TumixStatusIndex {
+pub fn load_tumix_status_index() -> TumixStatusIndex {
     let mut index = TumixStatusIndex::default();
     let tumix_dir = PathBuf::from(".tumix");
     let dir_iter = match fs::read_dir(&tumix_dir) {
