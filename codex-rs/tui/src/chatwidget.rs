@@ -918,22 +918,7 @@ impl ChatWidget {
         };
 
         // Sidebar status: Success/Failure summary
-        let status = if ev.exit_code == 0 {
-            format!("成功 {}s", ev.duration.as_secs())
-        } else {
-            let code = ev.exit_code;
-            format!("失败({}) {}s", code, ev.duration.as_secs())
-        };
-        if let Some(conv) = self.conversation_id.as_ref() {
-            self.app_event_tx
-                .send(crate::app_event::AppEvent::UpdateSessionStatus {
-                    session_id: conv.to_string(),
-                    status,
-                });
-        } else {
-            self.app_event_tx
-                .send(crate::app_event::AppEvent::UpdateCurrentSessionStatus { status });
-        }
+        // 已移除事件发送，改为在 sidebar_status() 中实时计算
 
         let needs_new = self
             .active_cell
@@ -997,18 +982,7 @@ impl ChatWidget {
         self.request_redraw();
 
         // Sidebar status: Waiting for approval
-        if let Some(conv) = self.conversation_id.as_ref() {
-            self.app_event_tx
-                .send(crate::app_event::AppEvent::UpdateSessionStatus {
-                    session_id: conv.to_string(),
-                    status: "等待审批".to_string(),
-                });
-        } else {
-            self.app_event_tx
-                .send(crate::app_event::AppEvent::UpdateCurrentSessionStatus {
-                    status: "等待审批".to_string(),
-                });
-        }
+        // 已移除事件发送，改为在 sidebar_status() 中实时计算
     }
 
     pub(crate) fn handle_apply_patch_approval_now(
@@ -1066,18 +1040,7 @@ impl ChatWidget {
         }
 
         // Sidebar status: Running
-        if let Some(conv) = self.conversation_id.as_ref() {
-            self.app_event_tx
-                .send(crate::app_event::AppEvent::UpdateSessionStatus {
-                    session_id: conv.to_string(),
-                    status: "运行中".to_string(),
-                });
-        } else {
-            self.app_event_tx
-                .send(crate::app_event::AppEvent::UpdateCurrentSessionStatus {
-                    status: "运行中".to_string(),
-                });
-        }
+        // 已移除事件发送，改为在 sidebar_status() 中实时计算
 
         self.request_redraw();
     }
@@ -2856,11 +2819,12 @@ impl ChatWidget {
     /// A lightweight status string for the sidebar, derived from existing UI state.
     /// Currently distinguishes between "运行中" and "就绪" based on Exec activity.
     pub(crate) fn sidebar_status(&self) -> String {
-        // If有底部状态指示器或活跃 Exec，则认为“运行中”。
+        // 检查底部状态指示器或活跃 Exec
         if self.bottom_pane.status_widget().is_some() {
             return "运行中".to_string();
         }
-        // 其次，看 ExecCell/运行中命令
+
+        // 检查 ExecCell/运行中命令
         let exec_active = self
             .active_cell
             .as_ref()
@@ -2870,6 +2834,7 @@ impl ChatWidget {
         if exec_active || !self.running_commands.is_empty() {
             return "运行中".to_string();
         }
+
         // Fallback
         "就绪".to_string()
     }
