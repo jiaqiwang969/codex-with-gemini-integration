@@ -161,12 +161,14 @@ pub(crate) enum AppEvent {
     },
 
     /// Update per-session runtime status (for UnifiedExec etc.).
+    #[allow(dead_code)]
     UpdateSessionStatus {
         session_id: String,
         status: String,
     },
 
     /// Update runtime status for the current active conversation (id inferred in App).
+    #[allow(dead_code)]
     UpdateCurrentSessionStatus {
         status: String,
     },

@@ -1175,12 +1175,12 @@ struct ParsedMessage {
 }
 
 #[derive(Default)]
-struct ParsedSessionData {
+pub(crate) struct ParsedSessionData {
     messages: Vec<ParsedMessage>,
     total_tokens: Option<usize>,
 }
 
-pub fn collect_session_messages(path: &PathBuf) -> ParsedSessionData {
+pub(crate) fn collect_session_messages(path: &PathBuf) -> ParsedSessionData {
     let mut data = ParsedSessionData::default();
     let file = match fs::File::open(path) {
         Ok(file) => file,
@@ -1235,6 +1235,7 @@ pub fn collect_session_messages(path: &PathBuf) -> ParsedSessionData {
 
 /// Return the first User message's first `max_words` words as a snippet label.
 /// Falls back to None if no user message is present or content is empty.
+#[allow(dead_code)]
 pub fn first_user_snippet(path: &PathBuf, max_words: usize) -> Option<String> {
     let data = collect_session_messages(path);
     let first_user = data

@@ -15,6 +15,7 @@ use ratatui::widgets::WidgetRef;
 use unicode_width::UnicodeWidthStr;
 
 use crate::cxresume_picker_widget::SessionInfo;
+use crate::cxresume_picker_widget::TumixState;
 use crate::cxresume_picker_widget::get_cwd_sessions;
 use crate::cxresume_picker_widget::last_user_snippet;
 use crate::cxresume_picker_widget::load_tumix_status_index;
@@ -247,7 +248,7 @@ impl SessionBar {
         let mut cur_x: u16 = 0;
         let mut sel_start: Option<u16> = None;
         let mut sel_end: Option<u16> = None;
-        let mut add_left =
+        let add_left =
             |spans: &mut Vec<Span<'static>>, cur_x: &mut u16, text: String, style: Style| {
                 *cur_x = cur_x.saturating_add(UnicodeWidthStr::width(text.as_str()) as u16);
                 spans.push(Span::styled(text, style));
@@ -335,7 +336,7 @@ impl SessionBar {
                     .cloned()
                     .unwrap_or_else(|| String::new());
                 // Compose: <snippet> · <short-id> [· <status>]
-                let mut composed = if label_part.is_empty() {
+                let composed = if label_part.is_empty() {
                     session_id.clone()
                 } else {
                     format!("{} · {}", label_part, session_id)
@@ -356,10 +357,16 @@ impl SessionBar {
                     sel_end = Some(cur_x);
                 }
 
-                if session.tumix.is_some() {
+                if let Some(ind) = session.tumix.as_ref() {
+                    let (label, color) = match ind.state {
+                        TumixState::Running => ("运行", Color::Yellow),
+                        TumixState::Completed => ("完成", Color::Green),
+                        TumixState::Failed => ("失败", Color::Red),
+                        TumixState::Stalled => ("停滞", Color::Magenta),
+                    };
                     left_spans.push(Span::styled(
-                        "*",
-                        Style::default().fg(Color::Rgb(191, 90, 242)),
+                        format!(" · {}", label),
+                        Style::default().fg(color),
                     ));
                 }
                 if !is_selected && session.message_count > 0 {
@@ -418,6 +425,12 @@ impl SessionBar {
                 .add_modifier(Modifier::BOLD);
             right_spans.push(b);
             right_spans.push(Span::raw(" Open "));
+            let mut nk = Span::raw("n");
+            nk.style = Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD);
+            right_spans.push(nk);
+            right_spans.push(Span::raw(" New "));
             let mut xk = Span::raw("x");
             xk.style = Style::default()
                 .fg(Color::Cyan)

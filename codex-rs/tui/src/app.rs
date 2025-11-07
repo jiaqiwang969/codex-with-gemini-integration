@@ -75,6 +75,7 @@ pub(crate) enum PanelFocus {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum LayoutMode {
     Normal,
+    #[allow(dead_code)]
     Collapsed,
 }
 
@@ -96,6 +97,7 @@ pub(crate) struct App {
     // Session panel components
     pub(crate) session_bar: SessionBar,
     pub(crate) panel_focus: PanelFocus,
+    #[allow(dead_code)]
     pub(crate) layout_mode: LayoutMode,
 
     // Pager overlay state (Transcript or Static like Diff)
@@ -928,6 +930,8 @@ impl App {
                     claim_status,
                     mode,
                 );
+                // 刷新会话栏以反映运行中状态
+                self.session_bar.refresh_sessions();
             }
             DelegateEvent::Delta { run_id, chunk, .. } => {
                 self.chat_widget.on_delegate_delta(&run_id, &chunk);
@@ -974,6 +978,8 @@ impl App {
                         output.as_deref(),
                     );
                 }
+                // 刷新会话栏以反映完成状态
+                self.session_bar.refresh_sessions();
             }
             DelegateEvent::Failed {
                 run_id,
@@ -1000,6 +1006,8 @@ impl App {
                     self.chat_widget
                         .notify_detached_failure(&display.label, &error);
                 }
+                // 刷新会话栏以反映失败/停滞状态
+                self.session_bar.refresh_sessions();
             }
         }
     }
@@ -1418,6 +1426,10 @@ impl App {
                             KeyCode::Right | KeyCode::Char('l') => {
                                 self.session_bar.select_next();
                                 tui.frame_requester().schedule_frame();
+                            }
+                            KeyCode::Char('n') => {
+                                // 快速新建会话
+                                self.app_event_tx.send(AppEvent::NewSession);
                             }
                             KeyCode::Enter => {
                                 // Enter on New vs History session
