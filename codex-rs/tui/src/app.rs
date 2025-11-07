@@ -12,6 +12,7 @@ use crate::history_cell::HistoryCell;
 use crate::pager_overlay::Overlay;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::resume_picker::ResumeSelection;
+use crate::session_bar::SessionBar;
 use crate::tui;
 use crate::tui::TuiEvent;
 use crate::updates::UpdateAction;
@@ -39,6 +40,7 @@ use color_eyre::eyre::WrapErr;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
+use ratatui::layout::Rect;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use std::collections::HashMap;
@@ -64,6 +66,18 @@ pub struct AppExitInfo {
     pub update_action: Option<UpdateAction>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum PanelFocus {
+    Sessions,
+    Chat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum LayoutMode {
+    Normal,
+    Collapsed,
+}
+
 pub(crate) struct App {
     pub(crate) server: Arc<ConversationManager>,
     pub(crate) app_event_tx: AppEventSender,
@@ -78,6 +92,11 @@ pub(crate) struct App {
     pub(crate) file_search: FileSearchManager,
 
     pub(crate) transcript_cells: Vec<Arc<dyn HistoryCell>>,
+
+    // Session panel components
+    pub(crate) session_bar: SessionBar,
+    pub(crate) panel_focus: PanelFocus,
+    pub(crate) layout_mode: LayoutMode,
 
     // Pager overlay state (Transcript or Static like Diff)
     pub(crate) overlay: Option<Overlay>,
@@ -284,6 +303,8 @@ impl App {
         #[cfg(not(debug_assertions))]
         let upgrade_version = crate::updates::get_upgrade_version(&config);
 
+        let session_bar = SessionBar::new(config.cwd.clone());
+
         let mut app = Self {
             server: conversation_manager,
             app_event_tx,
@@ -310,6 +331,9 @@ impl App {
             pending_update_action: None,
             delegate_tree: DelegateTree::default(),
             delegate_status_owner: None,
+            session_bar,
+            panel_focus: PanelFocus::Chat,
+            layout_mode: LayoutMode::Normal,
         };
 
         app.cxresume_idle.trigger_immediate(&app.app_event_tx);
@@ -430,15 +454,85 @@ impl App {
                     {
                         return Ok(true);
                     }
-                    tui.draw(
-                        self.chat_widget.desired_height(tui.terminal.size()?.width),
-                        |frame| {
-                            frame.render_widget_ref(&self.chat_widget, frame.area());
-                            if let Some((x, y)) = self.chat_widget.cursor_pos(frame.area()) {
+
+                    // Auto-manage layout mode based on screen width
+                    let terminal_width = tui.terminal.size()?.width;
+                    if terminal_width < 100 && self.layout_mode == LayoutMode::Normal {
+                        // Auto-collapse on very narrow screens
+                        self.layout_mode = LayoutMode::Collapsed;
+                    } else if terminal_width >= 150 && self.layout_mode == LayoutMode::Collapsed {
+                        // Could auto-expand, but let user control this
+                        // self.layout_mode = LayoutMode::Normal;
+                    }
+
+                    // Update session bar with current conversation ID
+                    let current_conv_id =
+                        self.chat_widget.conversation_id().map(|id| id.to_string());
+                    self.session_bar.set_current_session(current_conv_id);
+
+                    // First, calculate heights based on whether session bar is visible
+                    let terminal_area = tui.terminal.size()?;
+                    let (main_height, session_height) = if self.layout_mode == LayoutMode::Normal {
+                        // Reserve 4 lines for session bar (3 content + 1 separator)
+                        let session_h = 4u16;
+                        let main_h = terminal_area.height.saturating_sub(session_h);
+                        (main_h, session_h)
+                    } else {
+                        // No session bar
+                        (terminal_area.height, 0u16)
+                    };
+
+                    // Calculate the desired height for the inline viewport
+                    // This should be the height ChatWidget needs within its allocated area
+                    let chat_desired_in_area = self
+                        .chat_widget
+                        .desired_height(terminal_area.width)
+                        .min(main_height);
+
+                    // Total viewport height includes session bar if visible
+                    let total_desired_height = if session_height > 0 {
+                        chat_desired_in_area.saturating_add(session_height)
+                    } else {
+                        chat_desired_in_area
+                    };
+
+                    tui.draw(total_desired_height, |frame| {
+                        // Compute areas relative to the current viewport
+                        let frame_area = frame.area();
+                        let main_area = Rect::new(
+                            frame_area.x,
+                            frame_area.y,
+                            frame_area.width,
+                            frame_area.height.saturating_sub(session_height),
+                        );
+                        let session_area = if session_height > 0 {
+                            Rect::new(
+                                frame_area.x,
+                                frame_area.y.saturating_add(
+                                    frame_area.height.saturating_sub(session_height),
+                                ),
+                                frame_area.width,
+                                session_height,
+                            )
+                        } else {
+                            Rect::default()
+                        };
+
+                        // Render ChatWidget in its allocated area
+                        frame.render_widget_ref(&self.chat_widget, main_area);
+
+                        // Render session bar at bottom if visible
+                        if !session_area.is_empty() {
+                            frame.render_widget_ref(&self.session_bar, session_area);
+                        }
+
+                        // Set cursor position based on focus
+                        if self.panel_focus == PanelFocus::Chat {
+                            if let Some((x, y)) = self.chat_widget.cursor_pos(main_area) {
                                 frame.set_cursor_position((x, y));
                             }
-                        },
-                    )?;
+                        }
+                    })?;
                 }
             }
         }
@@ -459,6 +553,14 @@ impl App {
                     feedback: self.feedback.clone(),
                 };
                 self.chat_widget = ChatWidget::new(init, self.server.clone());
+
+                // Switch focus to new chat
+                self.panel_focus = PanelFocus::Chat;
+                self.session_bar.set_focus(false);
+
+                // Refresh session list
+                self.session_bar.refresh_sessions();
+
                 tui.frame_requester().schedule_frame();
             }
             AppEvent::ResumeSession(path) => {
@@ -1112,6 +1214,14 @@ impl App {
         self.transcript_cells.clear();
         self.deferred_history_lines.clear();
         self.has_emitted_history_lines = false;
+
+        // Switch focus to chat panel after loading session
+        self.panel_focus = PanelFocus::Chat;
+        self.session_bar.set_focus(false);
+
+        // Refresh session list to update selection state
+        self.session_bar.refresh_sessions();
+
         tui.frame_requester().schedule_frame();
         Ok(())
     }
@@ -1123,6 +1233,36 @@ impl App {
 
     async fn handle_key_event(&mut self, tui: &mut tui::Tui, key_event: KeyEvent) {
         match key_event {
+            // Tab switches focus between panels
+            KeyEvent {
+                code: KeyCode::Tab,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                match self.panel_focus {
+                    PanelFocus::Sessions => {
+                        self.panel_focus = PanelFocus::Chat;
+                        self.session_bar.set_focus(false);
+                    }
+                    PanelFocus::Chat => {
+                        self.panel_focus = PanelFocus::Sessions;
+                        self.session_bar.set_focus(true);
+                    }
+                }
+                tui.frame_requester().schedule_frame();
+            }
+            // F1 toggles sidebar
+            KeyEvent {
+                code: KeyCode::F(1),
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                self.layout_mode = match self.layout_mode {
+                    LayoutMode::Normal => LayoutMode::Collapsed,
+                    LayoutMode::Collapsed => LayoutMode::Normal,
+                };
+                tui.frame_requester().schedule_frame();
+            }
             KeyEvent {
                 code: KeyCode::Char('t'),
                 modifiers: crossterm::event::KeyModifiers::CONTROL,
@@ -1132,6 +1272,18 @@ impl App {
                 // Enter alternate screen and set viewport to full size.
                 let _ = tui.enter_alt_screen();
                 self.overlay = Some(Overlay::new_transcript(self.transcript_cells.clone()));
+                tui.frame_requester().schedule_frame();
+            }
+            // Ctrl+P - Quick session search/picker
+            KeyEvent {
+                code: KeyCode::Char('p'),
+                modifiers: crossterm::event::KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                // Focus the session panel for quick search
+                self.panel_focus = PanelFocus::Sessions;
+                self.session_bar.set_focus(true);
                 tui.frame_requester().schedule_frame();
             }
             KeyEvent {
@@ -1213,7 +1365,45 @@ impl App {
                 if key_event.code != KeyCode::Esc && self.backtrack.primed {
                     self.reset_backtrack_state();
                 }
-                self.chat_widget.handle_key_event(key_event);
+
+                // Route key events based on focus
+                match self.panel_focus {
+                    PanelFocus::Sessions => {
+                        // Handle session bar navigation (horizontal)
+                        match key_event.code {
+                            KeyCode::Left | KeyCode::Char('h') => {
+                                self.session_bar.select_previous();
+                                tui.frame_requester().schedule_frame();
+                            }
+                            KeyCode::Right | KeyCode::Char('l') => {
+                                self.session_bar.select_next();
+                                tui.frame_requester().schedule_frame();
+                            }
+                            KeyCode::Enter => {
+                                // Load selected session
+                                if let Some(session) = self.session_bar.selected_session() {
+                                    self.app_event_tx
+                                        .send(AppEvent::ResumeSession(session.path.clone()));
+                                }
+                            }
+                            KeyCode::Char('r') => {
+                                // Refresh sessions
+                                self.session_bar.refresh_sessions();
+                                tui.frame_requester().schedule_frame();
+                            }
+                            KeyCode::Esc | KeyCode::Tab => {
+                                // Return focus to chat
+                                self.panel_focus = PanelFocus::Chat;
+                                self.session_bar.set_focus(false);
+                                tui.frame_requester().schedule_frame();
+                            }
+                            _ => {}
+                        }
+                    }
+                    PanelFocus::Chat => {
+                        self.chat_widget.handle_key_event(key_event);
+                    }
+                }
             }
             _ => {
                 // Ignore Release key events.
@@ -1423,6 +1613,8 @@ mod tests {
             config.multi_agent.max_concurrent_delegates,
         ));
 
+        let session_bar = SessionBar::new(config.cwd.clone());
+
         App {
             server,
             app_event_tx,
@@ -1449,6 +1641,9 @@ mod tests {
             pending_update_action: None,
             delegate_tree: DelegateTree::default(),
             delegate_status_owner: None,
+            session_bar,
+            panel_focus: PanelFocus::Chat,
+            layout_mode: LayoutMode::Normal,
         }
     }
 

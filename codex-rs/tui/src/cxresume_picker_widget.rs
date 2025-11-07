@@ -191,7 +191,7 @@ pub struct SessionInfo {
 }
 
 #[derive(Default)]
-struct TumixStatusIndex {
+pub struct TumixStatusIndex {
     by_session: HashMap<String, TimedIndicator>,
     by_path: HashMap<PathBuf, TimedIndicator>,
 }
@@ -246,7 +246,7 @@ impl TumixStatusIndex {
         }
     }
 
-    fn lookup(&self, session_id: &str, path: &Path) -> Option<TumixIndicator> {
+    pub fn lookup(&self, session_id: &str, path: &Path) -> Option<TumixIndicator> {
         if let Some(entry) = self.by_session.get(session_id) {
             return Some(entry.indicator.clone());
         }
@@ -1566,7 +1566,7 @@ enum TumixStatusRaw {
     Failed,
 }
 
-fn load_tumix_status_index() -> TumixStatusIndex {
+pub fn load_tumix_status_index() -> TumixStatusIndex {
     let mut index = TumixStatusIndex::default();
     let tumix_dir = PathBuf::from(".tumix");
     let dir_iter = match fs::read_dir(&tumix_dir) {
