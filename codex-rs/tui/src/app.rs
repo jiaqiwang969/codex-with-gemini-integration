@@ -531,15 +531,14 @@ impl App {
 
     async fn handle_event(&mut self, tui: &mut tui::Tui, event: AppEvent) -> Result<bool> {
         match event {
-            AppEvent::UpdateSessionStatus { session_id, status } => {
-                self.session_bar.set_session_status(session_id, status);
-                tui.frame_requester().schedule_frame();
+            AppEvent::UpdateSessionStatus {
+                session_id: _,
+                status: _,
+            } => {
+                // 已废弃：状态现在从 ChatWidget 实时读取
             }
-            AppEvent::UpdateCurrentSessionStatus { status } => {
-                if let Some(cur) = self.chat_widget.conversation_id() {
-                    self.session_bar.set_session_status(cur.to_string(), status);
-                    tui.frame_requester().schedule_frame();
-                }
+            AppEvent::UpdateCurrentSessionStatus { status: _ } => {
+                // 已废弃：状态现在从 ChatWidget 实时读取
             }
             AppEvent::NewSession => {
                 let init = crate::chatwidget::ChatWidgetInit {

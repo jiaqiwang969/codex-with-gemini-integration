@@ -35,10 +35,10 @@ pub struct SessionBar {
     error: Option<String>,
     /// Current active session ID (if any)
     current_session_id: Option<String>,
+    /// Status for the current session only
+    current_session_status: Option<String>,
     /// Cached labels derived from first user message (by path)
     label_cache: HashMap<PathBuf, String>,
-    /// Per-session status text (keyed by session id)
-    status_by_session: HashMap<String, String>,
 }
 
 impl SessionBar {
@@ -51,8 +51,8 @@ impl SessionBar {
             loading: false,
             error: None,
             current_session_id: None,
+            current_session_status: None,
             label_cache: HashMap::new(),
-            status_by_session: HashMap::new(),
         };
 
         // Load sessions on creation
@@ -179,12 +179,19 @@ impl SessionBar {
 
     /// Set current session ID
     pub fn set_current_session(&mut self, session_id: Option<String>) {
+        // Clear status when switching sessions
+        if self.current_session_id != session_id {
+            self.current_session_status = None;
+        }
         self.current_session_id = session_id;
     }
 
-    /// Update status text for a specific session id
+    /// Update status text for the current session only
     pub fn set_session_status(&mut self, session_id: String, status: String) {
-        self.status_by_session.insert(session_id, status);
+        // Only update if it's the current session
+        if self.current_session_id.as_ref() == Some(&session_id) {
+            self.current_session_status = Some(status);
+        }
     }
 
     /// Reset selection when the bar gains focus: select current if present, else select "新建".
@@ -325,13 +332,7 @@ impl SessionBar {
                 } else {
                     format!("{} · {}", label_part, session_id)
                 };
-                if let Some(st) = self.status_by_session.get(&session.id) {
-                    // keep short; leave full text on the right for current
-                    if !st.is_empty() {
-                        composed.push_str(" · ");
-                        composed.push_str(st);
-                    }
-                }
+                // Don't show status in history items - only show in right side for current
 
                 if is_selected && sel_start.is_none() {
                     sel_start = Some(cur_x);
@@ -375,9 +376,8 @@ impl SessionBar {
                 cur_id.to_string()
             };
             let st = self
-                .status_by_session
-                .get(cur_id)
-                .cloned()
+                .current_session_status
+                .clone()
                 .unwrap_or_else(|| "就绪".to_string());
             (st, short_cur)
         } else {
