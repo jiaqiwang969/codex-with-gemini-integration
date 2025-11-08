@@ -6,11 +6,8 @@ use mcp_types::CallToolResult;
 use mcp_types::ContentBlock;
 use mcp_types::TextContent;
 use serde::Deserialize;
-use std::time::Duration;
-use tokio::time::sleep;
-use tracing::debug;
-use tracing::info;
-use tracing::warn;
+use serde_json::json;
+use tracing::{info, warn};
 
 use crate::image_utils::ImageSource;
 use crate::image_utils::{self};
@@ -20,7 +17,19 @@ use crate::models::GenerateType;
 use crate::models::PolygonType;
 use crate::models::ViewImage;
 use crate::tencent_cloud::TencentCloudClient;
-use crate::tools::download::download_results;
+
+async fn append_jsonl_event(base_dir: &str, job_id: &str, event: serde_json::Value) -> anyhow::Result<()> {
+    use tokio::fs::OpenOptions;
+    use tokio::io::AsyncWriteExt;
+    let log_root = std::path::Path::new(base_dir).join("logs");
+    tokio::fs::create_dir_all(&log_root).await?;
+    let path = log_root.join(format!("{}.jsonl", job_id));
+    let mut f = OpenOptions::new().create(true).append(true).open(path).await?;
+    let mut line = serde_json::to_string(&event)?;
+    line.push('\n');
+    f.write_all(line.as_bytes()).await?;
+    Ok(())
+}
 
 #[derive(Debug, Deserialize)]
 struct GenerateParams {
@@ -28,7 +37,6 @@ struct GenerateParams {
     image_url: Option<String>,
     image_base64: Option<String>,
     multi_view_images: Option<Vec<ViewImageParam>>,
-    output_format: Option<String>,
     api_version: Option<String>,
     generate_type: Option<String>,
     enable_pbr: Option<bool>,
@@ -37,7 +45,6 @@ struct GenerateParams {
     negative_prompt: Option<String>,
     seed: Option<i32>,
     wait_for_completion: Option<bool>,
-    output_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,8 +66,7 @@ pub async fn handle_generate(
     let api_version = match params.api_version.as_deref() {
         Some("rapid") => ApiVersion::Rapid,
         Some("pro") => ApiVersion::Pro,
-        Some("standard") => ApiVersion::Standard,
-        _ => ApiVersion::Pro, // Default to Pro (more features and parameters)
+        _ => ApiVersion::Rapid, // Default to Rapid (supports OutputFormat)
     };
 
     // Build request
@@ -69,7 +75,8 @@ pub async fn handle_generate(
         image_base64: None,
         image_url: None,
         multi_view_images: None,
-        output_format: params.output_format.or_else(|| Some("obj".to_string())), // Default to OBJ
+        // 仅允许 OBJ，强制为 OBJ（返回官方 ZIP 打包直链）
+        output_format: Some("OBJ".to_string()),
         enable_pbr: params.enable_pbr,
         face_count: params.face_count,
         generate_type: None,
@@ -158,6 +165,21 @@ pub async fn handle_generate(
     let job_id = submit_response.job_id.clone();
 
     info!("Submitted job: {}", job_id);
+    // 强制使用 /tmp/hunyuan-3d 作为输出目录（不允许 MCP 自定义）
+    let base_output_dir = "/tmp/hunyuan-3d".to_string();
+    let _ = append_jsonl_event(
+        &base_output_dir,
+        &job_id,
+        json!({
+            "event":"submitted",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "job_id": job_id,
+            "api_version": match api_version { ApiVersion::Rapid=>"rapid", ApiVersion::Pro=>"pro", ApiVersion::Standard=>"standard" },
+            "prompt": params.prompt,
+            "output_format": "OBJ",
+            "output_dir": "/tmp/hunyuan-3d"
+        })
+    ).await;
 
     // Prepare initial response
     let mut response_text = format!(
@@ -176,114 +198,57 @@ pub async fn handle_generate(
     if has_image {
         response_text.push_str("**Image**: Provided\n");
     }
+    // 显式告知输出格式为 OBJ
+    response_text.push_str("**输出格式**: OBJ\n");
 
-    // Wait for completion if requested
-    let wait_for_completion = params.wait_for_completion.unwrap_or(true);
-    if wait_for_completion {
-        response_text.push_str("\n⏳ Waiting for job to complete...\n");
-
-        let max_wait = Duration::from_secs(600); // 10 minutes
-        let poll_interval = Duration::from_secs(10);
-        let start = std::time::Instant::now();
-
-        loop {
-            if start.elapsed() > max_wait {
-                response_text.push_str("\n⚠️ Job timed out after 10 minutes. You can check status later with hunyuan_query_task.\n");
-                break;
-            }
-
-            sleep(poll_interval).await;
-
-            match client.query_job(&job_id, api_version).await {
-                Ok(status) => {
-                    debug!("Job {} status: {}", job_id, status.status);
-
-                    let status_lower = status.status.to_lowercase();
-                    if status_lower == "success"
-                        || status_lower == "completed"
-                        || status_lower == "finish"
-                    {
-                        response_text.push_str(&format!("\n✅ Job completed successfully!\n"));
-
-                        // Auto-download results
-                        if let Some(output_dir) = params.output_dir.as_ref() {
-                            match download_results(&job_id, api_version, output_dir, &client).await
-                            {
-                                Ok(files) => {
-                                    response_text.push_str(&format!(
-                                        "\n📦 Downloaded {} files to {}/\n",
-                                        files.len(),
-                                        output_dir
-                                    ));
-                                    for file in files {
-                                        response_text.push_str(&format!("  - {}\n", file));
-                                    }
-                                }
-                                Err(e) => {
-                                    response_text.push_str(&format!(
-                                        "\n⚠️ Failed to download files: {}\n",
-                                        e
-                                    ));
-                                }
-                            }
-                        }
-                        break;
-                    } else if status_lower == "failed"
-                        || status_lower == "error"
-                        || status_lower == "timeout"
-                    {
-                        let error_msg = status
-                            .error_msg
-                            .unwrap_or_else(|| "Unknown error".to_string());
-                        response_text.push_str(&format!("\n❌ Job failed: {}\n", error_msg));
-                        break;
-                    }
-                }
-                Err(e) => {
-                    debug!("Query error (will retry): {}", e);
-                }
-            }
-        }
-    } else {
+    // 若不等待，直接返回
+    if !params.wait_for_completion.unwrap_or(true) {
         response_text.push_str("\n💡 Job submitted. Use hunyuan_query_task to check status.\n");
     }
 
     // 如果 wait_for_completion 参数为 true，自动轮询并下载
     if params.wait_for_completion.unwrap_or(true) {
         info!("Auto-polling enabled, waiting for job completion...");
-
+        
         // 轮询任务状态
         let max_wait_time = std::time::Duration::from_secs(300); // 最多等待5分钟
         let poll_interval = std::time::Duration::from_secs(5); // 每5秒查询一次
         let start_time = std::time::Instant::now();
-
+        
         let mut final_status = None;
-
+        
         while start_time.elapsed() < max_wait_time {
             tokio::time::sleep(poll_interval).await;
-
+            
             match client.query_job(&job_id, api_version).await {
                 Ok(status) => {
                     let status_lower = status.status.to_lowercase();
                     info!("Job {} status: {}", job_id, status.status);
-
-                    if status_lower == "done"
-                        || status_lower == "success"
-                        || status_lower == "completed"
-                        || status_lower == "finish"
-                    {
+                    let _ = append_jsonl_event(
+                        &base_output_dir,
+                        &job_id,
+                        json!({
+                            "event":"status",
+                            "timestamp": chrono::Utc::now().to_rfc3339(),
+                            "job_id": job_id,
+                            "status": status.status
+                        })
+                    ).await;
+                    
+                    if status_lower == "done" || status_lower == "succ" || status_lower == "success" || status_lower == "completed" || status_lower == "finish" {
                         final_status = Some(status);
                         break;
-                    } else if status_lower == "failed"
-                        || status_lower == "error"
-                        || status_lower == "timeout"
-                    {
-                        let error_msg = status
-                            .error_msg
+                    } else if status_lower == "failed" || status_lower == "error" || status_lower == "timeout" {
+                        let error_msg = status.error_msg
                             .or(status.error_message)
                             .unwrap_or_else(|| "Unknown error".to_string());
                         response_text = format!("❌ 3D生成失败\n\n**错误信息**: {}", error_msg);
-
+                        let _ = append_jsonl_event(
+                            &base_output_dir,
+                            &job_id,
+                            json!({"event":"failed","timestamp": chrono::Utc::now().to_rfc3339(),"job_id": job_id,"error": error_msg})
+                        ).await;
+                        
                         return Ok(CallToolResult {
                             content: vec![ContentBlock::TextContent(TextContent {
                                 r#type: "text".to_string(),
@@ -302,84 +267,46 @@ pub async fn handle_generate(
                 }
             }
         }
-
+        
         // 如果任务完成，自动下载文件
         if let Some(status) = final_status {
             response_text = format!("✅ 3D模型生成成功！\n\n");
-
+            
             if let Some(prompt) = &params.prompt {
                 response_text.push_str(&format!("**描述**: {}\n", prompt));
             }
-
-            // 创建输出目录 - 使用时间戳和描述创建唯一目录
-            let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-            let base_dir = params
-                .output_dir
-                .clone()
-                .unwrap_or_else(|| "/tmp/hunyuan-3d".to_string());
-
-            // 从prompt中提取简短描述作为目录名的一部分
-            let desc = if let Some(prompt) = &params.prompt {
-                // 取前20个字符，移除特殊字符
-                let clean: String = prompt
-                    .chars()
-                    .take(20)
-                    .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_')
-                    .collect::<String>()
-                    .trim()
-                    .replace(' ', "_");
-                if !clean.is_empty() {
-                    format!("_{}", clean)
-                } else {
-                    String::new()
-                }
-            } else {
-                String::new()
-            };
-
-            let output_dir = format!(
-                "{}/{}_{}{}",
-                base_dir,
-                timestamp,
-                &job_id[..8], // 使用JobID的前8位
-                desc
-            );
+            let _ = append_jsonl_event(
+                &base_output_dir,
+                &job_id,
+                json!({"event":"completed","timestamp": chrono::Utc::now().to_rfc3339(),"job_id": job_id})
+            ).await;
+            
+            // 创建输出目录
+            let output_dir = base_output_dir.clone();
             let output_path = std::path::PathBuf::from(&output_dir);
             tokio::fs::create_dir_all(&output_path).await?;
-
+            
             let mut downloaded_files = Vec::new();
-
+            
             // 下载3D文件
             if let Some(files) = status.result_file3_d_s {
                 for file in files {
                     // 下载预览图
                     if let Some(preview) = &file.preview_image_url {
-                        response_text
-                            .push_str(&format!("\n🖼️ **预览图**: [查看预览]({})\n", preview));
+                        response_text.push_str(&format!("\n🖼️ **预览图**: [查看预览]({})\n", preview));
                     }
-
+                    
                     // 下载模型文件
-                    let ext = if file.url.contains(".zip") {
-                        "zip"
-                    } else {
-                        &file.file_type.to_lowercase()
-                    };
+                    let ext = if file.url.contains(".zip") { "zip" } else { &file.file_type.to_lowercase() };
                     let filename = format!("{}_{}.{}", job_id, file.file_type.to_lowercase(), ext);
-
-                    match crate::tools::download::download_file(&file.url, &output_path, &filename)
-                        .await
-                    {
+                    
+                    match crate::tools::download::download_file(&file.url, &output_path, &filename).await {
                         Ok(downloaded_path) => {
                             downloaded_files.push(downloaded_path.clone());
-
+                            
                             // 如果是ZIP文件，解压它
                             if downloaded_path.ends_with(".zip") {
-                                if let Ok(extracted) = crate::tools::download::extract_zip(
-                                    &downloaded_path,
-                                    &output_path,
-                                )
-                                .await
-                                {
+                                if let Ok(extracted) = crate::tools::download::extract_zip(&downloaded_path, &output_path).await {
                                     downloaded_files.extend(extracted);
                                 }
                             }
@@ -390,45 +317,42 @@ pub async fn handle_generate(
                     }
                 }
             }
-
+            
             // 显示下载的文件
             if !downloaded_files.is_empty() {
-                response_text.push_str(&format!(
-                    "\n📁 **下载的文件** (保存在 `{}`目录):\n",
-                    output_dir
-                ));
+                response_text.push_str(&format!("\n📁 **下载的文件** (保存在 `{}`目录):\n", output_dir));
                 for file in &downloaded_files {
                     if let Some(filename) = std::path::Path::new(&file).file_name() {
                         response_text.push_str(&format!("  - {}\n", filename.to_string_lossy()));
                     }
                 }
-
+                let _ = append_jsonl_event(
+                    &base_output_dir,
+                    &job_id,
+                    json!({"event":"downloaded","timestamp": chrono::Utc::now().to_rfc3339(),"job_id": job_id,"files": downloaded_files})
+                ).await;
+                
                 // 特别标注主要的3D文件
                 for file in &downloaded_files {
-                    if file.ends_with(".obj")
-                        || file.ends_with(".glb")
-                        || file.ends_with(".fbx")
-                        || file.ends_with(".usdz")
-                    {
+                    if file.ends_with(".obj") || file.ends_with(".glb") || file.ends_with(".fbx") || file.ends_with(".usdz") {
                         response_text.push_str(&format!("\n🎯 **3D模型文件**: `{}`\n", file));
                         break;
                     }
                 }
             }
-
-            response_text.push_str(&format!(
-                "\n⏱️ **生成用时**: 约{}秒",
-                start_time.elapsed().as_secs()
-            ));
+            
+            response_text.push_str(&format!("\n⏱️ **生成用时**: 约{}秒", start_time.elapsed().as_secs()));
         } else {
-            response_text.push_str(&format!(
-                "\n⏱️ 任务处理超时（已等待{}秒）\n",
-                max_wait_time.as_secs()
-            ));
+            response_text.push_str(&format!("\n⏱️ 任务处理超时（已等待{}秒）\n", max_wait_time.as_secs()));
             response_text.push_str(&format!("您可以稍后使用Job ID查询: {}", job_id));
+            let _ = append_jsonl_event(
+                &base_output_dir,
+                &job_id,
+                json!({"event":"timeout","timestamp": chrono::Utc::now().to_rfc3339(),"job_id": job_id,"max_wait_secs": max_wait_time.as_secs()})
+            ).await;
         }
     }
-
+    
     Ok(CallToolResult {
         content: vec![ContentBlock::TextContent(TextContent {
             r#type: "text".to_string(),

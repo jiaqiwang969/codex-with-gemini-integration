@@ -888,7 +888,7 @@ impl Config {
     /// Add built-in MCP servers like hunyuan-3d
     fn add_builtin_mcp_servers(
         mut mcp_servers: HashMap<String, McpServerConfig>,
-        codex_home: &Path,
+        _codex_home: &Path,
     ) -> HashMap<String, McpServerConfig> {
         // Check if hunyuan-3d is already configured
         if !mcp_servers.contains_key("hunyuan-3d") {

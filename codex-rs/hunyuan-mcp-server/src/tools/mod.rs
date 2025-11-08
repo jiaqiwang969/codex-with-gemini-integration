@@ -61,12 +61,6 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                         },
                         "description": "多视角图片 - Pro版本支持提供多个角度的参考图以生成更精确的模型"
                     },
-                    "output_format": {
-                        "type": "string",
-                        "enum": ["obj", "glb", "stl", "usdz", "fbx", "mp4"],
-                        "default": "obj",
-                        "description": "输出格式(仅Rapid API支持) - OBJ:最通用; GLB:Web友好; STL:3D打印; USDZ:苹果; FBX:游戏; MP4:视频"
-                    },
                     "api_version": {
                         "type": "string",
                         "enum": ["pro", "rapid", "standard"],
@@ -106,11 +100,6 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                         "type": "boolean",
                         "default": true,
                         "description": "是否等待任务完成并自动下载文件 - true:一站式完成; false:仅提交任务"
-                    },
-                    "output_dir": {
-                        "type": "string",
-                        "default": "/tmp/hunyuan-3d",
-                        "description": "输出目录 - 生成的3D文件保存位置(默认/tmp/hunyuan-3d)"
                     }
                 })),
                 required: Some(vec![]),

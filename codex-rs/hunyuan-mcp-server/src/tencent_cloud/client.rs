@@ -320,7 +320,7 @@ impl TencentCloudClient {
 
             // Send request
             let response = request.send().await?;
-            let status = response.status();
+            let _status = response.status();
             let text = response.text().await?;
 
             debug!("API Response: {}", text);
