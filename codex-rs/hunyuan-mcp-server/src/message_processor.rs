@@ -160,7 +160,7 @@ impl MessageProcessor {
             Ok(r) => r,
             Err(e) => {
                 self.sender
-                    .send_error(id, -32602, format!("Invalid params: {}", e));
+                    .send_error(id, -32602, format!("Invalid params: {e}"));
                 return;
             }
         };
@@ -220,7 +220,7 @@ impl MessageProcessor {
             Ok(r) => r,
             Err(e) => {
                 self.sender
-                    .send_error(id, -32602, format!("Invalid params: {}", e));
+                    .send_error(id, -32602, format!("Invalid params: {e}"));
                 return;
             }
         };
@@ -257,7 +257,7 @@ impl MessageProcessor {
                 let result = CallToolResult {
                     content: vec![ContentBlock::TextContent(TextContent {
                         r#type: "text".to_string(),
-                        text: format!("Error: {}", e),
+                        text: format!("Error: {e}"),
                         annotations: None,
                     })],
                     is_error: Some(true),

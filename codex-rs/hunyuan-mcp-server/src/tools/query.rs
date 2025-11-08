@@ -55,13 +55,13 @@ pub async fn handle_query(
         response_text.push_str("\n✅ Job completed successfully!\n");
 
         if let Some(preview_url) = &status.preview_url {
-            response_text.push_str(&format!("\n**Preview**: {}\n", preview_url));
+            response_text.push_str(&format!("\n**Preview**: {preview_url}\n"));
         }
 
         if let Some(result_urls) = &status.result_urls {
             response_text.push_str("\n**Result Files**:\n");
             for url in result_urls {
-                response_text.push_str(&format!("  - {}\n", url));
+                response_text.push_str(&format!("  - {url}\n"));
             }
         }
 
@@ -70,7 +70,7 @@ pub async fn handle_query(
             for file in files {
                 response_text.push_str(&format!("  - {} format: {}\n", file.file_type, file.url));
                 if let Some(preview) = &file.preview_image_url {
-                    response_text.push_str(&format!("    Preview: {}\n", preview));
+                    response_text.push_str(&format!("    Preview: {preview}\n"));
                 }
             }
         }
@@ -81,7 +81,7 @@ pub async fn handle_query(
             .error_msg
             .or(status.error_message)
             .unwrap_or_else(|| "Unknown error".to_string());
-        response_text.push_str(&format!("\n❌ Job failed: {}\n", error_msg));
+        response_text.push_str(&format!("\n❌ Job failed: {error_msg}\n"));
     } else if status_lower == "pending" || status_lower == "processing" || status_lower == "running"
     {
         response_text.push_str("\n⏳ Job is still processing. Please check again later.\n");

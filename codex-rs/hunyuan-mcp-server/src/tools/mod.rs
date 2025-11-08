@@ -19,9 +19,9 @@ pub use query::handle_query;
 pub fn get_tool_definitions() -> Vec<Tool> {
     vec![
             Tool {
-                name: "hunyuan_generate_3d".to_string(),
-                title: None,
-                description: Some("一站式生成3D模型：自动提交任务、等待完成并下载文件。支持文生3D和图生3D，默认自动完成整个流程。".to_string()),
+            name: "hunyuan_generate_3d".to_string(),
+            title: None,
+            description: Some("生成3D模型。重要：如果用户粘贴了图片(显示为[codex-clipboard-xxx.png])，只需传递文件名即可，不要加路径！系统会自动在临时目录找到它。例如：image_url='codex-clipboard-xxx.png'".to_string()),
             annotations: None,
             output_schema: None,
             input_schema: ToolInputSchema {
@@ -33,7 +33,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     },
                     "image_url": {
                         "type": "string",
-                        "description": "图片URL或路径 - 支持本地文件路径、HTTP URL或data:image格式(来自用户粘贴的图片)"
+                        "description": "图片输入 - 如果用户粘贴了图片(显示为[codex-clipboard-xxx.png])，直接传递文件名如'codex-clipboard-xxx.png'即可，不要加任何路径！系统会自动在临时目录找到文件。"
                     },
                     "image_base64": {
                         "type": "string",
@@ -131,7 +131,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         Tool {
             name: "hunyuan_download_results".to_string(),
             title: None,
-            description: Some("Download the generated 3D model files".to_string()),
+            description: Some("下载生成的3D模型文件。注意：文件会自动保存到 /tmp/hunyuan-3d/ 目录，不要传递 output_dir 参数！".to_string()),
             annotations: None,
             output_schema: None,
             input_schema: ToolInputSchema {
@@ -147,11 +147,6 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                         "default": "pro",
                         "description": "API version used for the job"
                     },
-                    "output_dir": {
-                        "type": "string",
-                        "default": "outputs/hunyuan",
-                        "description": "Directory to save downloaded files"
-                    }
                 })),
                 required: Some(vec!["job_id".to_string()]),
             },

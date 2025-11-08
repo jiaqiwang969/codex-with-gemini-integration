@@ -6,31 +6,22 @@ use serde::Serialize;
 /// API version to use
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum ApiVersion {
+    #[default]
     Pro,
     Rapid,
     Standard, // 通用版本 SubmitHunyuanTo3DJob
 }
 
-impl Default for ApiVersion {
-    fn default() -> Self {
-        ApiVersion::Pro
-    }
-}
-
 /// Generate type for professional version
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum GenerateType {
+    #[default]
     Normal,
     LowPoly,
     Geometry,
     Sketch,
-}
-
-impl Default for GenerateType {
-    fn default() -> Self {
-        GenerateType::Normal
-    }
 }
 
 /// Polygon type for LowPoly mode

@@ -54,12 +54,10 @@ impl TencentAuth {
         );
 
         // Step 2: Build string to sign
-        let credential_scope = format!("{}/{}/tc3_request", date_str, service);
+        let credential_scope = format!("{date_str}/{service}/tc3_request");
         let hashed_canonical_request = hex::encode(Sha256::digest(canonical_request.as_bytes()));
-        let string_to_sign = format!(
-            "{}\n{}\n{}\n{}",
-            algorithm, timestamp, credential_scope, hashed_canonical_request
-        );
+        let string_to_sign =
+            format!("{algorithm}\n{timestamp}\n{credential_scope}\n{hashed_canonical_request}");
 
         // Step 3: Calculate signature
         let secret_date = self.hmac_sha256(

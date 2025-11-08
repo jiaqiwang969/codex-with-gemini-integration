@@ -37,11 +37,15 @@ pub async fn handle_download(
         _ => ApiVersion::Pro,
     };
 
-    // 创建带时间戳的输出目录
+    // 强制使用 /tmp/hunyuan-3d 作为输出目录，忽略传入的 output_dir
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-    let base_dir = params
-        .output_dir
-        .unwrap_or_else(|| "/tmp/hunyuan-3d".to_string());
+    let base_dir = "/tmp/hunyuan-3d".to_string();
+
+    // 如果用户传递了 output_dir，记录警告
+    if params.output_dir.is_some() {
+        info!("⚠️ 忽略传入的 output_dir 参数，强制使用 /tmp/hunyuan-3d/");
+    }
+
     let output_dir = format!(
         "{}/{}_{}_download",
         base_dir,
@@ -71,7 +75,7 @@ pub async fn handle_download(
         );
 
         for file in &files {
-            text.push_str(&format!("  - {}\n", file));
+            text.push_str(&format!("  - {file}\n"));
         }
 
         text
@@ -120,23 +124,18 @@ pub async fn download_results(
     let mut downloaded_files = Vec::new();
 
     // Download preview if available
-    if let Some(preview_url) = status.preview_url {
-        if let Ok(file) = download_file(
-            &preview_url,
-            &output_path,
-            &format!("{}_preview.png", job_id),
-        )
-        .await
-        {
-            downloaded_files.push(file);
-        }
+    if let Some(preview_url) = status.preview_url
+        && let Ok(file) =
+            download_file(&preview_url, &output_path, &format!("{job_id}_preview.png")).await
+    {
+        downloaded_files.push(file);
     }
 
     // Download result files
     if let Some(result_urls) = status.result_urls {
         for (i, url) in result_urls.iter().enumerate() {
             let ext = detect_extension(url);
-            let filename = format!("{}_result_{}.{}", job_id, i, ext);
+            let filename = format!("{job_id}_result_{i}.{ext}");
             if let Ok(file) = download_file(url, &output_path, &filename).await {
                 downloaded_files.push(file);
             }
@@ -175,11 +174,11 @@ pub async fn download_results(
 
     // If we got a ZIP file, extract it
     for file in downloaded_files.clone() {
-        if file.ends_with(".zip") {
-            if let Ok(extracted) = extract_zip(&file, &output_path).await {
-                info!("Extracted {} files from {}", extracted.len(), file);
-                downloaded_files.extend(extracted);
-            }
+        if file.ends_with(".zip")
+            && let Ok(extracted) = extract_zip(&file, &output_path).await
+        {
+            info!("Extracted {} files from {}", extracted.len(), file);
+            downloaded_files.extend(extracted);
         }
     }
 

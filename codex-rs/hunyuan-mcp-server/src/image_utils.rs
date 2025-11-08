@@ -7,6 +7,8 @@ use base64::Engine;
 use image::GenericImageView;
 use std::path::Path;
 use tokio::fs;
+use tracing::debug;
+use tracing::info;
 
 const MAX_IMAGE_SIZE: usize = 6 * 1024 * 1024; // 6MB
 const MIN_IMAGE_DIMENSION: u32 = 128;
@@ -59,21 +61,37 @@ impl ImageSource {
 pub async fn to_base64(source: ImageSource) -> Result<String> {
     match source {
         ImageSource::DataUrl(url) => {
+            debug!("Extracting base64 from data URL");
             extract_base64_from_data_url(&url).ok_or_else(|| anyhow!("Invalid data URL format"))
         }
         ImageSource::LocalPath(path) => {
+            info!("📂 Reading local image file: {}", path);
             let data = fs::read(&path)
                 .await
-                .with_context(|| format!("Failed to read image file: {}", path))?;
+                .with_context(|| format!("Failed to read image file: {path}"))?;
+            info!("\u{1F4CF} Image file size: {} bytes", data.len());
             validate_image_bytes(&data)?;
-            Ok(base64::engine::general_purpose::STANDARD.encode(data))
+            let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+            info!(
+                "✅ Successfully encoded image to base64, output size: {} chars",
+                encoded.len()
+            );
+            Ok(encoded)
         }
-        ImageSource::RemoteUrl(url) => download_and_encode(&url).await,
+        ImageSource::RemoteUrl(url) => {
+            info!("🌐 Downloading image from URL: {}", url);
+            download_and_encode(&url).await
+        }
         ImageSource::Base64String(s) => {
+            debug!("Validating base64 string, length: {} chars", s.len());
             // Validate that it's actually valid base64
-            base64::engine::general_purpose::STANDARD
+            let decoded = base64::engine::general_purpose::STANDARD
                 .decode(&s)
                 .context("Invalid base64 string")?;
+            info!(
+                "✅ Valid base64 string, decoded size: {} bytes",
+                decoded.len()
+            );
             Ok(s)
         }
     }
@@ -83,7 +101,7 @@ pub async fn to_base64(source: ImageSource) -> Result<String> {
 async fn download_and_encode(url: &str) -> Result<String> {
     let response = reqwest::get(url)
         .await
-        .with_context(|| format!("Failed to download image from: {}", url))?;
+        .with_context(|| format!("Failed to download image from: {url}"))?;
 
     if !response.status().is_success() {
         return Err(anyhow!(
@@ -102,7 +120,7 @@ async fn download_and_encode(url: &str) -> Result<String> {
 }
 
 /// Validate image bytes for size and dimensions
-fn validate_image_bytes(data: &[u8]) -> Result<()> {
+pub fn validate_image_bytes(data: &[u8]) -> Result<()> {
     // Check file size
     if data.len() > MAX_IMAGE_SIZE {
         return Err(anyhow!(
@@ -119,21 +137,13 @@ fn validate_image_bytes(data: &[u8]) -> Result<()> {
 
     if width < MIN_IMAGE_DIMENSION || height < MIN_IMAGE_DIMENSION {
         return Err(anyhow!(
-            "Image dimensions ({}x{}) are below minimum required ({}x{})",
-            width,
-            height,
-            MIN_IMAGE_DIMENSION,
-            MIN_IMAGE_DIMENSION
+            "Image dimensions ({width}x{height}) are below minimum required ({MIN_IMAGE_DIMENSION}x{MIN_IMAGE_DIMENSION})"
         ));
     }
 
     if width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION {
         return Err(anyhow!(
-            "Image dimensions ({}x{}) exceed maximum allowed ({}x{})",
-            width,
-            height,
-            MAX_IMAGE_DIMENSION,
-            MAX_IMAGE_DIMENSION
+            "Image dimensions ({width}x{height}) exceed maximum allowed ({MAX_IMAGE_DIMENSION}x{MAX_IMAGE_DIMENSION})"
         ));
     }
 
@@ -145,7 +155,7 @@ pub fn get_mime_type(path: &str) -> &'static str {
     let ext = Path::new(path)
         .extension()
         .and_then(|s| s.to_str())
-        .map(|s| s.to_lowercase());
+        .map(str::to_lowercase);
 
     match ext.as_deref() {
         Some("jpg") | Some("jpeg") => "image/jpeg",

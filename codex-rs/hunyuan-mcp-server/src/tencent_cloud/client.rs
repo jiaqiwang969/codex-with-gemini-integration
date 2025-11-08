@@ -160,7 +160,7 @@ impl TencentCloudClient {
                 }
 
                 if let Some(face_count) = request.face_count {
-                    if face_count < 40000 || face_count > 1500000 {
+                    if !(40000..=1500000).contains(&face_count) {
                         return Err(anyhow!("FaceCount must be between 40000 and 1500000"));
                     }
                     pro_request["FaceCount"] = json!(face_count);
@@ -327,7 +327,7 @@ impl TencentCloudClient {
 
             // Parse response
             let json_response: serde_json::Value = serde_json::from_str(&text)
-                .with_context(|| format!("Failed to parse API response: {}", text))?;
+                .with_context(|| format!("Failed to parse API response: {text}"))?;
 
             // Check for errors
             if let Some(error) = json_response.get("Error") {
@@ -355,7 +355,7 @@ impl TencentCloudClient {
                     continue;
                 }
 
-                return Err(anyhow!("API error: {} - {}", code, message));
+                return Err(anyhow!("API error: {code} - {message}"));
             }
 
             // Success - parse response
