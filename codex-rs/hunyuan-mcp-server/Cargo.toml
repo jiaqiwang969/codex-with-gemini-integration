@@ -1,0 +1,51 @@
+[package]
+edition = "2024"
+name = "hunyuan-mcp-server"
+version = { workspace = true }
+
+[[bin]]
+name = "hunyuan-mcp-server"
+path = "src/main.rs"
+
+[lib]
+name = "hunyuan_mcp_server"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+codex-arg0 = { workspace = true }
+codex-common = { workspace = true, features = ["cli"] }
+hex = "0.4"
+hmac = "0.12"
+image = { workspace = true, features = ["jpeg", "png", "webp"] }
+mcp-types = { workspace = true }
+reqwest = { workspace = true, features = ["json", "stream"] }
+schemars = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = [
+    "fs",
+    "io-std",
+    "macros",
+    "process",
+    "rt-multi-thread",
+    "signal",
+] }
+tracing = { workspace = true, features = ["log"] }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+url = { workspace = true }
+zip = "0.6"
+
+[dev-dependencies]
+mockito = "1.2"
+pretty_assertions = { workspace = true }
+tokio-test = { workspace = true }
+wiremock = { workspace = true }

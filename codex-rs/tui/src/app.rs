@@ -1262,28 +1262,6 @@ impl App {
 
     async fn handle_key_event(&mut self, tui: &mut tui::Tui, key_event: KeyEvent) {
         match key_event {
-            // Tab switches focus between panels
-            KeyEvent {
-                code: KeyCode::Tab,
-                kind: KeyEventKind::Press,
-                ..
-            } => {
-                match self.panel_focus {
-                    PanelFocus::Sessions => {
-                        self.panel_focus = PanelFocus::Chat;
-                        self.session_bar.set_focus(false);
-                    }
-                    PanelFocus::Chat => {
-                        self.panel_focus = PanelFocus::Sessions;
-                        self.session_bar.set_focus(true);
-                        let current_id =
-                            self.chat_widget.conversation_id().map(|id| id.to_string());
-                        self.session_bar
-                            .reset_selection_for_focus(current_id.as_deref());
-                    }
-                }
-                tui.frame_requester().schedule_frame();
-            }
             // F1 Toggle Bar disabled per product decision
             KeyEvent {
                 code: KeyCode::Char('t'),
@@ -1296,7 +1274,7 @@ impl App {
                 self.overlay = Some(Overlay::new_transcript(self.transcript_cells.clone()));
                 tui.frame_requester().schedule_frame();
             }
-            // Ctrl+P - Quick session search/picker
+            // Ctrl+P - Quick session search/picker (and switch focus to Sessions)
             KeyEvent {
                 code: KeyCode::Char('p'),
                 modifiers: crossterm::event::KeyModifiers::CONTROL,
@@ -1456,7 +1434,8 @@ impl App {
                                     }
                                 }
                             }
-                            KeyCode::Esc | KeyCode::Tab => {
+                            // Exit sessions focus; Tab no longer toggles to avoid conflicts
+                            KeyCode::Esc => {
                                 // Return focus to chat
                                 self.panel_focus = PanelFocus::Chat;
                                 self.session_bar.set_focus(false);

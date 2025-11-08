@@ -7,8 +7,10 @@ use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::style::Style;
+use ratatui::style::Stylize; // Prefer Stylize helpers for consistent styling
 use ratatui::text::Line;
 use ratatui::text::Span;
+use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
 use ratatui::widgets::WidgetRef;
@@ -19,6 +21,8 @@ use crate::cxresume_picker_widget::TumixState;
 use crate::cxresume_picker_widget::get_cwd_sessions;
 use crate::cxresume_picker_widget::last_user_snippet;
 use crate::cxresume_picker_widget::load_tumix_status_index;
+use crate::key_hint; // Unify key-hint rendering
+use crossterm::event::KeyCode;
 
 /// Bottom session bar (similar to tmux)
 pub struct SessionBar {
@@ -231,11 +235,8 @@ impl SessionBar {
         if let Some(error) = &self.error {
             return (
                 Line::from(vec![
-                    Span::styled(
-                        " Error: ",
-                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(error.clone(), Style::default().fg(Color::Red)),
+                    Span::from(" Error: ").red().bold(),
+                    Span::from(error.clone()).red(),
                 ]),
                 Line::from(""),
                 None,
@@ -261,16 +262,11 @@ impl SessionBar {
 
         // Only show a standalone "新建" when the current session is not in history
         if !current_in_history {
-            // When focused and selection is on New, use green as follow-hint; otherwise gray/green as appropriate
-            let new_is_green = if self.has_focus {
-                self.selected_on_new
+            // Focused + selected → cyan + bold; otherwise dim to let theme drive appearance.
+            let new_style = if self.has_focus && self.selected_on_new {
+                Style::default().cyan().add_modifier(Modifier::BOLD)
             } else {
-                true
-            };
-            let new_style = if new_is_green {
-                Style::default().fg(Color::Green)
-            } else {
-                Style::default().fg(Color::Gray)
+                Style::default().dim()
             };
             if self.has_focus && self.selected_on_new && sel_start.is_none() {
                 sel_start = Some(cur_x);
@@ -289,17 +285,14 @@ impl SessionBar {
                 " ".to_string(),
                 Style::default(),
             );
-            left_spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+            left_spans.push(Span::from("│").dim());
             add_left(
                 &mut left_spans,
                 &mut cur_x,
                 " ".to_string(),
                 Style::default(),
             );
-            left_spans.push(Span::styled(
-                "No history",
-                Style::default().fg(Color::Yellow),
-            ));
+            left_spans.push(Span::from("No history").italic().dim());
         } else {
             for (idx, session) in self.sessions.iter().enumerate() {
                 let display_idx = idx + 1;
@@ -318,16 +311,16 @@ impl SessionBar {
                 };
 
                 let is_current = current_session_id.map_or(false, |id| id == session.id);
-                // Green follows selection when focused; otherwise marks the current session.
-                let is_green = if self.has_focus {
-                    is_selected
+                // Selection/current styling aligned with Codex conventions:
+                // - Focused + selected: cyan + bold
+                // - Unfocused + current: bold
+                // - Otherwise: default
+                let style = if self.has_focus && is_selected {
+                    Style::default().cyan().add_modifier(Modifier::BOLD)
+                } else if !self.has_focus && is_current {
+                    Style::default().add_modifier(Modifier::BOLD)
                 } else {
-                    is_current
-                };
-                let style = if is_green {
-                    Style::default().fg(Color::Green)
-                } else {
-                    Style::default().fg(Color::Gray)
+                    Style::default()
                 };
 
                 let label_part = self
@@ -370,19 +363,15 @@ impl SessionBar {
                     ));
                 }
                 if !is_selected && session.message_count > 0 {
-                    left_spans.push(Span::styled(
-                        format!("({})", session.message_count),
-                        Style::default().fg(Color::DarkGray),
-                    ));
+                    left_spans.push(Span::from(format!("({})", session.message_count)).dim());
                 }
             }
         }
 
         // Build right side (status + help)
         let mut right_spans: Vec<Span<'static>> = Vec::new();
-        right_spans.push(Span::raw(" 状态:"));
-        right_spans.last_mut().unwrap().style = Style::default().fg(Color::Gray);
-        right_spans.push(Span::raw(" "));
+        right_spans.push(Span::from(" 状态:").dim());
+        right_spans.push(Span::from(" "));
         // Build primary status label and current session short name
         let (status_label, status_name) = if let Some(cur_id) = current_session_id {
             let short_cur = if cur_id.len() > 8 {
@@ -398,56 +387,34 @@ impl SessionBar {
         } else {
             ("就绪".to_string(), "新建".to_string())
         };
-        let mut s = Span::raw(status_label);
-        s.style = Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD);
-        right_spans.push(s);
-        right_spans.push(Span::raw("  "));
-        let mut s2 = Span::raw("会话:");
-        s2.style = Style::default().fg(Color::Gray);
-        right_spans.push(s2);
-        right_spans.push(Span::raw(" "));
-        right_spans.push(Span::raw(status_name));
-        // (Removed duplicate trailing 状态: ... block to avoid showing two status fields)
-        right_spans.push(Span::raw(" │ "));
-        right_spans.last_mut().unwrap().style = Style::default().fg(Color::DarkGray);
+        right_spans.push(Span::from(status_label).green().bold());
+        right_spans.push(Span::from("  "));
+        right_spans.push(Span::from("会话:").dim());
+        right_spans.push(Span::from(" "));
+        right_spans.push(Span::from(status_name));
+        right_spans.push(Span::from(" │ ").dim());
         if self.has_focus {
-            let mut a = Span::raw("←/→");
-            a.style = Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD);
-            right_spans.push(a);
-            right_spans.push(Span::raw(" Navigate "));
-            let mut b = Span::raw("Enter");
-            b.style = Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD);
-            right_spans.push(b);
-            right_spans.push(Span::raw(" Open "));
-            let mut nk = Span::raw("n");
-            nk.style = Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD);
-            right_spans.push(nk);
-            right_spans.push(Span::raw(" New "));
-            let mut xk = Span::raw("x");
-            xk.style = Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD);
-            right_spans.push(xk);
-            right_spans.push(Span::raw(" Delete "));
-            let mut c = Span::raw("Tab");
-            c.style = Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD);
-            right_spans.push(c);
-            right_spans.push(Span::raw(" Exit"));
+            // Shared key-hint style; all hint texts are dim like the rest of Codex UI
+            right_spans.push(key_hint::plain(KeyCode::Left).into());
+            right_spans.push(Span::from("/".to_string()).dim());
+            right_spans.push(key_hint::plain(KeyCode::Right).into());
+            right_spans.push(Span::from(" move  ").dim());
+
+            right_spans.push(key_hint::plain(KeyCode::Enter).into());
+            right_spans.push(Span::from(" open  ").dim());
+
+            right_spans.push(key_hint::plain(KeyCode::Char('n')).into());
+            right_spans.push(Span::from(" new  ").dim());
+
+            right_spans.push(key_hint::plain(KeyCode::Char('x')).into());
+            right_spans.push(Span::from(" delete  ").dim());
+
+            // Use Esc to exit session focus; Tab is reserved elsewhere and disabled here
+            right_spans.push(key_hint::plain(KeyCode::Esc).into());
+            right_spans.push(Span::from(" exit").dim());
         } else {
-            let mut cp = Span::raw("Ctrl+P");
-            cp.style = Style::default().fg(Color::Gray);
-            right_spans.push(cp);
-            right_spans.push(Span::raw(" Sessions"));
+            right_spans.push(key_hint::ctrl(KeyCode::Char('p')).into());
+            right_spans.push(Span::from(" Sessions").dim());
         }
 
         (
@@ -466,11 +433,11 @@ impl WidgetRef for &SessionBar {
             return;
         }
 
-        // Draw a top border line to separate from chat area
-        let border_style = Style::default().fg(Color::Rgb(60, 60, 60));
-        for x in area.left()..area.right() {
-            buf[(x, area.top())].set_symbol("─").set_style(border_style);
-        }
+        // Draw a top border line to separate from chat area (dim, theme-friendly)
+        let border_rect = Rect::new(area.x, area.y, area.width, 1);
+        Span::from("─".repeat(border_rect.width as usize))
+            .dim()
+            .render_ref(border_rect, buf);
 
         // Adjust area to exclude the border line
         let bar_area = Rect {
@@ -484,19 +451,8 @@ impl WidgetRef for &SessionBar {
         let (left_line, right_line, sel_start, sel_end, total_left_width) =
             self.build_bar_line(self.current_session_id.as_deref());
 
-        // Render with background color and padding
-        let style = if self.has_focus {
-            Style::default().bg(Color::Rgb(30, 30, 30))
-        } else {
-            Style::default().bg(Color::Rgb(20, 20, 20))
-        };
-
-        // Clear the bar area with background color
-        for y in bar_area.top()..bar_area.bottom() {
-            for x in bar_area.left()..bar_area.right() {
-                buf[(x, y)].set_style(style);
-            }
-        }
+        // Clear the bar area without forcing background colors so terminal themes apply.
+        Clear.render(bar_area, buf);
 
         // Render the session bar with vertical centering
         if bar_area.height > 0 {
@@ -528,9 +484,9 @@ impl WidgetRef for &SessionBar {
             if right_width > 0 && left_width < render_area.width {
                 let sep_x = render_area.x + left_width;
                 if sep_x < render_area.x + render_area.width {
-                    buf[(sep_x, render_area.y)]
-                        .set_symbol("│")
-                        .set_style(Style::default().fg(Color::DarkGray));
+                    Span::from("│")
+                        .dim()
+                        .render_ref(Rect::new(sep_x, render_area.y, 1, 1), buf);
                 }
                 let right_area = Rect {
                     x: render_area.x + render_area.width.saturating_sub(right_width),
@@ -538,9 +494,7 @@ impl WidgetRef for &SessionBar {
                     width: right_width,
                     height: 1,
                 };
-                Paragraph::new(vec![right_line.clone()])
-                    .style(style)
-                    .render(right_area, buf);
+                Paragraph::new(vec![right_line.clone()]).render(right_area, buf);
             }
 
             // Compute horizontal scroll for left side: center selected when possible
@@ -556,7 +510,6 @@ impl WidgetRef for &SessionBar {
             }
 
             Paragraph::new(vec![left_line])
-                .style(style)
                 .scroll((0, scroll_x))
                 .render(left_area, buf);
         }

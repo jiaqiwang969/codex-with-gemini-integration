@@ -39,6 +39,8 @@ codex-login = { workspace = true }
 codex-ollama = { workspace = true }
 codex-multi-agent = { workspace = true }
 codex-protocol = { workspace = true }
+# Built-in MCP servers (ensure they're built together)
+hunyuan-mcp-server = { path = "../hunyuan-mcp-server" }
 codex-app-server-protocol = { workspace = true }
 codex-tumix = { workspace = true }
 codex-feedback = { workspace = true }
