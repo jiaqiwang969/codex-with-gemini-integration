@@ -2,7 +2,6 @@
 
 use mcp_types::CallToolRequestParams;
 use mcp_types::CallToolResult;
-use mcp_types::ClientCapabilities;
 use mcp_types::ContentBlock;
 use mcp_types::Implementation;
 use mcp_types::InitializeRequestParams;
@@ -13,12 +12,10 @@ use mcp_types::JSONRPCMessage;
 use mcp_types::JSONRPCNotification;
 use mcp_types::JSONRPCRequest;
 use mcp_types::JSONRPCResponse;
-use mcp_types::ListToolsRequestParams;
 use mcp_types::ListToolsResult;
 use mcp_types::ServerCapabilities;
 use mcp_types::ServerCapabilitiesTools;
 use mcp_types::TextContent;
-use serde_json::json;
 use std::env;
 use tokio::sync::mpsc;
 use tracing::debug;
@@ -60,7 +57,7 @@ impl OutgoingMessageSender {
         } else {
             mcp_types::RequestId::String("unknown".to_string())
         };
-        
+
         let response = JSONRPCResponse {
             jsonrpc: mcp_types::JSONRPC_VERSION.to_string(),
             id: request_id,
@@ -78,7 +75,7 @@ impl OutgoingMessageSender {
         } else {
             mcp_types::RequestId::String("unknown".to_string())
         };
-        
+
         let error = JSONRPCError {
             jsonrpc: mcp_types::JSONRPC_VERSION.to_string(),
             id: request_id,
@@ -122,7 +119,7 @@ impl MessageProcessor {
 
         let id = serde_json::to_value(request.id.clone()).unwrap_or(serde_json::Value::Null);
         let params = serde_json::to_value(request.params).unwrap_or(serde_json::Value::Null);
-        
+
         match request.method.as_str() {
             "initialize" => {
                 self.handle_initialize(id, params).await;

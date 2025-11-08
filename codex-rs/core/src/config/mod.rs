@@ -893,30 +893,34 @@ impl Config {
         // Check if hunyuan-3d is already configured
         if !mcp_servers.contains_key("hunyuan-3d") {
             // Check for API keys in environment
-            let has_credentials = std::env::var("TENCENTCLOUD_SECRET_ID").is_ok() 
+            let has_credentials = std::env::var("TENCENTCLOUD_SECRET_ID").is_ok()
                 && std::env::var("TENCENTCLOUD_SECRET_KEY").is_ok();
-            
+
             if has_credentials {
                 // Get the path to the hunyuan-mcp-server binary
                 // It should be in the same directory as the codex binary
                 let exe_path = std::env::current_exe().ok();
                 let hunyuan_path = if let Some(exe) = exe_path {
                     let parent = exe.parent().unwrap_or(Path::new("."));
-                    parent.join("hunyuan-mcp-server").to_string_lossy().to_string()
+                    parent
+                        .join("hunyuan-mcp-server")
+                        .to_string_lossy()
+                        .to_string()
                 } else {
                     // Fallback to assuming it's in PATH
                     "hunyuan-mcp-server".to_string()
                 };
-                
+
                 // Add the built-in hunyuan-3d MCP server
                 let hunyuan_config = McpServerConfig {
                     transport: McpServerTransportConfig::Stdio {
                         command: hunyuan_path,
                         args: vec![],
                         cwd: None,
-                        env: Some(HashMap::from([
-                            ("RUST_LOG".to_string(), "warn".to_string()),
-                        ])),
+                        env: Some(HashMap::from([(
+                            "RUST_LOG".to_string(),
+                            "warn".to_string(),
+                        )])),
                         env_vars: vec![
                             "TENCENTCLOUD_SECRET_ID".to_string(),
                             "TENCENTCLOUD_SECRET_KEY".to_string(),
@@ -928,14 +932,14 @@ impl Config {
                     enabled_tools: None,
                     disabled_tools: None,
                 };
-                
+
                 mcp_servers.insert("hunyuan-3d".to_string(), hunyuan_config);
             }
         }
-        
+
         mcp_servers
     }
-    
+
     /// Meant to be used exclusively for tests: `load_with_overrides()` should
     /// be used in all other cases.
     pub fn load_from_base_config_with_overrides(

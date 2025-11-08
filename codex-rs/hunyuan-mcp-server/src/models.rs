@@ -9,7 +9,7 @@ use serde::Serialize;
 pub enum ApiVersion {
     Pro,
     Rapid,
-    Standard,  // 通用版本 SubmitHunyuanTo3DJob
+    Standard, // 通用版本 SubmitHunyuanTo3DJob
 }
 
 impl Default for ApiVersion {
@@ -161,7 +161,7 @@ pub struct QueryResponse {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
-    
+
     // Error fields
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
@@ -169,7 +169,7 @@ pub struct QueryResponse {
     pub error_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_msg: Option<String>,
-    
+
     // Result fields (Professional API)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub job_id: Option<String>,
@@ -177,7 +177,7 @@ pub struct QueryResponse {
     pub preview_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_urls: Option<Vec<String>>,
-    
+
     // Result fields (Rapid API)
     #[serde(rename = "ResultFile3Ds", skip_serializing_if = "Option::is_none")]
     pub result_file3_d_s: Option<Vec<ResultFile>>,

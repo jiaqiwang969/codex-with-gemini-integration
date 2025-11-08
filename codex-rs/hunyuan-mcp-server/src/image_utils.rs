@@ -4,11 +4,9 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use base64::Engine;
-use image::DynamicImage;
 use image::GenericImageView;
 use std::path::Path;
 use tokio::fs;
-use url::Url;
 
 const MAX_IMAGE_SIZE: usize = 6 * 1024 * 1024; // 6MB
 const MIN_IMAGE_DIMENSION: u32 = 128;

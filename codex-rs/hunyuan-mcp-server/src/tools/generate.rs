@@ -6,13 +6,11 @@ use mcp_types::CallToolResult;
 use mcp_types::ContentBlock;
 use mcp_types::TextContent;
 use serde::Deserialize;
-use serde::Serialize;
-use serde_json::json;
-use chrono::Local;
-use tracing::{debug, info, warn};
-use std::path::PathBuf;
 use std::time::Duration;
 use tokio::time::sleep;
+use tracing::debug;
+use tracing::info;
+use tracing::warn;
 
 use crate::image_utils::ImageSource;
 use crate::image_utils::{self};
@@ -253,31 +251,39 @@ pub async fn handle_generate(
     // 如果 wait_for_completion 参数为 true，自动轮询并下载
     if params.wait_for_completion.unwrap_or(true) {
         info!("Auto-polling enabled, waiting for job completion...");
-        
+
         // 轮询任务状态
         let max_wait_time = std::time::Duration::from_secs(300); // 最多等待5分钟
         let poll_interval = std::time::Duration::from_secs(5); // 每5秒查询一次
         let start_time = std::time::Instant::now();
-        
+
         let mut final_status = None;
-        
+
         while start_time.elapsed() < max_wait_time {
             tokio::time::sleep(poll_interval).await;
-            
+
             match client.query_job(&job_id, api_version).await {
                 Ok(status) => {
                     let status_lower = status.status.to_lowercase();
                     info!("Job {} status: {}", job_id, status.status);
-                    
-                    if status_lower == "done" || status_lower == "success" || status_lower == "completed" || status_lower == "finish" {
+
+                    if status_lower == "done"
+                        || status_lower == "success"
+                        || status_lower == "completed"
+                        || status_lower == "finish"
+                    {
                         final_status = Some(status);
                         break;
-                    } else if status_lower == "failed" || status_lower == "error" || status_lower == "timeout" {
-                        let error_msg = status.error_msg
+                    } else if status_lower == "failed"
+                        || status_lower == "error"
+                        || status_lower == "timeout"
+                    {
+                        let error_msg = status
+                            .error_msg
                             .or(status.error_message)
                             .unwrap_or_else(|| "Unknown error".to_string());
                         response_text = format!("❌ 3D生成失败\n\n**错误信息**: {}", error_msg);
-                        
+
                         return Ok(CallToolResult {
                             content: vec![ContentBlock::TextContent(TextContent {
                                 r#type: "text".to_string(),
@@ -296,67 +302,84 @@ pub async fn handle_generate(
                 }
             }
         }
-        
+
         // 如果任务完成，自动下载文件
         if let Some(status) = final_status {
             response_text = format!("✅ 3D模型生成成功！\n\n");
-            
+
             if let Some(prompt) = &params.prompt {
                 response_text.push_str(&format!("**描述**: {}\n", prompt));
             }
-            
-                // 创建输出目录 - 使用时间戳和描述创建唯一目录
-                let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-                let base_dir = params.output_dir.clone().unwrap_or_else(|| "/tmp/hunyuan-3d".to_string());
-                
-                // 从prompt中提取简短描述作为目录名的一部分
-                let desc = if let Some(prompt) = &params.prompt {
-                    // 取前20个字符，移除特殊字符
-                    let clean: String = prompt.chars()
-                        .take(20)
-                        .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_')
-                        .collect::<String>()
-                        .trim()
-                        .replace(' ', "_");
-                    if !clean.is_empty() {
-                        format!("_{}", clean)
-                    } else {
-                        String::new()
-                    }
+
+            // 创建输出目录 - 使用时间戳和描述创建唯一目录
+            let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+            let base_dir = params
+                .output_dir
+                .clone()
+                .unwrap_or_else(|| "/tmp/hunyuan-3d".to_string());
+
+            // 从prompt中提取简短描述作为目录名的一部分
+            let desc = if let Some(prompt) = &params.prompt {
+                // 取前20个字符，移除特殊字符
+                let clean: String = prompt
+                    .chars()
+                    .take(20)
+                    .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_')
+                    .collect::<String>()
+                    .trim()
+                    .replace(' ', "_");
+                if !clean.is_empty() {
+                    format!("_{}", clean)
                 } else {
                     String::new()
-                };
-                
-                let output_dir = format!("{}/{}_{}{}",
-                    base_dir,
-                    timestamp,
-                    &job_id[..8], // 使用JobID的前8位
-                    desc
-                );
-                let output_path = std::path::PathBuf::from(&output_dir);
+                }
+            } else {
+                String::new()
+            };
+
+            let output_dir = format!(
+                "{}/{}_{}{}",
+                base_dir,
+                timestamp,
+                &job_id[..8], // 使用JobID的前8位
+                desc
+            );
+            let output_path = std::path::PathBuf::from(&output_dir);
             tokio::fs::create_dir_all(&output_path).await?;
-            
+
             let mut downloaded_files = Vec::new();
-            
+
             // 下载3D文件
             if let Some(files) = status.result_file3_d_s {
                 for file in files {
                     // 下载预览图
                     if let Some(preview) = &file.preview_image_url {
-                        response_text.push_str(&format!("\n🖼️ **预览图**: [查看预览]({})\n", preview));
+                        response_text
+                            .push_str(&format!("\n🖼️ **预览图**: [查看预览]({})\n", preview));
                     }
-                    
+
                     // 下载模型文件
-                    let ext = if file.url.contains(".zip") { "zip" } else { &file.file_type.to_lowercase() };
+                    let ext = if file.url.contains(".zip") {
+                        "zip"
+                    } else {
+                        &file.file_type.to_lowercase()
+                    };
                     let filename = format!("{}_{}.{}", job_id, file.file_type.to_lowercase(), ext);
-                    
-                    match crate::tools::download::download_file(&file.url, &output_path, &filename).await {
+
+                    match crate::tools::download::download_file(&file.url, &output_path, &filename)
+                        .await
+                    {
                         Ok(downloaded_path) => {
                             downloaded_files.push(downloaded_path.clone());
-                            
+
                             // 如果是ZIP文件，解压它
                             if downloaded_path.ends_with(".zip") {
-                                if let Ok(extracted) = crate::tools::download::extract_zip(&downloaded_path, &output_path).await {
+                                if let Ok(extracted) = crate::tools::download::extract_zip(
+                                    &downloaded_path,
+                                    &output_path,
+                                )
+                                .await
+                                {
                                     downloaded_files.extend(extracted);
                                 }
                             }
@@ -367,32 +390,45 @@ pub async fn handle_generate(
                     }
                 }
             }
-            
+
             // 显示下载的文件
             if !downloaded_files.is_empty() {
-                response_text.push_str(&format!("\n📁 **下载的文件** (保存在 `{}`目录):\n", output_dir));
+                response_text.push_str(&format!(
+                    "\n📁 **下载的文件** (保存在 `{}`目录):\n",
+                    output_dir
+                ));
                 for file in &downloaded_files {
                     if let Some(filename) = std::path::Path::new(&file).file_name() {
                         response_text.push_str(&format!("  - {}\n", filename.to_string_lossy()));
                     }
                 }
-                
+
                 // 特别标注主要的3D文件
                 for file in &downloaded_files {
-                    if file.ends_with(".obj") || file.ends_with(".glb") || file.ends_with(".fbx") || file.ends_with(".usdz") {
+                    if file.ends_with(".obj")
+                        || file.ends_with(".glb")
+                        || file.ends_with(".fbx")
+                        || file.ends_with(".usdz")
+                    {
                         response_text.push_str(&format!("\n🎯 **3D模型文件**: `{}`\n", file));
                         break;
                     }
                 }
             }
-            
-            response_text.push_str(&format!("\n⏱️ **生成用时**: 约{}秒", start_time.elapsed().as_secs()));
+
+            response_text.push_str(&format!(
+                "\n⏱️ **生成用时**: 约{}秒",
+                start_time.elapsed().as_secs()
+            ));
         } else {
-            response_text.push_str(&format!("\n⏱️ 任务处理超时（已等待{}秒）\n", max_wait_time.as_secs()));
+            response_text.push_str(&format!(
+                "\n⏱️ 任务处理超时（已等待{}秒）\n",
+                max_wait_time.as_secs()
+            ));
             response_text.push_str(&format!("您可以稍后使用Job ID查询: {}", job_id));
         }
     }
-    
+
     Ok(CallToolResult {
         content: vec![ContentBlock::TextContent(TextContent {
             r#type: "text".to_string(),

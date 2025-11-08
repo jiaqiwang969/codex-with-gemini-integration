@@ -6,9 +6,7 @@ use mcp_types::CallToolResult;
 use mcp_types::ContentBlock;
 use mcp_types::TextContent;
 use serde::Deserialize;
-use serde_json::json;
 use std::path::Path;
-use chrono::Local;
 use std::path::PathBuf;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -44,8 +42,9 @@ pub async fn handle_download(
     let base_dir = params
         .output_dir
         .unwrap_or_else(|| "/tmp/hunyuan-3d".to_string());
-    let output_dir = format!("{}/{}_{}_download", 
-        base_dir, 
+    let output_dir = format!(
+        "{}/{}_{}_download",
+        base_dir,
         timestamp,
         &params.job_id[..8.min(params.job_id.len())]
     );
@@ -100,8 +99,15 @@ pub async fn download_results(
     let status = client.query_job(job_id, api_version).await?;
 
     let status_lower = status.status.to_lowercase();
-    if !(status_lower == "success" || status_lower == "completed" || status_lower == "finish" || status_lower == "done") {
-        info!("Job {} is not complete yet, status: {}", job_id, status.status);
+    if !(status_lower == "success"
+        || status_lower == "completed"
+        || status_lower == "finish"
+        || status_lower == "done")
+    {
+        info!(
+            "Job {} is not complete yet, status: {}",
+            job_id, status.status
+        );
         return Ok(Vec::new());
     }
 
@@ -146,23 +152,21 @@ pub async fn download_results(
             } else {
                 &file.file_type.to_lowercase()
             };
-            
-            let filename = format!(
-                "{}_{}.{}",
-                job_id,
-                file.file_type.to_lowercase(),
-                ext
-            );
-            
+
+            let filename = format!("{}_{}.{}", job_id, file.file_type.to_lowercase(), ext);
+
             info!("Downloading {} file from {}", file.file_type, file.url);
             if let Ok(downloaded) = download_file(&file.url, &output_path, &filename).await {
                 downloaded_files.push(downloaded);
             }
-            
+
             // Also download preview if available
             if let Some(preview) = &file.preview_image_url {
-                let preview_filename = format!("{}_{}_preview.png", job_id, file.file_type.to_lowercase());
-                if let Ok(downloaded) = download_file(preview, &output_path, &preview_filename).await {
+                let preview_filename =
+                    format!("{}_{}_preview.png", job_id, file.file_type.to_lowercase());
+                if let Ok(downloaded) =
+                    download_file(preview, &output_path, &preview_filename).await
+                {
                     downloaded_files.push(downloaded);
                 }
             }
@@ -207,36 +211,36 @@ pub async fn extract_zip(zip_path: &str, output_dir: &Path) -> Result<Vec<String
     // Run the zip extraction in a blocking task to avoid Send issues
     let zip_path = zip_path.to_string();
     let output_dir = output_dir.to_path_buf();
-    
+
     tokio::task::spawn_blocking(move || {
         use std::io::Cursor;
         use std::io::Read;
-        
+
         let zip_data = std::fs::read(&zip_path)?;
         let cursor = Cursor::new(zip_data);
-        
+
         let mut archive = zip::ZipArchive::new(cursor)?;
         let mut extracted_files = Vec::new();
-        
+
         for i in 0..archive.len() {
             let mut file = archive.by_index(i)?;
             let file_path = output_dir.join(file.name());
-            
+
             if file.is_dir() {
                 std::fs::create_dir_all(&file_path)?;
             } else {
                 if let Some(parent) = file_path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                
+
                 let mut buffer = Vec::new();
                 file.read_to_end(&mut buffer)?;
                 std::fs::write(&file_path, buffer)?;
-                
+
                 extracted_files.push(file_path.to_string_lossy().to_string());
             }
         }
-        
+
         Ok::<Vec<String>, anyhow::Error>(extracted_files)
     })
     .await?

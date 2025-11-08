@@ -5,24 +5,19 @@ use anyhow::Result;
 use anyhow::anyhow;
 use chrono::Utc;
 use reqwest::Client;
-use reqwest::Response;
-use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tracing::warn;
 use serde_json::json;
 use std::time::Duration;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
+use tracing::warn;
 
 use crate::models::ApiVersion;
 use crate::models::Generate3DRequest;
 use crate::models::GenerateType;
-use crate::models::ProApiRequest;
 use crate::models::QueryResponse;
-use crate::models::RapidApiRequest;
 use crate::models::SubmitResponse;
-use crate::models::ViewImage;
 use crate::tencent_cloud::auth::TencentAuth;
 
 const API_ENDPOINT: &str = "https://ai3d.tencentcloudapi.com";
@@ -65,9 +60,12 @@ impl TencentCloudClient {
 
         let body = self.prepare_request_body(request, api_version)?;
         let response: serde_json::Value = self.call_api(action, &body).await?;
-        
+
         // Log the full response for debugging
-        info!("Submit job response: {}", serde_json::to_string_pretty(&response)?);
+        info!(
+            "Submit job response: {}",
+            serde_json::to_string_pretty(&response)?
+        );
 
         // Extract job ID from various possible response formats
         let job_id = response
@@ -76,8 +74,13 @@ impl TencentCloudClient {
             .or_else(|| response.get("Data").and_then(|d| d.get("JobId")))
             .or_else(|| response.get("Result").and_then(|r| r.get("JobId")))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("Failed to extract JobId from response. Response: {}", 
-                serde_json::to_string(&response).unwrap_or_else(|_| "unable to serialize".to_string())))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "Failed to extract JobId from response. Response: {}",
+                    serde_json::to_string(&response)
+                        .unwrap_or_else(|_| "unable to serialize".to_string())
+                )
+            })?;
 
         Ok(SubmitResponse {
             job_id: job_id.to_string(),
@@ -102,12 +105,19 @@ impl TencentCloudClient {
 
         // Get raw response first for debugging
         let response: serde_json::Value = self.call_api(action, &body).await?;
-        info!("Query job response: {}", serde_json::to_string_pretty(&response)?);
-        
+        info!(
+            "Query job response: {}",
+            serde_json::to_string_pretty(&response)?
+        );
+
         // Try to parse into QueryResponse
-        serde_json::from_value(response.clone())
-            .with_context(|| format!("Failed to parse query response: {}", 
-                serde_json::to_string(&response).unwrap_or_else(|_| "unable to serialize".to_string())))
+        serde_json::from_value(response.clone()).with_context(|| {
+            format!(
+                "Failed to parse query response: {}",
+                serde_json::to_string(&response)
+                    .unwrap_or_else(|_| "unable to serialize".to_string())
+            )
+        })
     }
 
     /// Prepare request body based on API version
@@ -208,7 +218,10 @@ impl TencentCloudClient {
                 // Handle text input (Rapid限制200字符，Pro限制1024字符)
                 if let Some(ref prompt) = request.prompt {
                     if prompt.len() > 200 {
-                        warn!("Rapid API限制prompt最多200个字符，当前{}个字符", prompt.len());
+                        warn!(
+                            "Rapid API限制prompt最多200个字符，当前{}个字符",
+                            prompt.len()
+                        );
                     }
                     rapid_request["Prompt"] = json!(prompt);
                 }
@@ -264,7 +277,7 @@ impl TencentCloudClient {
                 if let Some(ref generate_type) = request.generate_type {
                     let type_str = match generate_type {
                         GenerateType::Normal => "Normal",
-                        GenerateType::LowPoly => "LowPoly", 
+                        GenerateType::LowPoly => "LowPoly",
                         GenerateType::Geometry => "Geometry",
                         GenerateType::Sketch => "Sketch",
                     };

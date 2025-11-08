@@ -176,14 +176,14 @@ pub async fn handle_tool_call(
     secret_id: String,
     secret_key: String,
 ) -> Result<CallToolResult> {
-    let arguments = request.arguments.unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-    
+    let arguments = request
+        .arguments
+        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+
     match request.name.as_str() {
         "hunyuan_generate_3d" => handle_generate(arguments, secret_id, secret_key).await,
         "hunyuan_query_task" => handle_query(arguments, secret_id, secret_key).await,
-        "hunyuan_download_results" => {
-            handle_download(arguments, secret_id, secret_key).await
-        }
+        "hunyuan_download_results" => handle_download(arguments, secret_id, secret_key).await,
         _ => Err(anyhow::anyhow!("Unknown tool: {}", request.name)),
     }
 }

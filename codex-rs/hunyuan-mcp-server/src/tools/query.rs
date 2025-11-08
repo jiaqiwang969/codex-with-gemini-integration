@@ -6,7 +6,6 @@ use mcp_types::CallToolResult;
 use mcp_types::ContentBlock;
 use mcp_types::TextContent;
 use serde::Deserialize;
-use serde_json::json;
 use tracing::info;
 
 use crate::models::ApiVersion;
@@ -48,7 +47,11 @@ pub async fn handle_query(
 
     let status_lower = status.status.to_lowercase();
 
-    if status_lower == "success" || status_lower == "completed" || status_lower == "finish" || status_lower == "done" {
+    if status_lower == "success"
+        || status_lower == "completed"
+        || status_lower == "finish"
+        || status_lower == "done"
+    {
         response_text.push_str("\n✅ Job completed successfully!\n");
 
         if let Some(preview_url) = &status.preview_url {
@@ -79,7 +82,8 @@ pub async fn handle_query(
             .or(status.error_message)
             .unwrap_or_else(|| "Unknown error".to_string());
         response_text.push_str(&format!("\n❌ Job failed: {}\n", error_msg));
-    } else if status_lower == "pending" || status_lower == "processing" || status_lower == "running" {
+    } else if status_lower == "pending" || status_lower == "processing" || status_lower == "running"
+    {
         response_text.push_str("\n⏳ Job is still processing. Please check again later.\n");
     }
 

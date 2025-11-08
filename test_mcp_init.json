@@ -1,1 +1,0 @@
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"test-client","version":"0.1.0"},"protocolVersion":"2025-06-18"}}
