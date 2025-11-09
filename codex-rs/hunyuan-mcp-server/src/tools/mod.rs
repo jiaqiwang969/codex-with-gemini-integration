@@ -18,10 +18,10 @@ pub use query::handle_query;
 /// Get tool definitions for MCP
 pub fn get_tool_definitions() -> Vec<Tool> {
     vec![
-            Tool {
+        Tool {
             name: "hunyuan_generate_3d".to_string(),
             title: None,
-            description: Some("生成3D模型。重要：如果用户粘贴了图片(显示为[codex-clipboard-xxx.png])，只需传递文件名即可，不要加路径！系统会自动在临时目录找到它。例如：image_url='codex-clipboard-xxx.png'".to_string()),
+            description: Some("生成3D模型。当用户粘贴图片时，直接调用此工具即可，系统会自动处理剪贴板图片。无需搜索文件或询问路径！".to_string()),
             annotations: None,
             output_schema: None,
             input_schema: ToolInputSchema {
@@ -33,7 +33,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     },
                     "image_url": {
                         "type": "string",
-                        "description": "图片输入 - 如果用户粘贴了图片(显示为[codex-clipboard-xxx.png])，直接传递文件名如'codex-clipboard-xxx.png'即可，不要加任何路径！系统会自动在临时目录找到文件。"
+                        "description": "图片输入（可选）- 如果用户粘贴了图片，可以留空或传递文件名，系统会自动从会话中提取图片"
                     },
                     "image_base64": {
                         "type": "string",

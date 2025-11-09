@@ -6,14 +6,14 @@ Hunyuan MCP Server 是一个基于 Model Context Protocol (MCP) 的服务器，�
 
 ## ✅ 核心功能
 
-### 1. 剪贴板图片自动处理
+### 1. 剪贴板图片自动处理（Data URL 直传方案）
 - **问题场景**：用户在 Codex 中粘贴图片后，AI 需要将其传递给 MCP 工具
-- **技术挑战**：AI 传递的路径格式不正确或路径不存在
-- **解决方案**：
-  - 在 `core/src/tools/handlers/mcp.rs` 中实现 `auto_resolve_clipboard_path` 函数
-  - 自动识别 `codex-clipboard-xxx.png` 格式的文件名
-  - 在系统临时目录 (`$TMPDIR`, `/tmp`, `/private/tmp`) 中搜索实际文件
-  - 自动替换为正确的绝对路径
+- **核心发现**：Codex 已将图片转换为 data URL 并传给 AI，无需查找文件
+- **最优解决方案**：
+  - 在 `core/src/tools/handlers/mcp.rs` 中实现 `extract_recent_image_from_session` 函数
+  - 直接从会话历史中提取 Codex 已准备好的 data URL
+  - AI 调用工具时可以不传 `image_url` 参数，系统会自动注入
+  - 备用方案：`auto_resolve_clipboard_path` 在本地查找文件
 
 ### 2. 统一文件存储管理
 - **设计决策**：所有生成的 3D 模型强制保存到统一位置
