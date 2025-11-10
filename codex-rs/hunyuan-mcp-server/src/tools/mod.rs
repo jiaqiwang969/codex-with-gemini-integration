@@ -21,7 +21,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         Tool {
             name: "hunyuan_generate_3d".to_string(),
             title: None,
-            description: Some("生成3D模型。当用户粘贴图片时，直接调用此工具即可，系统会自动处理剪贴板图片。无需搜索文件或询问路径！".to_string()),
+            description: Some("生成3D模型。重要：用户粘贴图片后，不要传递image_url参数，也不要传递'[剪贴板图片]'等占位符！系统会自动从会话中提取图片。".to_string()),
             annotations: None,
             output_schema: None,
             input_schema: ToolInputSchema {
@@ -29,15 +29,15 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                 properties: Some(json!({
                     "prompt": {
                         "type": "string",
-                        "description": "文本描述 - 详细描述想要生成的3D模型特征，如'一个可爱的机器人，金属质感，蓝白配色，圆润造型'"
+                        "description": "文本描述（仅用于纯文本生成）- 重要：有图片输入时不要传递此参数！prompt与image_url/image_base64互斥，不能同时存在！"
                     },
                     "image_url": {
                         "type": "string",
-                        "description": "图片输入（可选）- 如果用户粘贴了图片，可以留空或传递文件名，系统会自动从会话中提取图片"
+                        "description": "图片URL - 警告：1) 用户粘贴图片时不要传递此参数！2) 不要传递'[剪贴板图片]'！3) image_url和image_base64不能同时存在！系统会自动处理剪贴板图片。"
                     },
                     "image_base64": {
                         "type": "string",
-                        "description": "Base64编码图片 - 直接提供图片的base64数据"
+                        "description": "Base64编码图片 - 直接提供图片的base64数据。注意：image_base64 和 image_url 不能同时存在，只能选择其一！"
                     },
                     "multi_view_images": {
                         "type": "array",

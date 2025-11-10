@@ -71,6 +71,34 @@ pub async fn handle_generate(
     let params: GenerateParams =
         serde_json::from_value(arguments).context("Failed to parse generate parameters")?;
 
+    // 验证1：image_url 和 image_base64 不能同时存在
+    if params.image_url.is_some() && params.image_base64.is_some() {
+        let error_text = "❌ 错误：image_url 和 image_base64 不能同时存在，请只使用其中一个！".to_string();
+        return Ok(CallToolResult {
+            content: vec![ContentBlock::TextContent(TextContent {
+                r#type: "text".to_string(),
+                text: error_text.clone(),
+                annotations: None,
+            })],
+            is_error: Some(true),
+            structured_content: None,
+        });
+    }
+    
+    // 验证2：prompt 不能与 image_url/image_base64 同时存在
+    if params.prompt.is_some() && (params.image_url.is_some() || params.image_base64.is_some()) {
+        let error_text = "❌ 错误：Prompt 不能与 ImageUrl/ImageBase64 同时存在！图片生成模式下不需要文本描述。".to_string();
+        return Ok(CallToolResult {
+            content: vec![ContentBlock::TextContent(TextContent {
+                r#type: "text".to_string(),
+                text: error_text.clone(),
+                annotations: None,
+            })],
+            is_error: Some(true),
+            structured_content: None,
+        });
+    }
+
     // Parse API version
     let api_version = match params.api_version.as_deref() {
         Some("rapid") => ApiVersion::Rapid,
