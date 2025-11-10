@@ -391,37 +391,35 @@ impl SessionBar {
             }
         }
 
-        // Build status line (right side of first line) - only show when focused
+        // Build status line (right side of first line) - always show
         let mut status_spans: Vec<Span<'static>> = Vec::new();
-        if self.has_focus {
-            status_spans.push(Span::from(" 状态:").dim());
-            status_spans.push(Span::from(" "));
-            // Build primary status label and current session short name
-            let (status_label, status_name) = if let Some(cur_id) = current_session_id {
-                // 优先使用别名，否则使用短ID
-                let display_name = if let Some(alias) = self.alias_manager.get_alias(cur_id) {
-                    alias
-                } else {
-                    if cur_id.len() > 8 {
-                        format!("{}…", &cur_id[..7])
-                    } else {
-                        cur_id.to_string()
-                    }
-                };
-                let st = self
-                    .current_session_status
-                    .clone()
-                    .unwrap_or_else(|| "就绪".to_string());
-                (st, display_name)
+        status_spans.push(Span::from(" 状态:").dim());
+        status_spans.push(Span::from(" "));
+        // Build primary status label and current session short name
+        let (status_label, status_name) = if let Some(cur_id) = current_session_id {
+            // 优先使用别名，否则使用短ID
+            let display_name = if let Some(alias) = self.alias_manager.get_alias(cur_id) {
+                alias
             } else {
-                ("就绪".to_string(), "新建".to_string())
+                if cur_id.len() > 8 {
+                    format!("{}…", &cur_id[..7])
+                } else {
+                    cur_id.to_string()
+                }
             };
-            status_spans.push(Span::from(status_label).green().bold());
-            status_spans.push(Span::from("  "));
-            status_spans.push(Span::from("会话:").dim());
-            status_spans.push(Span::from(" "));
-            status_spans.push(Span::from(status_name).bold());
-        }
+            let st = self
+                .current_session_status
+                .clone()
+                .unwrap_or_else(|| "就绪".to_string());
+            (st, display_name)
+        } else {
+            ("就绪".to_string(), "新建".to_string())
+        };
+        status_spans.push(Span::from(status_label).green().bold());
+        status_spans.push(Span::from("  "));
+        status_spans.push(Span::from("会话:").dim());
+        status_spans.push(Span::from(" "));
+        status_spans.push(Span::from(status_name).bold());
 
         // Build help line (second line with keyboard shortcuts)
         let mut help_spans: Vec<Span<'static>> = Vec::new();
@@ -508,13 +506,9 @@ impl WidgetRef for &SessionBar {
                 .map(|s| UnicodeWidthStr::width(s.content.as_ref()) as u16)
                 .sum();
 
-            let sessions_width = if self.has_focus && status_width > 0 {
-                first_line_area
-                    .width
-                    .saturating_sub(status_width.saturating_add(3)) // 3 for separator
-            } else {
-                first_line_area.width  // Full width when not focused
-            };
+            let sessions_width = first_line_area
+                .width
+                .saturating_sub(status_width.saturating_add(3)); // 3 for separator
             let sessions_area = Rect {
                 x: first_line_area.x,
                 y: first_line_area.y,
@@ -522,8 +516,8 @@ impl WidgetRef for &SessionBar {
                 height: 1,
             };
 
-            // Draw separator and status on right side (only when focused)
-            if self.has_focus && status_width > 0 && sessions_width < first_line_area.width {
+            // Draw separator and status on right side (always show)
+            if status_width > 0 && sessions_width < first_line_area.width {
                 let sep_x = first_line_area.x + sessions_width;
                 if sep_x < first_line_area.x + first_line_area.width {
                     Span::from(" │ ")
