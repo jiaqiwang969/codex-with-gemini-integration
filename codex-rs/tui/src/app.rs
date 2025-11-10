@@ -543,6 +543,13 @@ impl App {
             AppEvent::UpdateCurrentSessionStatus { status: _ } => {
                 // 已废弃：状态现在从 ChatWidget 实时读取
             }
+            AppEvent::SaveSessionAlias { session_id, alias } => {
+                // Save alias in SessionBar
+                self.session_bar.set_session_alias(session_id, alias);
+                // Refresh session list to display updated alias
+                self.session_bar.refresh_sessions();
+                tui.frame_requester().schedule_frame();
+            }
             AppEvent::NewSession => {
                 let init = crate::chatwidget::ChatWidgetInit {
                     config: self.config.clone(),
@@ -1419,15 +1426,42 @@ impl App {
                                 }
                             }
                             KeyCode::Char('r') => {
-                                // Refresh sessions
-                                self.session_bar.refresh_sessions();
-                                tui.frame_requester().schedule_frame();
+                                // Rename selected session (edit alias) - only works on existing sessions
+                                if !self.session_bar.selected_is_new() {
+                                    if let Some(session) = self.session_bar.selected_session() {
+                                        let session_id = session.id.clone();
+                                        let app_tx = self.app_event_tx.clone();
+                                        
+                                        // Show alias input for renaming
+                                        self.chat_widget.show_session_alias_input_for_rename(
+                                            session_id.clone(),
+                                            Box::new(move |sid, alias| {
+                                                app_tx.send(AppEvent::SaveSessionAlias {
+                                                    session_id: sid,
+                                                    alias,
+                                                });
+                                            }),
+                                        );
+                                        
+                                        // Transfer focus to ChatWidget so the rename dialog can receive input
+                                        self.panel_focus = PanelFocus::Chat;
+                                        self.session_bar.set_focus(false);
+                                        tui.frame_requester().schedule_frame();
+                                    }
+                                }
                             }
                             KeyCode::Char('x') => {
                                 // Delete selected history session rollout file (no confirmation)
                                 if !self.session_bar.selected_is_new() {
                                     if let Some(session) = self.session_bar.selected_session() {
-                                        let _ = std::fs::remove_file(&session.path);
+                                        // Clone values before mutable borrow
+                                        let session_path = session.path.clone();
+                                        let session_id = session.id.clone();
+                                        
+                                        // Remove the session file
+                                        let _ = std::fs::remove_file(&session_path);
+                                        // Remove the associated alias
+                                        self.session_bar.remove_session_alias(&session_id);
                                         // Do NOT switch conversation; just refresh list
                                         self.session_bar.refresh_sessions();
                                         tui.frame_requester().schedule_frame();

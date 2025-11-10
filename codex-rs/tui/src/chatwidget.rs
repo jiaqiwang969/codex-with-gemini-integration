@@ -363,11 +363,16 @@ impl ChatWidget {
     fn on_session_configured(&mut self, event: codex_core::protocol::SessionConfiguredEvent) {
         self.bottom_pane
             .set_history_metadata(event.history_log_id, event.history_entry_count);
-        self.conversation_id = Some(event.session_id);
+        let session_id = event.session_id.clone();
+        self.conversation_id = Some(session_id.clone());
         self.current_rollout_path = Some(event.rollout_path.clone());
         let initial_messages = event.initial_messages.clone();
         let model_for_header = event.model.clone();
         self.session_header.set_model(&model_for_header);
+        
+        // Check if this is a new session (no history) and show alias input
+        let is_new_session = event.history_entry_count == 0 && initial_messages.is_none();
+        
         self.add_to_history(history_cell::new_session_info(
             &self.config,
             event,
@@ -376,16 +381,49 @@ impl ChatWidget {
         if let Some(messages) = initial_messages {
             self.replay_initial_messages(messages);
         }
+        
+        if is_new_session {
+            // Store initial user message to submit after alias input
+            let pending_message = self.initial_user_message.take();
+            
+            // Show alias input dialog
+            let app_tx = self.app_event_tx.clone();
+            let sid = session_id.to_string();
+            self.bottom_pane.show_session_alias_input(
+                sid.clone(),
+                Box::new(move |session_id, alias| {
+                    app_tx.send(AppEvent::SaveSessionAlias {
+                        session_id,
+                        alias,
+                    });
+                }),
+            );
+            
+            // Restore initial message to be submitted after alias input
+            self.initial_user_message = pending_message;
+        } else {
+            // For existing sessions, submit initial message immediately
+            if let Some(user_message) = self.initial_user_message.take() {
+                self.submit_user_message(user_message);
+            }
+        }
+        
         // Ask codex-core to enumerate custom prompts for this session.
         self.submit_op(Op::ListCustomPrompts);
-        if let Some(user_message) = self.initial_user_message.take() {
-            self.submit_user_message(user_message);
-        }
         if !self.suppress_session_configured_redraw {
             self.request_redraw();
         }
     }
 
+    /// Show alias input dialog for renaming an existing session
+    pub(crate) fn show_session_alias_input_for_rename(
+        &mut self,
+        session_id: String,
+        on_submit: Box<dyn Fn(String, String) + Send + Sync>,
+    ) {
+        self.bottom_pane.show_session_alias_input(session_id, on_submit);
+    }
+    
     pub(crate) fn set_delegate_context(&mut self, summary: Option<DelegateSessionSummary>) {
         let label = summary
             .as_ref()

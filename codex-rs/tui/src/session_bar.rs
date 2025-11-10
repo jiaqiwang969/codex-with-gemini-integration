@@ -22,6 +22,7 @@ use crate::cxresume_picker_widget::get_cwd_sessions;
 use crate::cxresume_picker_widget::last_user_snippet;
 use crate::cxresume_picker_widget::load_tumix_status_index;
 use crate::key_hint; // Unify key-hint rendering
+use crate::session_alias_manager::SessionAliasManager;
 use crossterm::event::KeyCode;
 
 /// Bottom session bar (similar to tmux)
@@ -44,6 +45,8 @@ pub struct SessionBar {
     current_session_status: Option<String>,
     /// Cached labels derived from first user message (by path)
     label_cache: HashMap<PathBuf, String>,
+    /// Session alias manager
+    alias_manager: SessionAliasManager,
 }
 
 impl SessionBar {
@@ -58,6 +61,7 @@ impl SessionBar {
             current_session_id: None,
             current_session_status: None,
             label_cache: HashMap::new(),
+            alias_manager: SessionAliasManager::load(),
         };
 
         // Load sessions on creation
@@ -223,10 +227,20 @@ impl SessionBar {
         }
     }
 
+    /// Set alias for a session
+    pub fn set_session_alias(&mut self, session_id: String, alias: String) {
+        self.alias_manager.set_alias(session_id, alias);
+    }
+
+    /// Remove alias for a session (e.g., when deleting a session)
+    pub fn remove_session_alias(&mut self, session_id: &str) {
+        self.alias_manager.remove_alias(session_id);
+    }
+
     /// Build the session bar line (similar to tmux status bar)
     ///
-    /// Label format: [n]:<short-id> (no "历史/当前" words). The current session is
-    /// highlighted by style only. A standalone "[0]:新建" is shown only when the
+    /// Label format: Alias/ShortID (no numbering). The current session is
+    /// highlighted by style only. A standalone "新建" is shown only when the
     /// current session is not present in history.
     fn build_bar_line(
         &self,
@@ -271,8 +285,7 @@ impl SessionBar {
             if self.has_focus && self.selected_on_new && sel_start.is_none() {
                 sel_start = Some(cur_x);
             }
-            add_left(&mut left_spans, &mut cur_x, "[0]".to_string(), new_style);
-            add_left(&mut left_spans, &mut cur_x, ":新建".to_string(), new_style);
+            add_left(&mut left_spans, &mut cur_x, "新建".to_string(), new_style);
             if self.has_focus && self.selected_on_new {
                 sel_end = Some(cur_x);
             }
@@ -295,14 +308,24 @@ impl SessionBar {
             left_spans.push(Span::from("No history").italic().dim());
         } else {
             for (idx, session) in self.sessions.iter().enumerate() {
-                let display_idx = idx + 1;
                 let is_selected = self.selected_index == idx;
-                add_left(
-                    &mut left_spans,
-                    &mut cur_x,
-                    " ".to_string(),
-                    Style::default(),
-                );
+                
+                // Add separator before each session except the first
+                if idx > 0 || !current_in_history {
+                    add_left(
+                        &mut left_spans,
+                        &mut cur_x,
+                        " • ".to_string(),
+                        Style::default().dim(),
+                    );
+                } else {
+                    add_left(
+                        &mut left_spans,
+                        &mut cur_x,
+                        " ".to_string(),
+                        Style::default(),
+                    );
+                }
 
                 let session_id = if session.id.len() > 8 {
                     format!("{}…", &session.id[..7])
@@ -313,39 +336,36 @@ impl SessionBar {
                 let is_current = current_session_id.map_or(false, |id| id == session.id);
                 // Selection/current styling aligned with Codex conventions:
                 // - Focused + selected: cyan + bold
-                // - Unfocused + current: bold
+                // - Current session (regardless of focus): green + bold
+                // - Focused + selected (non-current): cyan + bold
                 // - Otherwise: default
-                let style = if self.has_focus && is_selected {
+                let style = if is_current {
+                    // 当前会话始终用绿色高亮
+                    Style::default().green().add_modifier(Modifier::BOLD)
+                } else if self.has_focus && is_selected {
+                    // 非当前会话但被选中时用青色
                     Style::default().cyan().add_modifier(Modifier::BOLD)
-                } else if !self.has_focus && is_current {
-                    Style::default().add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
 
-                let label_part = self
-                    .label_cache
-                    .get(&session.path)
-                    .cloned()
-                    .unwrap_or_else(|| String::new());
-                // Compose: <snippet> · <short-id> [· <status>]
-                let composed = if label_part.is_empty() {
-                    session_id.clone()
+                // Get display name: prefer alias, fall back to snippet or ID
+                let display_name = if let Some(alias) = self.alias_manager.get_alias(&session.id) {
+                    alias
+                } else if let Some(snippet) = self.label_cache.get(&session.path) {
+                    if snippet.is_empty() {
+                        session_id.clone()
+                    } else {
+                        format!("{} · {}", snippet, session_id)
+                    }
                 } else {
-                    format!("{} · {}", label_part, session_id)
+                    session_id.clone()
                 };
-                // Don't show status in history items - only show in right side for current
 
                 if is_selected && sel_start.is_none() {
                     sel_start = Some(cur_x);
                 }
-                add_left(
-                    &mut left_spans,
-                    &mut cur_x,
-                    format!("[{}]", display_idx),
-                    style,
-                );
-                add_left(&mut left_spans, &mut cur_x, format!(":{}", composed), style);
+                add_left(&mut left_spans, &mut cur_x, display_name, style);
                 if is_selected {
                     sel_end = Some(cur_x);
                 }
@@ -374,16 +394,21 @@ impl SessionBar {
         right_spans.push(Span::from(" "));
         // Build primary status label and current session short name
         let (status_label, status_name) = if let Some(cur_id) = current_session_id {
-            let short_cur = if cur_id.len() > 8 {
-                format!("{}…", &cur_id[..7])
+            // 优先使用别名，否则使用短ID
+            let display_name = if let Some(alias) = self.alias_manager.get_alias(cur_id) {
+                alias
             } else {
-                cur_id.to_string()
+                if cur_id.len() > 8 {
+                    format!("{}…", &cur_id[..7])
+                } else {
+                    cur_id.to_string()
+                }
             };
             let st = self
                 .current_session_status
                 .clone()
                 .unwrap_or_else(|| "就绪".to_string());
-            (st, short_cur)
+            (st, display_name)
         } else {
             ("就绪".to_string(), "新建".to_string())
         };
@@ -391,7 +416,7 @@ impl SessionBar {
         right_spans.push(Span::from("  "));
         right_spans.push(Span::from("会话:").dim());
         right_spans.push(Span::from(" "));
-        right_spans.push(Span::from(status_name));
+        right_spans.push(Span::from(status_name).bold());
         right_spans.push(Span::from(" │ ").dim());
         if self.has_focus {
             // Shared key-hint style; all hint texts are dim like the rest of Codex UI
@@ -405,6 +430,9 @@ impl SessionBar {
 
             right_spans.push(key_hint::plain(KeyCode::Char('n')).into());
             right_spans.push(Span::from(" new  ").dim());
+
+            right_spans.push(key_hint::plain(KeyCode::Char('r')).into());
+            right_spans.push(Span::from(" rename  ").dim());
 
             right_spans.push(key_hint::plain(KeyCode::Char('x')).into());
             right_spans.push(Span::from(" delete  ").dim());
