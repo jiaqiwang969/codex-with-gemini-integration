@@ -172,6 +172,12 @@ pub(crate) enum AppEvent {
     UpdateCurrentSessionStatus {
         status: String,
     },
+
+    /// Save session alias after user input.
+    SaveSessionAlias {
+        session_id: String,
+        alias: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -67,6 +67,7 @@ pub mod public_widgets;
 mod render;
 mod resume_picker;
 mod selection_list;
+mod session_alias_manager;
 mod session_bar;
 mod session_log;
 mod shimmer;

@@ -1567,11 +1567,7 @@ pub fn get_cwd_sessions() -> Result<Vec<SessionInfo>, String> {
     // Limit to recent 100 sessions for performance
     sessions.truncate(100);
 
-    if sessions.is_empty() {
-        Err("No sessions found in current working directory".to_string())
-    } else {
-        Ok(sessions)
-    }
+    Ok(sessions)
 }
 
 fn should_include_session(session_cwd: &str, cwd: &Path) -> bool {

@@ -32,6 +32,7 @@ mod list_selection_view;
 mod prompt_args;
 pub(crate) use list_selection_view::SelectionViewParams;
 mod feedback_view;
+mod session_alias_input;
 pub(crate) use feedback_view::feedback_selection_params;
 pub(crate) use feedback_view::feedback_upload_consent_params;
 mod paste_burst;
@@ -454,6 +455,16 @@ impl BottomPane {
 
     pub(crate) fn show_view(&mut self, view: Box<dyn BottomPaneView>) {
         self.push_view(view);
+    }
+
+    /// Show session alias input dialog for naming a new session.
+    pub(crate) fn show_session_alias_input(
+        &mut self,
+        session_id: String,
+        on_submit: session_alias_input::AliasSubmitted,
+    ) {
+        let view = session_alias_input::SessionAliasInput::new(session_id, on_submit);
+        self.push_view(Box::new(view));
     }
 
     /// Called when the agent requests user approval.
