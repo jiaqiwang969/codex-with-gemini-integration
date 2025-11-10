@@ -391,41 +391,42 @@ impl SessionBar {
             }
         }
 
-        // Build status line (right side of first line)
+        // Build status line (right side of first line) - only show when focused
         let mut status_spans: Vec<Span<'static>> = Vec::new();
-        status_spans.push(Span::from(" 状态:").dim());
-        status_spans.push(Span::from(" "));
-        // Build primary status label and current session short name
-        let (status_label, status_name) = if let Some(cur_id) = current_session_id {
-            // 优先使用别名，否则使用短ID
-            let display_name = if let Some(alias) = self.alias_manager.get_alias(cur_id) {
-                alias
-            } else {
-                if cur_id.len() > 8 {
-                    format!("{}…", &cur_id[..7])
+        if self.has_focus {
+            status_spans.push(Span::from(" 状态:").dim());
+            status_spans.push(Span::from(" "));
+            // Build primary status label and current session short name
+            let (status_label, status_name) = if let Some(cur_id) = current_session_id {
+                // 优先使用别名，否则使用短ID
+                let display_name = if let Some(alias) = self.alias_manager.get_alias(cur_id) {
+                    alias
                 } else {
-                    cur_id.to_string()
-                }
+                    if cur_id.len() > 8 {
+                        format!("{}…", &cur_id[..7])
+                    } else {
+                        cur_id.to_string()
+                    }
+                };
+                let st = self
+                    .current_session_status
+                    .clone()
+                    .unwrap_or_else(|| "就绪".to_string());
+                (st, display_name)
+            } else {
+                ("就绪".to_string(), "新建".to_string())
             };
-            let st = self
-                .current_session_status
-                .clone()
-                .unwrap_or_else(|| "就绪".to_string());
-            (st, display_name)
-        } else {
-            ("就绪".to_string(), "新建".to_string())
-        };
-        status_spans.push(Span::from(status_label).green().bold());
-        status_spans.push(Span::from("  "));
-        status_spans.push(Span::from("会话:").dim());
-        status_spans.push(Span::from(" "));
-        status_spans.push(Span::from(status_name).bold());
+            status_spans.push(Span::from(status_label).green().bold());
+            status_spans.push(Span::from("  "));
+            status_spans.push(Span::from("会话:").dim());
+            status_spans.push(Span::from(" "));
+            status_spans.push(Span::from(status_name).bold());
+        }
 
         // Build help line (second line with keyboard shortcuts)
         let mut help_spans: Vec<Span<'static>> = Vec::new();
         if self.has_focus {
             // Shared key-hint style; all hint texts are dim like the rest of Codex UI
-            help_spans.push(Span::from("  "));  // Indent for alignment
             help_spans.push(key_hint::plain(KeyCode::Left).into());
             help_spans.push(Span::from("/".to_string()).dim());
             help_spans.push(key_hint::plain(KeyCode::Right).into());
@@ -447,7 +448,6 @@ impl SessionBar {
             help_spans.push(key_hint::plain(KeyCode::Esc).into());
             help_spans.push(Span::from(" exit").dim());
         } else {
-            help_spans.push(Span::from("  "));  // Indent for alignment
             help_spans.push(key_hint::ctrl(KeyCode::Char('p')).into());
             help_spans.push(Span::from(" Sessions").dim());
         }
@@ -508,9 +508,13 @@ impl WidgetRef for &SessionBar {
                 .map(|s| UnicodeWidthStr::width(s.content.as_ref()) as u16)
                 .sum();
 
-            let sessions_width = first_line_area
-                .width
-                .saturating_sub(status_width.saturating_add(3)); // 3 for separator
+            let sessions_width = if self.has_focus && status_width > 0 {
+                first_line_area
+                    .width
+                    .saturating_sub(status_width.saturating_add(3)) // 3 for separator
+            } else {
+                first_line_area.width  // Full width when not focused
+            };
             let sessions_area = Rect {
                 x: first_line_area.x,
                 y: first_line_area.y,
@@ -518,8 +522,8 @@ impl WidgetRef for &SessionBar {
                 height: 1,
             };
 
-            // Draw separator and status on right side
-            if status_width > 0 && sessions_width < first_line_area.width {
+            // Draw separator and status on right side (only when focused)
+            if self.has_focus && status_width > 0 && sessions_width < first_line_area.width {
                 let sep_x = first_line_area.x + sessions_width;
                 if sep_x < first_line_area.x + first_line_area.width {
                     Span::from(" │ ")
@@ -551,16 +555,34 @@ impl WidgetRef for &SessionBar {
                 .scroll((0, scroll_x))
                 .render(sessions_area, buf);
 
-            // Second line: help/keyboard shortcuts
+            // Second line: help/keyboard shortcuts (right-aligned)
             if bar_area.height > 1 {
                 let second_line_y = bar_area.y + 1;
-                let second_line_area = Rect {
-                    x: bar_area.x,
-                    y: second_line_y,
-                    width: bar_area.width,
-                    height: 1,
+                
+                // Calculate help text width
+                let help_width: u16 = help_line
+                    .spans
+                    .iter()
+                    .map(|s| UnicodeWidthStr::width(s.content.as_ref()) as u16)
+                    .sum();
+                
+                // Right-align the help text
+                let help_area = if help_width < bar_area.width {
+                    Rect {
+                        x: bar_area.x + bar_area.width.saturating_sub(help_width),
+                        y: second_line_y,
+                        width: help_width,
+                        height: 1,
+                    }
+                } else {
+                    Rect {
+                        x: bar_area.x,
+                        y: second_line_y,
+                        width: bar_area.width,
+                        height: 1,
+                    }
                 };
-                Paragraph::new(vec![help_line]).render(second_line_area, buf);
+                Paragraph::new(vec![help_line]).render(help_area, buf);
             }
         }
     }
