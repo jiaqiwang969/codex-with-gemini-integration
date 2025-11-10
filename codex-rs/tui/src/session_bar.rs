@@ -237,21 +237,24 @@ impl SessionBar {
         self.alias_manager.remove_alias(session_id);
     }
 
-    /// Build the session bar line (similar to tmux status bar)
+    /// Build the session bar lines (similar to tmux status bar)
     ///
     /// Label format: Alias/ShortID (no numbering). The current session is
     /// highlighted by style only. A standalone "新建" is shown only when the
     /// current session is not present in history.
-    fn build_bar_line(
+    /// 
+    /// Returns: (sessions_line, status_line, help_line, sel_start, sel_end, total_left_width)
+    fn build_bar_lines(
         &self,
         current_session_id: Option<&str>,
-    ) -> (Line<'static>, Line<'static>, Option<u16>, Option<u16>, u16) {
+    ) -> (Line<'static>, Line<'static>, Line<'static>, Option<u16>, Option<u16>, u16) {
         if let Some(error) = &self.error {
             return (
                 Line::from(vec![
                     Span::from(" Error: ").red().bold(),
                     Span::from(error.clone()).red(),
                 ]),
+                Line::from(""),
                 Line::from(""),
                 None,
                 None,
@@ -388,10 +391,10 @@ impl SessionBar {
             }
         }
 
-        // Build right side (status + help)
-        let mut right_spans: Vec<Span<'static>> = Vec::new();
-        right_spans.push(Span::from(" 状态:").dim());
-        right_spans.push(Span::from(" "));
+        // Build status line (right side of first line)
+        let mut status_spans: Vec<Span<'static>> = Vec::new();
+        status_spans.push(Span::from(" 状态:").dim());
+        status_spans.push(Span::from(" "));
         // Build primary status label and current session short name
         let (status_label, status_name) = if let Some(cur_id) = current_session_id {
             // 优先使用别名，否则使用短ID
@@ -412,42 +415,47 @@ impl SessionBar {
         } else {
             ("就绪".to_string(), "新建".to_string())
         };
-        right_spans.push(Span::from(status_label).green().bold());
-        right_spans.push(Span::from("  "));
-        right_spans.push(Span::from("会话:").dim());
-        right_spans.push(Span::from(" "));
-        right_spans.push(Span::from(status_name).bold());
-        right_spans.push(Span::from(" │ ").dim());
+        status_spans.push(Span::from(status_label).green().bold());
+        status_spans.push(Span::from("  "));
+        status_spans.push(Span::from("会话:").dim());
+        status_spans.push(Span::from(" "));
+        status_spans.push(Span::from(status_name).bold());
+
+        // Build help line (second line with keyboard shortcuts)
+        let mut help_spans: Vec<Span<'static>> = Vec::new();
         if self.has_focus {
             // Shared key-hint style; all hint texts are dim like the rest of Codex UI
-            right_spans.push(key_hint::plain(KeyCode::Left).into());
-            right_spans.push(Span::from("/".to_string()).dim());
-            right_spans.push(key_hint::plain(KeyCode::Right).into());
-            right_spans.push(Span::from(" move  ").dim());
+            help_spans.push(Span::from("  "));  // Indent for alignment
+            help_spans.push(key_hint::plain(KeyCode::Left).into());
+            help_spans.push(Span::from("/".to_string()).dim());
+            help_spans.push(key_hint::plain(KeyCode::Right).into());
+            help_spans.push(Span::from(" move  ").dim());
 
-            right_spans.push(key_hint::plain(KeyCode::Enter).into());
-            right_spans.push(Span::from(" open  ").dim());
+            help_spans.push(key_hint::plain(KeyCode::Enter).into());
+            help_spans.push(Span::from(" open  ").dim());
 
-            right_spans.push(key_hint::plain(KeyCode::Char('n')).into());
-            right_spans.push(Span::from(" new  ").dim());
+            help_spans.push(key_hint::plain(KeyCode::Char('n')).into());
+            help_spans.push(Span::from(" new  ").dim());
 
-            right_spans.push(key_hint::plain(KeyCode::Char('r')).into());
-            right_spans.push(Span::from(" rename  ").dim());
+            help_spans.push(key_hint::plain(KeyCode::Char('r')).into());
+            help_spans.push(Span::from(" rename  ").dim());
 
-            right_spans.push(key_hint::plain(KeyCode::Char('x')).into());
-            right_spans.push(Span::from(" delete  ").dim());
+            help_spans.push(key_hint::plain(KeyCode::Char('x')).into());
+            help_spans.push(Span::from(" delete  ").dim());
 
             // Use Esc to exit session focus; Tab is reserved elsewhere and disabled here
-            right_spans.push(key_hint::plain(KeyCode::Esc).into());
-            right_spans.push(Span::from(" exit").dim());
+            help_spans.push(key_hint::plain(KeyCode::Esc).into());
+            help_spans.push(Span::from(" exit").dim());
         } else {
-            right_spans.push(key_hint::ctrl(KeyCode::Char('p')).into());
-            right_spans.push(Span::from(" Sessions").dim());
+            help_spans.push(Span::from("  "));  // Indent for alignment
+            help_spans.push(key_hint::ctrl(KeyCode::Char('p')).into());
+            help_spans.push(Span::from(" Sessions").dim());
         }
 
         (
             Line::from(left_spans),
-            Line::from(right_spans),
+            Line::from(status_spans),
+            Line::from(help_spans),
             sel_start,
             sel_end,
             cur_x,
@@ -475,71 +483,85 @@ impl WidgetRef for &SessionBar {
             height: area.height.saturating_sub(1),
         };
 
-        // Build the status bar line and scrolling metadata
-        let (left_line, right_line, sel_start, sel_end, total_left_width) =
-            self.build_bar_line(self.current_session_id.as_deref());
+        // Build the status bar lines and scrolling metadata
+        let (sessions_line, status_line, help_line, sel_start, sel_end, total_left_width) =
+            self.build_bar_lines(self.current_session_id.as_deref());
 
         // Clear the bar area without forcing background colors so terminal themes apply.
         Clear.render(bar_area, buf);
 
-        // Render the session bar with vertical centering
+        // Render two lines: sessions/status on first line, help on second line
         if bar_area.height > 0 {
-            let centered_y = bar_area.y + (bar_area.height.saturating_sub(1) / 2);
-            let render_area = Rect {
+            // First line: sessions list + status
+            let first_line_y = bar_area.y;
+            let first_line_area = Rect {
                 x: bar_area.x,
-                y: centered_y,
+                y: first_line_y,
                 width: bar_area.width,
                 height: 1,
             };
-            // Measure right side width and allocate left/right areas
-            let right_width: u16 = right_line
+            
+            // Measure status line width for right side
+            let status_width: u16 = status_line
                 .spans
                 .iter()
                 .map(|s| UnicodeWidthStr::width(s.content.as_ref()) as u16)
                 .sum();
 
-            let left_width = render_area
+            let sessions_width = first_line_area
                 .width
-                .saturating_sub(right_width.saturating_add(1));
-            let left_area = Rect {
-                x: render_area.x,
-                y: render_area.y,
-                width: left_width,
+                .saturating_sub(status_width.saturating_add(3)); // 3 for separator
+            let sessions_area = Rect {
+                x: first_line_area.x,
+                y: first_line_area.y,
+                width: sessions_width,
                 height: 1,
             };
 
-            // Draw separator and right side pinned
-            if right_width > 0 && left_width < render_area.width {
-                let sep_x = render_area.x + left_width;
-                if sep_x < render_area.x + render_area.width {
-                    Span::from("│")
+            // Draw separator and status on right side
+            if status_width > 0 && sessions_width < first_line_area.width {
+                let sep_x = first_line_area.x + sessions_width;
+                if sep_x < first_line_area.x + first_line_area.width {
+                    Span::from(" │ ")
                         .dim()
-                        .render_ref(Rect::new(sep_x, render_area.y, 1, 1), buf);
+                        .render_ref(Rect::new(sep_x, first_line_area.y, 3, 1), buf);
                 }
-                let right_area = Rect {
-                    x: render_area.x + render_area.width.saturating_sub(right_width),
-                    y: render_area.y,
-                    width: right_width,
+                let status_area = Rect {
+                    x: first_line_area.x + first_line_area.width.saturating_sub(status_width),
+                    y: first_line_area.y,
+                    width: status_width,
                     height: 1,
                 };
-                Paragraph::new(vec![right_line.clone()]).render(right_area, buf);
+                Paragraph::new(vec![status_line.clone()]).render(status_area, buf);
             }
 
-            // Compute horizontal scroll for left side: center selected when possible
+            // Compute horizontal scroll for sessions list: center selected when possible
             let mut scroll_x: u16 = 0;
             if let (Some(start), Some(end)) = (sel_start, sel_end) {
                 let sel_center = start.saturating_add(end).saturating_div(2);
-                let half = left_area.width.saturating_div(2);
+                let half = sessions_area.width.saturating_div(2);
                 let desired = sel_center.saturating_sub(half);
-                let max_scroll = total_left_width.saturating_sub(left_area.width);
+                let max_scroll = total_left_width.saturating_sub(sessions_area.width);
                 scroll_x = desired.min(max_scroll);
-            } else if total_left_width > left_area.width {
-                scroll_x = total_left_width.saturating_sub(left_area.width);
+            } else if total_left_width > sessions_area.width {
+                scroll_x = total_left_width.saturating_sub(sessions_area.width);
             }
 
-            Paragraph::new(vec![left_line])
+            Paragraph::new(vec![sessions_line])
                 .scroll((0, scroll_x))
-                .render(left_area, buf);
+                .render(sessions_area, buf);
+
+            // Second line: help/keyboard shortcuts
+            if bar_area.height > 1 {
+                let second_line_y = bar_area.y + 1;
+                let second_line_area = Rect {
+                    x: bar_area.x,
+                    y: second_line_y,
+                    width: bar_area.width,
+                    height: 1,
+                };
+                Paragraph::new(vec![help_line]).render(second_line_area, buf);
+            }
         }
     }
 }
