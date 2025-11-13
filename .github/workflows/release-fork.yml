@@ -1,0 +1,171 @@
+name: Build And Publish Fork (npm)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. 0.58.0-alpha.9)"
+        required: true
+        type: string
+      npm_tag:
+        description: "npm dist-tag (e.g. latest, alpha)"
+        required: false
+        default: "alpha"
+        type: string
+      publish:
+        description: "Publish to npm (requires NPM_TOKEN)"
+        required: false
+        default: false
+        type: boolean
+      make_release:
+        description: "Create GitHub release and attach npm tarball"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  build:
+    name: Build ${{ matrix.triple }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            triple: x86_64-unknown-linux-musl
+            exe_suffix: ""
+            rg_url: https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-x86_64-unknown-linux-musl.tar.gz
+            rg_path: ripgrep-14.1.1-x86_64-unknown-linux-musl/rg
+          - os: macos-13
+            triple: x86_64-apple-darwin
+            exe_suffix: ""
+            rg_url: https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-x86_64-apple-darwin.tar.gz
+            rg_path: ripgrep-14.1.1-x86_64-apple-darwin/rg
+          - os: macos-14
+            triple: aarch64-apple-darwin
+            exe_suffix: ""
+            rg_url: https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-aarch64-apple-darwin.tar.gz
+            rg_path: ripgrep-14.1.1-aarch64-apple-darwin/rg
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+            exe_suffix: ".exe"
+            rg_url: https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-x86_64-pc-windows-msvc.zip
+            rg_path: ripgrep-14.1.1-x86_64-pc-windows-msvc/rg.exe
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Linux musl toolchain
+        if: startsWith(matrix.triple, 'x86_64-unknown-linux-musl')
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y musl-tools pkg-config
+
+      - name: Build codex and hunyuan-mcp-server
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          rustup target add ${{ matrix.triple }} || true
+          cargo build -p codex-cli --release --target ${{ matrix.triple }}
+          cargo build -p hunyuan-mcp-server --release --target ${{ matrix.triple }}
+
+      - name: Prepare vendor layout
+        shell: bash
+        run: |
+          mkdir -p codex-cli/vendor/${{ matrix.triple }}/codex codex-cli/vendor/${{ matrix.triple }}/path
+          SRC_DIR="codex-rs/target/${{ matrix.triple }}/release"
+          cp -f "${SRC_DIR}/codex${{ matrix.exe_suffix }}" codex-cli/vendor/${{ matrix.triple }}/codex/codex${{ matrix.exe_suffix }}
+          cp -f "${SRC_DIR}/hunyuan-mcp-server${{ matrix.exe_suffix }}" codex-cli/vendor/${{ matrix.triple }}/codex/hunyuan-mcp-server${{ matrix.exe_suffix }}
+
+      - name: Download ripgrep (Linux/macOS)
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          TMPD="$(mktemp -d)"
+          curl -fsSL -o "$TMPD/rg.pkg" "${{ matrix.rg_url }}"
+          tar -xzf "$TMPD/rg.pkg" -C "$TMPD"
+          cp -f "$TMPD/${{ matrix.rg_path }}" codex-cli/vendor/${{ matrix.triple }}/path/rg
+          chmod +x codex-cli/vendor/${{ matrix.triple }}/path/rg
+
+      - name: Download ripgrep (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $tmp = New-Item -ItemType Directory -Path $env:TEMP -Name rgdl -Force
+          $zip = Join-Path $tmp.FullName "rg.zip"
+          Invoke-WebRequest "${{ matrix.rg_url }}" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $tmp -Force
+          Copy-Item -Path (Join-Path $tmp "${{ matrix.rg_path }}") -Destination "codex-cli/vendor/${{ matrix.triple }}/path/rg.exe" -Force
+
+      - name: Upload vendor artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vendor-${{ matrix.triple }}
+          path: codex-cli/vendor/${{ matrix.triple }}
+
+  package:
+    name: Package npm
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download vendor artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: codex-cli/vendor
+          pattern: vendor-*
+          merge-multiple: true
+
+      - name: Build npm package
+        shell: bash
+        run: |
+          python3 codex-cli/scripts/build_npm_package.py \
+            --package codex \
+            --version "${{ inputs.version }}" \
+            --vendor-src codex-cli/vendor \
+            --staging-dir ./dist/codex-npm \
+            --pack-output ./dist/codex.tgz
+          node ./dist/codex-npm/bin/codex.js --version || true
+
+      - name: Publish to npm
+        if: inputs.publish == true
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm publish --access public --tag "${{ inputs.npm_tag }}" ./dist/codex-npm
+
+      - name: Upload npm tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-npm-${{ inputs.version }}
+          path: dist/codex.tgz
+
+      - name: Create GitHub release
+        if: inputs.make_release == true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: fork-v${{ inputs.version }}
+          name: "Fork Release v${{ inputs.version }}"
+          draft: false
+          prerelease: ${{ contains(inputs.version, '-') }}
+          files: |
+            dist/codex.tgz
