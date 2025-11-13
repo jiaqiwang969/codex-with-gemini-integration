@@ -6,7 +6,6 @@ use crate::app::App;
 use crate::app_event::AppEvent;
 use crate::cxresume_picker_widget::SessionInfo;
 use crate::cxresume_picker_widget::{self};
-use crate::history_cell::CompositeHistoryCell;
 use crate::history_cell::SessionInfoCell;
 use crate::history_cell::UserHistoryCell;
 use crate::pager_overlay::Overlay;

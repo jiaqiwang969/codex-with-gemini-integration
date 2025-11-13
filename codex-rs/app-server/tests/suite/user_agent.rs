@@ -25,8 +25,10 @@ async fn get_user_agent_returns_current_codex_user_agent() -> Result<()> {
     .await??;
 
     let os_info = os_info::get();
+    // Match the actual crate version (may be pre-release like 0.58.0-alpha.9)
+    let version = env!("CARGO_PKG_VERSION");
     let user_agent = format!(
-        "codex_cli_rs/0.0.0 ({} {}; {}) {} (codex-app-server-tests; 0.1.0)",
+        "codex_cli_rs/{version} ({} {}; {}) {} (codex-app-server-tests; 0.1.0)",
         os_info.os_type(),
         os_info.version(),
         os_info.architecture().unwrap_or("unknown"),
