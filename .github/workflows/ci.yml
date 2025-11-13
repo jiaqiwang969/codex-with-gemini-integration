@@ -45,6 +45,7 @@ jobs:
         id: stage_npm_package
         env:
           GH_TOKEN: ${{ github.token }}
+        if: ${{ github.repository == 'openai/codex' }}
         run: |
           set -euo pipefail
           CODEX_VERSION=0.40.0
@@ -57,6 +58,7 @@ jobs:
           echo "pack_output=$PACK_OUTPUT" >> "$GITHUB_OUTPUT"
 
       - name: Upload staged npm package artifact
+        if: ${{ github.repository == 'openai/codex' }}
         uses: actions/upload-artifact@v5
         with:
           name: codex-npm-staging
