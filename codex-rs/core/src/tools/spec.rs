@@ -74,7 +74,7 @@ impl ToolsConfig {
 
         Self {
             shell_type,
-            delegate_tool: include_delegate_tool,
+            delegate_tool: *include_delegate_tool,
             apply_patch_tool_type,
             web_search_request: include_web_search_request,
             include_view_image_tool,
@@ -1247,7 +1247,7 @@ mod tests {
             .unwrap_or_else(|| panic!("{model_family} should be a valid model family"));
         let config = ToolsConfig::new(&ToolsConfigParams {
             model_family: &model_family,
-            features: &features,
+            features: features,
             include_delegate_tool: false,
         });
         let (tools, _) = build_specs(&config, Some(HashMap::new())).build();

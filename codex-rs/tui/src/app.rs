@@ -629,7 +629,8 @@ impl App {
                         };
 
                         // Render ChatWidget in its allocated area
-                        frame.render_widget_ref(&self.chat_widget, main_area);
+                        // ChatWidget implements our Renderable trait; render directly.
+                        self.chat_widget.render(main_area, frame.buffer_mut());
 
                         // Render session bar at bottom if visible
                         if !session_area.is_empty() {
@@ -1642,7 +1643,7 @@ impl App {
                                     if let Some(session) = self.session_bar.selected_session() {
                                         let session_id = session.id.clone();
                                         let app_tx = self.app_event_tx.clone();
-                                        
+
                                         // Show alias input for renaming
                                         self.chat_widget.show_session_alias_input_for_rename(
                                             session_id.clone(),
@@ -1653,7 +1654,7 @@ impl App {
                                                 });
                                             }),
                                         );
-                                        
+
                                         // Transfer focus to ChatWidget so the rename dialog can receive input
                                         self.panel_focus = PanelFocus::Chat;
                                         self.session_bar.set_focus(false);
@@ -1668,7 +1669,7 @@ impl App {
                                         // Clone values before mutable borrow
                                         let session_path = session.path.clone();
                                         let session_id = session.id.clone();
-                                        
+
                                         // Remove the session file
                                         let _ = std::fs::remove_file(&session_path);
                                         // Remove the associated alias
@@ -1943,12 +1944,14 @@ mod tests {
                 config_profile: None,
                 codex_linux_sandbox_exe: None,
                 base_instructions: None,
-                include_plan_tool: None,
                 include_delegate_tool: None,
                 include_apply_patch_tool: None,
-                include_view_image_tool: None,
                 show_raw_agent_reasoning: None,
                 tools_web_search_request: None,
+                developer_instructions: None,
+                compact_prompt: None,
+                experimental_sandbox_command_assessment: None,
+                additional_writable_roots: Vec::new(),
             },
             Vec::new(),
             config.multi_agent.max_concurrent_delegates,

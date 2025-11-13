@@ -572,9 +572,6 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
             tokio::task::spawn_blocking(move || codex_stdio_to_uds::run(socket_path.as_path()))
                 .await??;
         }
-        Some(Subcommand::GenerateTs(gen_cli)) => {
-            codex_protocol_ts::generate_ts(&gen_cli.out_dir, gen_cli.prettier.as_deref())?;
-        }
         Some(Subcommand::Tumix(mut tumix_cli)) => {
             prepend_config_flags(
                 &mut tumix_cli.config_overrides,

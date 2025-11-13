@@ -6,8 +6,8 @@ use std::sync::atomic::AtomicU64;
 
 use crate::AuthManager;
 use crate::client_common::REVIEW_PROMPT;
-use crate::delegate_tool::DelegateToolAdapter;
 use crate::compact;
+use crate::delegate_tool::DelegateToolAdapter;
 // Keep both our custom delegate adapter and upstream compact module import.
 // - DelegateToolAdapter: local customization for delegate tool handling
 // - compact: upstream module used for summarization and auto-compact tasks

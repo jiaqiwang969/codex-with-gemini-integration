@@ -242,12 +242,19 @@ impl SessionBar {
     /// Label format: Alias/ShortID (no numbering). The current session is
     /// highlighted by style only. A standalone "新建" is shown only when the
     /// current session is not present in history.
-    /// 
+    ///
     /// Returns: (sessions_line, status_line, help_line, sel_start, sel_end, total_left_width)
     fn build_bar_lines(
         &self,
         current_session_id: Option<&str>,
-    ) -> (Line<'static>, Line<'static>, Line<'static>, Option<u16>, Option<u16>, u16) {
+    ) -> (
+        Line<'static>,
+        Line<'static>,
+        Line<'static>,
+        Option<u16>,
+        Option<u16>,
+        u16,
+    ) {
         if let Some(error) = &self.error {
             return (
                 Line::from(vec![
@@ -312,7 +319,7 @@ impl SessionBar {
         } else {
             for (idx, session) in self.sessions.iter().enumerate() {
                 let is_selected = self.selected_index == idx;
-                
+
                 // Add separator before each session except the first
                 if idx > 0 || !current_in_history {
                     add_left(
@@ -498,7 +505,7 @@ impl WidgetRef for &SessionBar {
                 width: bar_area.width,
                 height: 1,
             };
-            
+
             // Measure status line width for right side
             let status_width: u16 = status_line
                 .spans
@@ -552,14 +559,14 @@ impl WidgetRef for &SessionBar {
             // Second line: help/keyboard shortcuts (right-aligned)
             if bar_area.height > 1 {
                 let second_line_y = bar_area.y + 1;
-                
+
                 // Calculate help text width
                 let help_width: u16 = help_line
                     .spans
                     .iter()
                     .map(|s| UnicodeWidthStr::width(s.content.as_ref()) as u16)
                     .sum();
-                
+
                 // Right-align the help text
                 let help_area = if help_width < bar_area.width {
                     Rect {
