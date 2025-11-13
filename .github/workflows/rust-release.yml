@@ -440,6 +440,7 @@ jobs:
       - name: Stage npm packages
         env:
           GH_TOKEN: ${{ github.token }}
+        if: ${{ github.repository == "openai/codex" }}
         run: |
           ./scripts/stage_npm_packages.py \
             --release-version "${{ steps.release_name.outputs.name }}" \
@@ -469,7 +470,7 @@ jobs:
   # npm docs: https://docs.npmjs.com/trusted-publishers
   publish-npm:
     # Publish to npm for stable releases and alpha pre-releases with numeric suffixes.
-    if: ${{ needs.release.outputs.should_publish_npm == 'true' }}
+    if: ${{ needs.release.outputs.should_publish_npm == 'true' && github.repository == "openai/codex" }}
     name: publish-npm
     needs: release
     runs-on: ubuntu-latest
@@ -533,6 +534,7 @@ jobs:
           done
 
   update-branch:
+    if: ${{ github.repository == "openai/codex" }}
     name: Update latest-alpha-cli branch
     permissions:
       contents: write
