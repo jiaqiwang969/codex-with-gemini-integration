@@ -9,14 +9,19 @@ use crate::diff_render::DiffSummary;
 use crate::exec_command::strip_bash_lc_and_escape;
 use crate::file_search::FileSearchManager;
 use crate::history_cell::HistoryCell;
+use crate::model_migration::ModelMigrationOutcome;
+use crate::model_migration::run_model_migration_prompt;
 use crate::pager_overlay::Overlay;
 use crate::render::highlight::highlight_bash_to_lines;
+use crate::render::renderable::Renderable;
 use crate::resume_picker::ResumeSelection;
 use crate::session_bar::SessionBar;
 use crate::tui;
 use crate::tui::TuiEvent;
-use crate::updates::UpdateAction;
+use crate::update_action::UpdateAction;
 use codex_ansi_escape::ansi_escape_line;
+use codex_common::model_presets::ModelUpgrade;
+use codex_common::model_presets::all_model_presets;
 use codex_core::AuthManager;
 use codex_core::ConversationManager;
 use codex_core::config::Config;
@@ -79,6 +84,85 @@ pub(crate) enum LayoutMode {
     Collapsed,
 }
 
+fn should_show_model_migration_prompt(
+    current_model: &str,
+    target_model: &str,
+    hide_prompt_flag: Option<bool>,
+) -> bool {
+    if target_model == current_model || hide_prompt_flag.unwrap_or(false) {
+        return false;
+    }
+
+    all_model_presets()
+        .iter()
+        .filter(|preset| preset.upgrade.is_some())
+        .any(|preset| preset.model == current_model)
+}
+
+async fn handle_model_migration_prompt_if_needed(
+    tui: &mut tui::Tui,
+    config: &mut Config,
+    app_event_tx: &AppEventSender,
+) -> Option<AppExitInfo> {
+    let upgrade = all_model_presets()
+        .iter()
+        .find(|preset| preset.model == config.model)
+        .and_then(|preset| preset.upgrade.as_ref());
+
+    if let Some(ModelUpgrade {
+        id: target_model,
+        reasoning_effort_mapping,
+    }) = upgrade
+    {
+        let target_model = target_model.to_string();
+        let hide_prompt_flag = config.notices.hide_gpt5_1_migration_prompt;
+        if !should_show_model_migration_prompt(&config.model, &target_model, hide_prompt_flag) {
+            return None;
+        }
+
+        match run_model_migration_prompt(tui).await {
+            ModelMigrationOutcome::Accepted => {
+                app_event_tx.send(AppEvent::PersistModelMigrationPromptAcknowledged {
+                    migration_config: "hide_gpt5_1_migration_prompt".to_string(),
+                });
+                config.model = target_model.to_string();
+                if let Some(family) = find_family_for_model(&target_model) {
+                    config.model_family = family;
+                }
+
+                let mapped_effort = if let Some(reasoning_effort_mapping) = reasoning_effort_mapping
+                    && let Some(reasoning_effort) = config.model_reasoning_effort
+                {
+                    reasoning_effort_mapping
+                        .get(&reasoning_effort)
+                        .cloned()
+                        .or(config.model_reasoning_effort)
+                } else {
+                    config.model_reasoning_effort
+                };
+
+                config.model_reasoning_effort = mapped_effort;
+
+                app_event_tx.send(AppEvent::UpdateModel(target_model.clone()));
+                app_event_tx.send(AppEvent::UpdateReasoningEffort(mapped_effort));
+                app_event_tx.send(AppEvent::PersistModelSelection {
+                    model: target_model.clone(),
+                    effort: mapped_effort,
+                });
+            }
+            ModelMigrationOutcome::Exit => {
+                return Some(AppExitInfo {
+                    token_usage: TokenUsage::default(),
+                    conversation_id: None,
+                    update_action: None,
+                });
+            }
+        }
+    }
+
+    None
+}
+
 pub(crate) struct App {
     pub(crate) server: Arc<ConversationManager>,
     pub(crate) app_event_tx: AppEventSender,
@@ -123,6 +207,8 @@ pub(crate) struct App {
     pub(crate) pending_update_action: Option<UpdateAction>,
     delegate_tree: DelegateTree,
     delegate_status_owner: Option<String>,
+    // One-shot suppression of the next world-writable scan after user confirmation.
+    skip_world_writable_scan_once: bool,
 }
 
 #[derive(Default)]
@@ -230,7 +316,7 @@ impl App {
         tui: &mut tui::Tui,
         auth_manager: Arc<AuthManager>,
         delegate_orchestrator: Arc<AgentOrchestrator>,
-        config: Config,
+        mut config: Config,
         active_profile: Option<String>,
         initial_prompt: Option<String>,
         initial_images: Vec<PathBuf>,
@@ -241,6 +327,14 @@ impl App {
         let (app_event_tx, mut app_event_rx) = unbounded_channel();
         let app_event_tx = AppEventSender::new(app_event_tx);
 
+        // Handle model migration prompt if needed (upstream addition).
+        if let Some(exit_info) =
+            handle_model_migration_prompt_if_needed(tui, &mut config, &app_event_tx).await
+        {
+            return Ok(exit_info);
+        }
+
+        // Wire up delegate orchestrator (custom multi-agent integration).
         let delegate_adapter = delegate_tool_adapter(delegate_orchestrator.clone());
         let mut delegate_event_rx = delegate_orchestrator.subscribe().await;
         let delegate_app_event_tx = app_event_tx.clone();
@@ -334,6 +428,7 @@ impl App {
             pending_update_action: None,
             delegate_tree: DelegateTree::default(),
             delegate_status_owner: None,
+            skip_world_writable_scan_once: false,
             session_bar,
             panel_focus: PanelFocus::Chat,
             layout_mode: LayoutMode::Normal,
@@ -341,13 +436,36 @@ impl App {
 
         app.cxresume_idle.trigger_immediate(&app.app_event_tx);
 
+        // On startup, if Auto mode (workspace-write) or ReadOnly is active, warn about world-writable dirs on Windows.
+        #[cfg(target_os = "windows")]
+        {
+            let should_check = codex_core::get_platform_sandbox().is_some()
+                && matches!(
+                    app.config.sandbox_policy,
+                    codex_core::protocol::SandboxPolicy::WorkspaceWrite { .. }
+                        | codex_core::protocol::SandboxPolicy::ReadOnly
+                )
+                && !app
+                    .config
+                    .notices
+                    .hide_world_writable_warning
+                    .unwrap_or(false);
+            if should_check {
+                let cwd = app.config.cwd.clone();
+                let env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
+                let tx = app.app_event_tx.clone();
+                let logs_base_dir = app.config.codex_home.clone();
+                Self::spawn_world_writable_scan(cwd, env_map, logs_base_dir, tx);
+            }
+        }
+
         #[cfg(not(debug_assertions))]
         if let Some(latest_version) = upgrade_version {
             app.handle_event(
                 tui,
                 AppEvent::InsertHistoryCell(Box::new(UpdateAvailableHistoryCell::new(
                     latest_version,
-                    crate::updates::get_update_action(),
+                    crate::update_action::get_update_action(),
                 ))),
             )
             .await?;
@@ -457,7 +575,6 @@ impl App {
                     {
                         return Ok(true);
                     }
-
                     // Always show session bar (no auto-collapse)
 
                     // Update session bar with current conversation ID and status derived from ChatWidget
@@ -703,6 +820,19 @@ impl App {
             AppEvent::OpenFullAccessConfirmation { preset } => {
                 self.chat_widget.open_full_access_confirmation(preset);
             }
+            AppEvent::OpenWorldWritableWarningConfirmation {
+                preset,
+                sample_paths,
+                extra_count,
+                failed_scan,
+            } => {
+                self.chat_widget.open_world_writable_warning_confirmation(
+                    preset,
+                    sample_paths,
+                    extra_count,
+                    failed_scan,
+                );
+            }
             AppEvent::OpenFeedbackNote {
                 category,
                 include_logs,
@@ -761,10 +891,49 @@ impl App {
                 self.chat_widget.set_approval_policy(policy);
             }
             AppEvent::UpdateSandboxPolicy(policy) => {
+                #[cfg(target_os = "windows")]
+                let policy_is_workspace_write_or_ro = matches!(
+                    policy,
+                    codex_core::protocol::SandboxPolicy::WorkspaceWrite { .. }
+                        | codex_core::protocol::SandboxPolicy::ReadOnly
+                );
+
                 self.chat_widget.set_sandbox_policy(policy);
+
+                // If sandbox policy becomes workspace-write or read-only, run the Windows world-writable scan.
+                #[cfg(target_os = "windows")]
+                {
+                    // One-shot suppression if the user just confirmed continue.
+                    if self.skip_world_writable_scan_once {
+                        self.skip_world_writable_scan_once = false;
+                        return Ok(true);
+                    }
+
+                    let should_check = codex_core::get_platform_sandbox().is_some()
+                        && policy_is_workspace_write_or_ro
+                        && !self.chat_widget.world_writable_warning_hidden();
+                    if should_check {
+                        let cwd = self.config.cwd.clone();
+                        let env_map: std::collections::HashMap<String, String> =
+                            std::env::vars().collect();
+                        let tx = self.app_event_tx.clone();
+                        let logs_base_dir = self.config.codex_home.clone();
+                        Self::spawn_world_writable_scan(cwd, env_map, logs_base_dir, tx);
+                    }
+                }
+            }
+            AppEvent::SkipNextWorldWritableScan => {
+                self.skip_world_writable_scan_once = true;
             }
             AppEvent::UpdateFullAccessWarningAcknowledged(ack) => {
                 self.chat_widget.set_full_access_warning_acknowledged(ack);
+            }
+            AppEvent::UpdateWorldWritableWarningAcknowledged(ack) => {
+                self.chat_widget
+                    .set_world_writable_warning_acknowledged(ack);
+            }
+            AppEvent::UpdateRateLimitSwitchPromptHidden(hidden) => {
+                self.chat_widget.set_rate_limit_switch_prompt_hidden(hidden);
             }
             AppEvent::PersistFullAccessWarningAcknowledged => {
                 if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
@@ -778,6 +947,48 @@ impl App {
                     );
                     self.chat_widget.add_error_message(format!(
                         "Failed to save full access confirmation preference: {err}"
+                    ));
+                }
+            }
+            AppEvent::PersistWorldWritableWarningAcknowledged => {
+                if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
+                    .set_hide_world_writable_warning(true)
+                    .apply()
+                    .await
+                {
+                    tracing::error!(
+                        error = %err,
+                        "failed to persist world-writable warning acknowledgement"
+                    );
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to save Auto mode warning preference: {err}"
+                    ));
+                }
+            }
+            AppEvent::PersistRateLimitSwitchPromptHidden => {
+                if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
+                    .set_hide_rate_limit_model_nudge(true)
+                    .apply()
+                    .await
+                {
+                    tracing::error!(
+                        error = %err,
+                        "failed to persist rate limit switch prompt preference"
+                    );
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to save rate limit reminder preference: {err}"
+                    ));
+                }
+            }
+            AppEvent::PersistModelMigrationPromptAcknowledged { migration_config } => {
+                if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
+                    .set_hide_model_migration_prompt(&migration_config, true)
+                    .apply()
+                    .await
+                {
+                    tracing::error!(error = %err, "failed to persist model migration prompt acknowledgement");
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to save model migration prompt preference: {err}"
                     ));
                 }
             }
@@ -1488,6 +1699,58 @@ impl App {
             }
         };
     }
+
+    #[cfg(target_os = "windows")]
+    fn spawn_world_writable_scan(
+        cwd: PathBuf,
+        env_map: std::collections::HashMap<String, String>,
+        logs_base_dir: PathBuf,
+        tx: AppEventSender,
+    ) {
+        #[inline]
+        fn normalize_windows_path_for_display(p: &std::path::Path) -> String {
+            let canon = dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            canon.display().to_string().replace('/', "\\")
+        }
+        tokio::task::spawn_blocking(move || {
+            let result = codex_windows_sandbox::preflight_audit_everyone_writable(
+                &cwd,
+                &env_map,
+                Some(logs_base_dir.as_path()),
+            );
+            if let Ok(ref paths) = result
+                && !paths.is_empty()
+            {
+                let as_strings: Vec<String> = paths
+                    .iter()
+                    .map(|p| normalize_windows_path_for_display(p))
+                    .collect();
+                let sample_paths: Vec<String> = as_strings.iter().take(3).cloned().collect();
+                let extra_count = if as_strings.len() > sample_paths.len() {
+                    as_strings.len() - sample_paths.len()
+                } else {
+                    0
+                };
+
+                tx.send(AppEvent::OpenWorldWritableWarningConfirmation {
+                    preset: None,
+                    sample_paths,
+                    extra_count,
+                    failed_scan: false,
+                });
+            } else if result.is_err() {
+                // Scan failed: still warn, but with no examples and mark as failed.
+                let sample_paths: Vec<String> = Vec::new();
+                let extra_count = 0usize;
+                tx.send(AppEvent::OpenWorldWritableWarningConfirmation {
+                    preset: None,
+                    sample_paths,
+                    extra_count,
+                    failed_scan: true,
+                });
+            }
+        });
+    }
 }
 
 struct DelegateSessionState {
@@ -1722,7 +1985,40 @@ mod tests {
             session_bar,
             panel_focus: PanelFocus::Chat,
             layout_mode: LayoutMode::Normal,
+            skip_world_writable_scan_once: false,
         }
+    }
+
+    #[test]
+    fn model_migration_prompt_only_shows_for_deprecated_models() {
+        assert!(should_show_model_migration_prompt("gpt-5", "gpt-5.1", None));
+        assert!(should_show_model_migration_prompt(
+            "gpt-5-codex",
+            "gpt-5.1-codex",
+            None
+        ));
+        assert!(should_show_model_migration_prompt(
+            "gpt-5-codex-mini",
+            "gpt-5.1-codex-mini",
+            None
+        ));
+        assert!(!should_show_model_migration_prompt(
+            "gpt-5.1-codex",
+            "gpt-5.1-codex",
+            None
+        ));
+    }
+
+    #[test]
+    fn model_migration_prompt_respects_hide_flag_and_self_target() {
+        assert!(!should_show_model_migration_prompt(
+            "gpt-5",
+            "gpt-5.1",
+            Some(true)
+        ));
+        assert!(!should_show_model_migration_prompt(
+            "gpt-5.1", "gpt-5.1", None
+        ));
     }
 
     #[test]
