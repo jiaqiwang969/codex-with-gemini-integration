@@ -1,5 +1,5 @@
-<p align="center"><code>npm i -g @jiaqiwang969/codex</code><br />(Fork 版本)</p>
-<p align="center">或安装上游版本：<code>npm i -g @openai/codex</code> / <code>brew install --cask codex</code></p>
+<p align="center"><em>（提示）Fork 的 npm 安装暂未开放，后续更新。</em></p>
+<p align="center">如需上游版本：<code>npm i -g @openai/codex</code> / <code>brew install --cask codex</code></p>
 
 <!-- 已移除“非 npm 一键安装”脚本，后续如需再讨论开启 -->
 
@@ -18,11 +18,9 @@
 
 ### Installing and running Codex CLI
 
-Install globally with your preferred package manager. If you use npm (Fork 版本):
+Install globally with your preferred package manager.
 
-```shell
-npm install -g @jiaqiwang969/codex
-```
+> 注：本 Fork 的 npm 发布暂未开放，后续更新。下面提供上游官方安装方式。
 
 Alternatively, for the upstream package (OpenAI official):
 
