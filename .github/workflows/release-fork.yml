@@ -22,6 +22,9 @@ on:
         required: false
         default: false
         type: boolean
+  push:
+    tags:
+      - "fork-v*"
 
 jobs:
   build:
@@ -176,7 +179,7 @@ jobs:
         run: |
           python3 codex-cli/scripts/build_npm_package.py \
             --package codex \
-            --version "${{ inputs.version }}" \
+            --version "${{ inputs.version || github.ref_name }}" \
             --vendor-src codex-cli/vendor \
             --staging-dir ./dist/codex-npm \
             --pack-output ./dist/codex.tgz
@@ -203,6 +206,17 @@ jobs:
           name: "Fork Release v${{ inputs.version }}"
           draft: false
           prerelease: ${{ contains(inputs.version, '-') }}
+          files: |
+            dist/codex.tgz
+            dist/bundles/*.tar.gz
+      - name: Create GitHub release (push tag)
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "Fork Release ${{ github.ref_name }}"
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             dist/codex.tgz
             dist/bundles/*.tar.gz
