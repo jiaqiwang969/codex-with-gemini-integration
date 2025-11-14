@@ -271,7 +271,7 @@ impl App {
         enum OverlayCloseAction {
             Session {
                 id: Option<String>,
-                session: Option<SessionInfo>,
+                session: Box<Option<SessionInfo>>,
             },
             Other,
         }
@@ -283,7 +283,7 @@ impl App {
                 close_action = Some(match overlay {
                     Overlay::SessionPicker(_) => OverlayCloseAction::Session {
                         id: overlay.get_selected_session_id(),
-                        session: overlay.get_selected_session(),
+                        session: Box::new(overlay.get_selected_session()),
                     },
                     _ => OverlayCloseAction::Other,
                 });
@@ -293,7 +293,7 @@ impl App {
         if let Some(action) = close_action {
             match action {
                 OverlayCloseAction::Session { id, session } => {
-                    self.close_session_picker(tui, id, session)?;
+                    self.close_session_picker(tui, id, *session)?;
                 }
                 OverlayCloseAction::Other => self.close_transcript_overlay(tui),
             }

@@ -14,6 +14,8 @@ permissions:
 jobs:
   codespell:
     name: Check for spelling errors
+    # Skip in forks; only run in upstream repo
+    if: ${{ github.repository == 'openai/codex' }}
     runs-on: ubuntu-latest
 
     steps:

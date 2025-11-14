@@ -1247,7 +1247,7 @@ mod tests {
             .unwrap_or_else(|| panic!("{model_family} should be a valid model family"));
         let config = ToolsConfig::new(&ToolsConfigParams {
             model_family: &model_family,
-            features: features,
+            features,
             include_delegate_tool: false,
         });
         let (tools, _) = build_specs(&config, Some(HashMap::new())).build();

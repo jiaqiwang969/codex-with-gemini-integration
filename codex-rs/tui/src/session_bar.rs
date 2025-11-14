@@ -92,10 +92,10 @@ impl SessionBar {
                 self.loading = false;
 
                 // If current session is in history, select it by default
-                if let Some(cur) = self.current_session_id.as_ref() {
-                    if let Some(pos) = self.sessions.iter().position(|s| &s.id == cur) {
-                        self.selected_index = pos;
-                    }
+                if let Some(cur) = self.current_session_id.as_ref()
+                    && let Some(pos) = self.sessions.iter().position(|s| &s.id == cur)
+                {
+                    self.selected_index = pos;
                 }
 
                 // Keep selection in bounds
@@ -112,17 +112,15 @@ impl SessionBar {
                         .map(|id| *id == s.id)
                         .unwrap_or(false)
                         || !self.label_cache.contains_key(&s.path);
-                    if must_update {
-                        if let Some(snippet) = last_user_snippet(&s.path, 5) {
-                            // Unicode-safe truncation to keep bar compact
-                            let short = if snippet.chars().count() > 10 {
-                                let truncated: String = snippet.chars().take(10).collect();
-                                format!("{}…", truncated)
-                            } else {
-                                snippet
-                            };
-                            self.label_cache.insert(s.path.clone(), short);
-                        }
+                    if must_update && let Some(snippet) = last_user_snippet(&s.path, 5) {
+                        // Unicode-safe truncation to keep bar compact
+                        let short = if snippet.chars().count() > 10 {
+                            let truncated: String = snippet.chars().take(10).collect();
+                            format!("{truncated}…")
+                        } else {
+                            snippet
+                        };
+                        self.label_cache.insert(s.path.clone(), short);
                     }
                 }
             }
@@ -213,12 +211,12 @@ impl SessionBar {
 
     /// Reset selection when the bar gains focus: select current if present, else select "新建".
     pub fn reset_selection_for_focus(&mut self, current_session_id: Option<&str>) {
-        if let Some(id) = current_session_id {
-            if let Some(pos) = self.sessions.iter().position(|s| s.id == id) {
-                self.selected_index = pos;
-                self.selected_on_new = false;
-                return;
-            }
+        if let Some(id) = current_session_id
+            && let Some(pos) = self.sessions.iter().position(|s| s.id == id)
+        {
+            self.selected_index = pos;
+            self.selected_on_new = false;
+            return;
         }
         // Current not in history -> select New if visible
         self.selected_on_new = true;
@@ -343,7 +341,7 @@ impl SessionBar {
                     session.id.clone()
                 };
 
-                let is_current = current_session_id.map_or(false, |id| id == session.id);
+                let is_current = current_session_id.is_some_and(|id| id == session.id);
                 // Selection/current styling aligned with Codex conventions:
                 // - Focused + selected: cyan + bold
                 // - Current session (regardless of focus): green + bold
@@ -366,7 +364,7 @@ impl SessionBar {
                     if snippet.is_empty() {
                         session_id.clone()
                     } else {
-                        format!("{} · {}", snippet, session_id)
+                        format!("{snippet} · {session_id}")
                     }
                 } else {
                     session_id.clone()
@@ -388,7 +386,7 @@ impl SessionBar {
                         TumixState::Stalled => ("停滞", Color::Magenta),
                     };
                     left_spans.push(Span::styled(
-                        format!(" · {}", label),
+                        format!(" · {label}"),
                         Style::default().fg(color),
                     ));
                 }
@@ -407,12 +405,10 @@ impl SessionBar {
             // 优先使用别名，否则使用短ID
             let display_name = if let Some(alias) = self.alias_manager.get_alias(cur_id) {
                 alias
+            } else if cur_id.len() > 8 {
+                format!("{}…", &cur_id[..7])
             } else {
-                if cur_id.len() > 8 {
-                    format!("{}…", &cur_id[..7])
-                } else {
-                    cur_id.to_string()
-                }
+                cur_id.to_string()
             };
             let st = self
                 .current_session_status

@@ -69,16 +69,19 @@ impl SessionAliasManager {
     }
 
     /// 检查是否有别名
+    #[allow(dead_code)]
     pub fn has_alias(&self, session_id: &str) -> bool {
         self.aliases.contains_key(session_id)
     }
 
     /// 获取所有别名（用于调试或导出）
+    #[allow(dead_code)]
     pub fn all_aliases(&self) -> &HashMap<String, String> {
         &self.aliases
     }
 
     /// 清空所有别名（谨慎使用）
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.aliases.clear();
         let _ = self.save();

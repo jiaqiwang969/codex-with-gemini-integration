@@ -69,7 +69,8 @@ jobs:
     name: cargo shear
     runs-on: ubuntu-24.04
     needs: changed
-    if: ${{ needs.changed.outputs.codex == 'true' || needs.changed.outputs.workflows == 'true' || github.event_name == 'push' }}
+    # Skip on forks to avoid tool installation friction; still required upstream.
+    if: ${{ (needs.changed.outputs.codex == 'true' || needs.changed.outputs.workflows == 'true' || github.event_name == 'push') && github.repository == 'openai/codex' }}
     defaults:
       run:
         working-directory: codex-rs
@@ -478,7 +479,11 @@ jobs:
 
           # Otherwise require the jobs to have succeeded
           [[ '${{ needs.general.result }}' == 'success' ]] || { echo 'general failed'; exit 1; }
-          [[ '${{ needs.cargo_shear.result }}' == 'success' ]] || { echo 'cargo_shear failed'; exit 1; }
+          # Allow cargo_shear to be skipped (e.g., in forks)
+          if [[ '${{ needs.cargo_shear.result }}' != 'success' && '${{ needs.cargo_shear.result }}' != 'skipped' ]]; then
+            echo 'cargo_shear failed'
+            exit 1
+          fi
           [[ '${{ needs.lint_build.result }}' == 'success' ]] || { echo 'lint_build failed'; exit 1; }
           [[ '${{ needs.tests.result }}' == 'success' ]] || { echo 'tests failed'; exit 1; }
 

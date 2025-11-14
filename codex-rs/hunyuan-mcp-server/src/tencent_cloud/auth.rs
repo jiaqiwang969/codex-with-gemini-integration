@@ -43,14 +43,9 @@ impl TencentAuth {
 
         // Step 1: Build canonical request
         let hashed_payload = hex::encode(Sha256::digest(payload.as_bytes()));
+        // Canonical request per TC3 spec; note the blank line between canonical headers and signed headers.
         let canonical_request = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}",
-            method,
-            uri,
-            params,
-            format!("content-type:application/json\nhost:{}\n", host),
-            "content-type;host",
-            hashed_payload
+            "{method}\n{uri}\n{params}\ncontent-type:application/json\nhost:{host}\n\ncontent-type;host\n{hashed_payload}"
         );
 
         // Step 2: Build string to sign

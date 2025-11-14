@@ -42,16 +42,6 @@ fn convert_to_round_style(line: &str) -> String {
     result = result.replace('/', "╱"); // Replace forward slash with diagonal
     result = result.replace('-', "─"); // Replace dash with horizontal line
 
-    // Handle merge patterns
-    result = result.replace("│╲", "│╲");
-    result = result.replace("│╱", "│╱");
-    result = result.replace("╲│", "╲│");
-    result = result.replace("╱│", "╱│");
-
-    // Make some visual improvements
-    result = result.replace("  ●", "  ●"); // Keep bullet spacing
-    result = result.replace("● ", "● "); // Keep bullet spacing
-
     result
 }
 

@@ -305,6 +305,7 @@ pub async fn run_main(
     .map_err(|err| std::io::Error::other(err.to_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_ratatui_app(
     cli: Cli,
     initial_config: Config,

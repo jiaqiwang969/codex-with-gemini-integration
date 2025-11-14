@@ -271,6 +271,12 @@ pub fn create_client() -> CodexHttpClient {
     if is_sandboxed() {
         builder = builder.no_proxy();
     }
+    // Tests spin up local mock servers (127.0.0.1). Respecting system proxies breaks
+    // those connections on some developer machines/CI (e.g., HTTP_PROXY=127.0.0.1:7890).
+    // Disable proxies for tests to ensure hermetic local IO.
+    if cfg!(test) {
+        builder = builder.no_proxy();
+    }
 
     let inner = builder.build().unwrap_or_else(|_| reqwest::Client::new());
     CodexHttpClient::new(inner)

@@ -31,14 +31,14 @@ use arboard::Clipboard;
 
 pub const NEW_SESSION_SENTINEL: &str = "__cxresume_new_session__";
 const FULL_PREVIEW_WRAP_WIDTH: usize = 76;
-const THEME_GRAY: Color = Color::Rgb(0x80, 0x80, 0x80);
-const THEME_GREEN: Color = Color::Rgb(0x5a, 0xf7, 0x8e);
-const THEME_YELLOW: Color = Color::Rgb(0xf3, 0xf9, 0x9d);
-const THEME_ORANGE: Color = Color::Rgb(0xff, 0x95, 0x00);
-const THEME_PURPLE: Color = Color::Rgb(0xbf, 0x5a, 0xf2);
-const THEME_CYAN: Color = Color::Rgb(0x5f, 0xbe, 0xaa);
-const THEME_BLUE: Color = Color::Rgb(0x6a, 0xc8, 0xff);
-const THEME_PINK: Color = Color::Rgb(0xff, 0x6a, 0xc1);
+const THEME_GRAY: Color = Color::Gray;
+const THEME_GREEN: Color = Color::Green;
+const THEME_YELLOW: Color = Color::Cyan;
+const THEME_ORANGE: Color = Color::Magenta;
+const THEME_PURPLE: Color = Color::Magenta;
+const THEME_CYAN: Color = Color::Cyan;
+const THEME_BLUE: Color = Color::Blue;
+const THEME_PINK: Color = Color::Magenta;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TumixState {
@@ -1123,7 +1123,11 @@ fn extract_session_meta(
             .get("id")
             .and_then(|v| v.as_str())
             .map(std::string::ToString::to_string)
-            .unwrap_or_else(|| path.file_name().unwrap().to_string_lossy().to_string());
+            .unwrap_or_else(|| {
+                path.file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            });
 
         cwd = payload
             .get("cwd")
@@ -1154,7 +1158,10 @@ fn extract_session_meta(
     }
 
     if session_id.is_empty() {
-        session_id = path.file_name().unwrap().to_string_lossy().to_string();
+        session_id = path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
     }
 
     Ok((
@@ -1478,7 +1485,7 @@ fn extract_recent_messages(path: &PathBuf, limit: usize) -> Vec<(String, String)
 fn format_relative_time(mtime: u64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
         .as_secs();
 
     let diff = now.saturating_sub(mtime);
@@ -1742,7 +1749,7 @@ fn format_left_panel_sessions(
     let mut lines = Vec::new();
 
     if sessions.is_empty() {
-        lines.push("No sessions".yellow().into());
+        lines.push("No sessions".cyan().into());
         return lines;
     }
 
@@ -1768,12 +1775,13 @@ fn format_left_panel_sessions(
         let marker = if is_selected { "▶" } else { " " };
 
         // Line 1: marker, indicator, badge, ID, age
-        let mut line1_spans = Vec::new();
-        line1_spans.push(Span::from(" "));
-        line1_spans.push(Span::from(marker.to_string()));
-        line1_spans.push(Span::from(" "));
-        line1_spans.push(tumix_indicator_span(session, 0));
-        line1_spans.push(Span::from(" "));
+        let mut line1_spans = vec![
+            Span::from(" "),
+            Span::from(marker.to_string()),
+            Span::from(" "),
+            tumix_indicator_span(session, 0),
+            Span::from(" "),
+        ];
         if session.tumix.is_some() {
             line1_spans.push(tumix_badge_span());
             line1_spans.push(Span::from(" "));
@@ -1885,7 +1893,7 @@ fn tumix_state_text(state: TumixState) -> String {
     match state {
         TumixState::Completed => "completed".green().bold().to_string(),
         TumixState::Failed => "failed".red().bold().to_string(),
-        TumixState::Running => "running".yellow().bold().to_string(),
+        TumixState::Running => "running".cyan().bold().to_string(),
         TumixState::Stalled => "stalled".magenta().bold().to_string(),
     }
 }
@@ -1899,7 +1907,7 @@ fn format_left_panel_sessions_paginated(
     let mut lines = Vec::new();
 
     if sessions.is_empty() {
-        lines.push("No sessions".yellow().into());
+        lines.push("No sessions".cyan().into());
         return lines;
     }
 
@@ -1924,12 +1932,13 @@ fn format_left_panel_sessions_paginated(
         let is_selected = state.selected_idx == abs_idx;
         let marker = if is_selected { "▶" } else { " " };
 
-        let mut line1_spans = Vec::new();
-        line1_spans.push(Span::from(" "));
-        line1_spans.push(Span::from(marker.to_string()));
-        line1_spans.push(Span::from(" "));
-        line1_spans.push(tumix_indicator_span(session, state.animation_frame()));
-        line1_spans.push(Span::from(" "));
+        let mut line1_spans = vec![
+            Span::from(" "),
+            Span::from(marker.to_string()),
+            Span::from(" "),
+            tumix_indicator_span(session, state.animation_frame()),
+            Span::from(" "),
+        ];
         if session.tumix.is_some() {
             line1_spans.push(tumix_badge_span());
             line1_spans.push(Span::from(" "));
@@ -2025,7 +2034,7 @@ fn format_right_panel_preview(session: &SessionInfo, width: u16) -> Vec<Line<'st
         let sanitized = content.replace('\r', "");
 
         let wrapped_raw = crate::wrapping::word_wrap_lines(
-            &vec![Line::from(sanitized)],
+            vec![Line::from(sanitized)],
             crate::wrapping::RtOptions::new(content_width)
                 .initial_indent("  ".into())
                 .subsequent_indent("  ".into()),
@@ -2095,20 +2104,20 @@ fn format_session_details(session: &SessionInfo) -> Vec<Line<'static>> {
     // Model
     lines.push(ansi_escape_line(&format!(
         "  Model:          {}",
-        session.model.as_str().yellow()
+        session.model.as_str().cyan()
     )));
 
     // Messages
     lines.push(ansi_escape_line(&format!(
         "  Messages:       {} ({} last)",
-        session.message_count.to_string().yellow(),
+        session.message_count.to_string().cyan(),
         session.last_role.as_str().green()
     )));
 
     // Tokens
     lines.push(ansi_escape_line(&format!(
         "  Tokens Used:    {}",
-        session.total_tokens.to_string().yellow()
+        session.total_tokens.to_string().cyan()
     )));
 
     // Age
@@ -2182,7 +2191,7 @@ fn format_session_details(session: &SessionInfo) -> Vec<Line<'static>> {
             "N/A".to_string()
         }
         .as_str()
-        .yellow()
+        .cyan()
     )));
 
     lines.push(Line::from(""));
@@ -2242,7 +2251,7 @@ fn format_message_blocks(session: &SessionInfo, width: u16) -> Vec<Line<'static>
 
     let messages = extract_recent_messages_with_timestamps(&session.path, 8);
     if messages.is_empty() {
-        lines.push("No messages found in this session.".yellow().into());
+        lines.push("No messages found in this session.".cyan().into());
     } else {
         for (role, content, _timestamp) in messages.iter() {
             // Message header with bar indicator (┃)
@@ -2293,7 +2302,7 @@ fn format_session_preview(session: &SessionInfo) -> Vec<Line<'static>> {
     )));
     lines.push(ansi_escape_line(&format!(
         "Model: {}",
-        session.model.as_str().yellow()
+        session.model.as_str().cyan()
     )));
     lines.push(Line::from(""));
     lines
@@ -2316,7 +2325,7 @@ fn format_session_preview(session: &SessionInfo) -> Vec<Line<'static>> {
 
             let sanitized = content.replace('\r', "");
             let wrapped = crate::wrapping::word_wrap_lines(
-                &vec![Line::from(sanitized)],
+                vec![Line::from(sanitized)],
                 crate::wrapping::RtOptions::new(FULL_PREVIEW_WRAP_WIDTH)
                     .initial_indent("   ".into())
                     .subsequent_indent("   ".into()),
@@ -2354,7 +2363,7 @@ pub fn load_picker_state() -> Result<PickerState, String> {
 pub fn create_session_picker_overlay() -> Result<Overlay, String> {
     let state = load_picker_state()?;
     let picker_overlay = crate::pager_overlay::SessionPickerOverlay::from_state(state);
-    Ok(Overlay::SessionPicker(picker_overlay))
+    Ok(Overlay::SessionPicker(Box::new(picker_overlay)))
 }
 
 /// Render the picker view directly into the provided frame.
@@ -2405,7 +2414,7 @@ fn render_body(frame: &mut crate::custom_terminal::Frame, area: Rect, state: &Pi
     if state.sessions.is_empty() {
         let lines = vec![
             "No sessions found in current working directory"
-                .yellow()
+                .cyan()
                 .into(),
             Line::from(""),
             "Press q to close".dim().into(),
@@ -2492,7 +2501,7 @@ fn render_full_preview_body(
     let lines = state
         .selected_session()
         .map(format_session_preview)
-        .unwrap_or_else(|| vec!["No session selected".yellow().into()]);
+        .unwrap_or_else(|| vec!["No session selected".cyan().into()]);
     let offset = if state.focus == FocusPane::RightPreview {
         state.scroll_offset_right
     } else {

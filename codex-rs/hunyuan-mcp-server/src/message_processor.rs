@@ -187,8 +187,12 @@ impl MessageProcessor {
         };
 
         self.initialized = true;
-        self.sender
-            .send_response(id, serde_json::to_value(result).unwrap());
+        match serde_json::to_value(result) {
+            Ok(val) => self.sender.send_response(id, val),
+            Err(e) => self
+                .sender
+                .send_error(id, -32000, format!("Serialization error: {e}")),
+        }
         info!("Initialized Hunyuan MCP server");
     }
 
@@ -205,8 +209,12 @@ impl MessageProcessor {
             next_cursor: None,
         };
 
-        self.sender
-            .send_response(id, serde_json::to_value(result).unwrap());
+        match serde_json::to_value(result) {
+            Ok(val) => self.sender.send_response(id, val),
+            Err(e) => self
+                .sender
+                .send_error(id, -32000, format!("Serialization error: {e}")),
+        }
     }
 
     async fn handle_tool_call(&mut self, id: serde_json::Value, params: serde_json::Value) {
@@ -236,35 +244,52 @@ impl MessageProcessor {
                 is_error: Some(true),
                 structured_content: None,
             };
-            self.sender
-                .send_response(id, serde_json::to_value(result).unwrap());
+            match serde_json::to_value(result) {
+                Ok(val) => self.sender.send_response(id, val),
+                Err(e) => self
+                    .sender
+                    .send_error(id, -32000, format!("Serialization error: {e}")),
+            }
             return;
         }
 
         // Handle tool call
-        match handle_tool_call(
-            request,
-            self.secret_id.clone().unwrap(),
-            self.secret_key.clone().unwrap(),
-        )
-        .await
-        {
-            Ok(result) => {
-                self.sender
-                    .send_response(id, serde_json::to_value(result).unwrap());
+        match (self.secret_id.clone(), self.secret_key.clone()) {
+            (Some(secret_id), Some(secret_key)) => {
+                match handle_tool_call(request, secret_id, secret_key).await {
+                    Ok(result) => match serde_json::to_value(result) {
+                        Ok(val) => self.sender.send_response(id, val),
+                        Err(e) => {
+                            self.sender
+                                .send_error(id, -32000, format!("Serialization error: {e}"))
+                        }
+                    },
+                    Err(e) => {
+                        let result = CallToolResult {
+                            content: vec![ContentBlock::TextContent(TextContent {
+                                r#type: "text".to_string(),
+                                text: format!("Error: {e}"),
+                                annotations: None,
+                            })],
+                            is_error: Some(true),
+                            structured_content: None,
+                        };
+                        match serde_json::to_value(result) {
+                            Ok(val) => self.sender.send_response(id, val),
+                            Err(e) => self.sender.send_error(
+                                id,
+                                -32000,
+                                format!("Serialization error: {e}"),
+                            ),
+                        }
+                    }
+                }
             }
-            Err(e) => {
-                let result = CallToolResult {
-                    content: vec![ContentBlock::TextContent(TextContent {
-                        r#type: "text".to_string(),
-                        text: format!("Error: {e}"),
-                        annotations: None,
-                    })],
-                    is_error: Some(true),
-                    structured_content: None,
-                };
+            _ => {
+                // Should not reach here because we early-return on missing credentials,
+                // but handle defensively.
                 self.sender
-                    .send_response(id, serde_json::to_value(result).unwrap());
+                    .send_error(id, -32002, "Server credentials missing".to_string());
             }
         }
     }

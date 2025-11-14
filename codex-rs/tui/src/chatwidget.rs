@@ -382,8 +382,8 @@ impl ChatWidget {
     fn on_session_configured(&mut self, event: codex_core::protocol::SessionConfiguredEvent) {
         self.bottom_pane
             .set_history_metadata(event.history_log_id, event.history_entry_count);
-        let session_id = event.session_id.clone();
-        self.conversation_id = Some(session_id.clone());
+        let session_id = event.session_id;
+        self.conversation_id = Some(session_id);
         self.current_rollout_path = Some(event.rollout_path.clone());
         let initial_messages = event.initial_messages.clone();
         let model_for_header = event.model.clone();
@@ -409,7 +409,7 @@ impl ChatWidget {
             let app_tx = self.app_event_tx.clone();
             let sid = session_id.to_string();
             self.bottom_pane.show_session_alias_input(
-                sid.clone(),
+                sid,
                 Box::new(move |session_id, alias| {
                     app_tx.send(AppEvent::SaveSessionAlias { session_id, alias });
                 }),
@@ -2913,9 +2913,9 @@ impl ChatWidget {
         let session_short = session_id.chars().take(8).collect::<String>();
         let run_id = format!("tumix-{}", Uuid::new_v4());
         let display_prompt = if prompt_text.is_empty() {
-            format!("会话：{}", session_short)
+            format!("会话：{session_short}")
         } else {
-            format!("会话：{} · 任务：{}", session_short, prompt_text)
+            format!("会话：{session_short} · 任务：{prompt_text}")
         };
 
         self.app_event_tx.send(AppEvent::TumixRunRequested {
@@ -3255,7 +3255,7 @@ impl ChatWidget {
             .active_cell
             .as_ref()
             .and_then(|c| c.as_any().downcast_ref::<ExecCell>())
-            .map(|c| c.is_active())
+            .map(crate::exec_cell::ExecCell::is_active)
             .unwrap_or(false);
         if exec_active || !self.running_commands.is_empty() {
             return "运行中".to_string();

@@ -887,8 +887,14 @@ impl Config {
         mut mcp_servers: HashMap<String, McpServerConfig>,
         _codex_home: &Path,
     ) -> HashMap<String, McpServerConfig> {
+        // Only add built-in servers when explicitly enabled. This keeps CLI tests stable
+        // and avoids surprising defaults in environments with credentials pre-set.
+        let enable_builtin = std::env::var("CODEX_ENABLE_HUNYUAN_MCP")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
         // Check if hunyuan-3d is already configured
-        if !mcp_servers.contains_key("hunyuan-3d") {
+        if enable_builtin && !mcp_servers.contains_key("hunyuan-3d") {
             // Check for API keys in environment
             let has_credentials = std::env::var("TENCENTCLOUD_SECRET_ID").is_ok()
                 && std::env::var("TENCENTCLOUD_SECRET_KEY").is_ok();

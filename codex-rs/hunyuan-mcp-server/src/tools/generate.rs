@@ -78,7 +78,7 @@ pub async fn handle_generate(
         return Ok(CallToolResult {
             content: vec![ContentBlock::TextContent(TextContent {
                 r#type: "text".to_string(),
-                text: error_text.clone(),
+                text: error_text,
                 annotations: None,
             })],
             is_error: Some(true),
@@ -94,7 +94,7 @@ pub async fn handle_generate(
         return Ok(CallToolResult {
             content: vec![ContentBlock::TextContent(TextContent {
                 r#type: "text".to_string(),
-                text: error_text.clone(),
+                text: error_text,
                 annotations: None,
             })],
             is_error: Some(true),
@@ -270,7 +270,7 @@ pub async fn handle_generate(
     if has_text {
         response_text.push_str(&format!(
             "**Prompt**: {}\n",
-            params.prompt.as_ref().unwrap()
+            params.prompt.as_deref().unwrap_or("")
         ));
     }
     if has_image {

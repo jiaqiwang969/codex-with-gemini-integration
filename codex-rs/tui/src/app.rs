@@ -504,9 +504,9 @@ impl App {
         }
 
         let overlay = if let Some(state) = self.cxresume_cache.clone() {
-            Ok(Overlay::SessionPicker(
+            Ok(Overlay::SessionPicker(Box::new(
                 crate::pager_overlay::SessionPickerOverlay::from_state(state),
-            ))
+            )))
         } else {
             crate::cxresume_picker_widget::create_session_picker_overlay()
         };
@@ -582,7 +582,7 @@ impl App {
                         self.chat_widget.conversation_id().map(|id| id.to_string());
                     self.session_bar
                         .set_current_session(current_conv_id.clone());
-                    if let Some(id) = current_conv_id.clone() {
+                    if let Some(id) = current_conv_id {
                         let st = self.chat_widget.sidebar_status();
                         self.session_bar.set_session_status(id, st);
                     }
@@ -638,10 +638,10 @@ impl App {
                         }
 
                         // Set cursor position based on focus
-                        if self.panel_focus == PanelFocus::Chat {
-                            if let Some((x, y)) = self.chat_widget.cursor_pos(main_area) {
-                                frame.set_cursor_position((x, y));
-                            }
+                        if self.panel_focus == PanelFocus::Chat
+                            && let Some((x, y)) = self.chat_widget.cursor_pos(main_area)
+                        {
+                            frame.set_cursor_position((x, y));
                         }
                     })?;
                 }
@@ -1369,10 +1369,12 @@ impl App {
         user_prompt: Option<String>,
         display_prompt: String,
     ) -> Result<()> {
-        let agent_id = AgentId::parse("tumix").expect("static Tumix agent id is valid");
+        let agent_id = AgentId::parse("tumix")
+            .map_err(|e| color_eyre::eyre::eyre!("failed to parse agent id: {e}"))?;
+        let agent_id_for_task = agent_id.clone();
         self.handle_delegate_update(DelegateEvent::Started {
             run_id: run_id.clone(),
-            agent_id: agent_id.clone(),
+            agent_id,
             prompt: display_prompt,
             started_at: SystemTime::now(),
             parent_run_id: None,
@@ -1381,14 +1383,13 @@ impl App {
 
         let tx = self.app_event_tx.clone();
         tokio::spawn(async move {
-            let agent_id =
-                AgentId::parse("tumix").expect("static Tumix agent id is valid inside task");
+            let agent_id = agent_id_for_task;
             let start_time = Instant::now();
             let progress_tx = tx.clone();
             let progress_run_id = run_id.clone();
             let progress_agent_id = agent_id.clone();
             let progress_cb: codex_tumix::ProgressCallback = Box::new(move |msg: String| {
-                let _ = progress_tx.send(AppEvent::DelegateUpdate(DelegateEvent::Delta {
+                progress_tx.send(AppEvent::DelegateUpdate(DelegateEvent::Delta {
                     run_id: progress_run_id.clone(),
                     agent_id: progress_agent_id.clone(),
                     chunk: msg,
@@ -1401,7 +1402,7 @@ impl App {
                 Ok(round_result) => {
                     let duration = start_time.elapsed();
                     let summary = format_tumix_summary(&round_result);
-                    let _ = tx.send(AppEvent::DelegateUpdate(DelegateEvent::Completed {
+                    tx.send(AppEvent::DelegateUpdate(DelegateEvent::Completed {
                         run_id,
                         agent_id,
                         output: Some(summary),
@@ -1410,7 +1411,7 @@ impl App {
                     }));
                 }
                 Err(err) => {
-                    let _ = tx.send(AppEvent::DelegateUpdate(DelegateEvent::Failed {
+                    tx.send(AppEvent::DelegateUpdate(DelegateEvent::Failed {
                         run_id,
                         agent_id,
                         error: format!("TUMIX失败：{err}"),
@@ -1541,11 +1542,11 @@ impl App {
                 }
             }
             KeyEvent {
-                code: KeyCode::Char(c),
+                code: KeyCode::Char('x' | 'q'),
                 modifiers: crossterm::event::KeyModifiers::CONTROL,
                 kind: KeyEventKind::Press,
                 ..
-            } if matches!(c, 'x' | 'q') => {
+            } => {
                 self.open_or_refresh_session_picker(tui);
             }
             // Esc primes/advances backtracking only in normal (not working) mode
@@ -1639,45 +1640,45 @@ impl App {
                             }
                             KeyCode::Char('r') => {
                                 // Rename selected session (edit alias) - only works on existing sessions
-                                if !self.session_bar.selected_is_new() {
-                                    if let Some(session) = self.session_bar.selected_session() {
-                                        let session_id = session.id.clone();
-                                        let app_tx = self.app_event_tx.clone();
+                                if !self.session_bar.selected_is_new()
+                                    && let Some(session) = self.session_bar.selected_session()
+                                {
+                                    let session_id = session.id.clone();
+                                    let app_tx = self.app_event_tx.clone();
 
-                                        // Show alias input for renaming
-                                        self.chat_widget.show_session_alias_input_for_rename(
-                                            session_id.clone(),
-                                            Box::new(move |sid, alias| {
-                                                app_tx.send(AppEvent::SaveSessionAlias {
-                                                    session_id: sid,
-                                                    alias,
-                                                });
-                                            }),
-                                        );
+                                    // Show alias input for renaming
+                                    self.chat_widget.show_session_alias_input_for_rename(
+                                        session_id,
+                                        Box::new(move |sid, alias| {
+                                            app_tx.send(AppEvent::SaveSessionAlias {
+                                                session_id: sid,
+                                                alias,
+                                            });
+                                        }),
+                                    );
 
-                                        // Transfer focus to ChatWidget so the rename dialog can receive input
-                                        self.panel_focus = PanelFocus::Chat;
-                                        self.session_bar.set_focus(false);
-                                        tui.frame_requester().schedule_frame();
-                                    }
+                                    // Transfer focus to ChatWidget so the rename dialog can receive input
+                                    self.panel_focus = PanelFocus::Chat;
+                                    self.session_bar.set_focus(false);
+                                    tui.frame_requester().schedule_frame();
                                 }
                             }
                             KeyCode::Char('x') => {
                                 // Delete selected history session rollout file (no confirmation)
-                                if !self.session_bar.selected_is_new() {
-                                    if let Some(session) = self.session_bar.selected_session() {
-                                        // Clone values before mutable borrow
-                                        let session_path = session.path.clone();
-                                        let session_id = session.id.clone();
+                                if !self.session_bar.selected_is_new()
+                                    && let Some(session) = self.session_bar.selected_session()
+                                {
+                                    // Clone values before mutable borrow
+                                    let session_path = session.path.clone();
+                                    let session_id = session.id.clone();
 
-                                        // Remove the session file
-                                        let _ = std::fs::remove_file(&session_path);
-                                        // Remove the associated alias
-                                        self.session_bar.remove_session_alias(&session_id);
-                                        // Do NOT switch conversation; just refresh list
-                                        self.session_bar.refresh_sessions();
-                                        tui.frame_requester().schedule_frame();
-                                    }
+                                    // Remove the session file
+                                    let _ = std::fs::remove_file(&session_path);
+                                    // Remove the associated alias
+                                    self.session_bar.remove_session_alias(&session_id);
+                                    // Do NOT switch conversation; just refresh list
+                                    self.session_bar.refresh_sessions();
+                                    tui.frame_requester().schedule_frame();
                                 }
                             }
                             // Exit sessions focus; Tab no longer toggles to avoid conflicts

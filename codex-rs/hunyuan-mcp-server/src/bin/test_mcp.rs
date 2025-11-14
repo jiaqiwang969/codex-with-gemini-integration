@@ -20,10 +20,10 @@ fn main() -> Result<()> {
         std::env::set_var("RUST_LOG", "info");
     }
 
-    let secret_id =
-        std::env::var("TENCENTCLOUD_SECRET_ID").expect("Please set TENCENTCLOUD_SECRET_ID");
-    let secret_key =
-        std::env::var("TENCENTCLOUD_SECRET_KEY").expect("Please set TENCENTCLOUD_SECRET_KEY");
+    let secret_id = std::env::var("TENCENTCLOUD_SECRET_ID")
+        .map_err(|_| anyhow::anyhow!("Please set TENCENTCLOUD_SECRET_ID"))?;
+    let secret_key = std::env::var("TENCENTCLOUD_SECRET_KEY")
+        .map_err(|_| anyhow::anyhow!("Please set TENCENTCLOUD_SECRET_KEY"))?;
 
     println!("✅ Credentials loaded: {}...", &secret_id[..10]);
 
@@ -38,39 +38,48 @@ fn main() -> Result<()> {
         .stderr(Stdio::piped())
         .spawn()?;
 
-    let mut stdin = server.stdin.take().expect("Failed to get stdin");
-    let stdout = server.stdout.take().expect("Failed to get stdout");
-    let stderr = server.stderr.take().expect("Failed to get stderr");
+    let mut stdin = server
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get stdin"))?;
+    let stdout = server
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get stdout"))?;
+    let stderr = server
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get stderr"))?;
 
     // 启动输出读取线程
     let running = Arc::new(AtomicBool::new(true));
-    let running_clone = running.clone();
 
-    let stdout_thread = thread::spawn(move || {
+    let _stdout_thread = thread::spawn(move || {
         let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                println!("📤 Server: {line}");
+        for line in reader.lines().map_while(Result::ok) {
+            println!("📤 Server: {line}");
 
-                // 解析 JSON 响应
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
-                    if let Some(result) = json.get("result") {
-                        println!(
-                            "✅ Result: {}",
-                            serde_json::to_string_pretty(result).unwrap()
-                        );
+            // 解析 JSON 响应
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                if let Some(result) = json.get("result") {
+                    match serde_json::to_string_pretty(result) {
+                        Ok(s) => println!("✅ Result: {s}"),
+                        Err(e) => println!("✅ Result (unformatted): {result:?} (fmt err: {e})"),
                     }
-                    if let Some(error) = json.get("error") {
-                        println!("❌ Error: {}", serde_json::to_string_pretty(error).unwrap());
+                }
+                if let Some(error) = json.get("error") {
+                    match serde_json::to_string_pretty(error) {
+                        Ok(s) => println!("❌ Error: {s}"),
+                        Err(e) => println!("❌ Error (unformatted): {error:?} (fmt err: {e})"),
                     }
                 }
             }
         }
     });
 
-    let stderr_thread = thread::spawn(move || {
+    let _stderr_thread = thread::spawn(move || {
         let reader = BufReader::new(stderr);
-        for line in reader.lines().flatten() {
+        for line in reader.lines().map_while(Result::ok) {
             if line.contains("ERROR") || line.contains("WARN") {
                 eprintln!("⚠️  {line}");
             } else if line.contains("INFO") {

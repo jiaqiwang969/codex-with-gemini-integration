@@ -211,7 +211,7 @@ impl Renderable for SessionAliasInput {
         let mut lines = vec![
             Line::from(""),
             Line::from(vec![
-                Span::from("✨ ").yellow(),
+                Span::from("✨ ").magenta(),
                 Span::from(title_text).cyan().bold(),
             ]),
             Line::from(""),
@@ -251,7 +251,7 @@ impl Renderable for SessionAliasInput {
             Span::from("  按 ").dim(),
             Span::from("Enter").green().bold(),
             Span::from(" 确认 · ").dim(),
-            Span::from("Esc").yellow(),
+            Span::from("Esc").cyan(),
             Span::from(" 跳过").dim(),
         ]));
 

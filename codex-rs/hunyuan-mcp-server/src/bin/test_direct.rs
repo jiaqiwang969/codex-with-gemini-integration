@@ -66,8 +66,10 @@ async fn test_api_directly() -> Result<()> {
 
     let client = TencentCloudClient::new(secret_id, secret_key)?;
 
-    let mut request = Generate3DRequest::default();
-    request.prompt = Some("一个简单的立方体".to_string());
+    let request = Generate3DRequest {
+        prompt: Some("一个简单的立方体".to_string()),
+        ..Default::default()
+    };
 
     println!("Submitting job with Professional API...");
     match client.submit_job(request.clone(), ApiVersion::Pro).await {

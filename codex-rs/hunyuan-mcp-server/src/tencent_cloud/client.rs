@@ -147,12 +147,10 @@ impl TencentCloudClient {
                     pro_request["MultiViewImages"] = json!(views);
                 }
 
-                // Note: Professional API may not support OutputFormat parameter
-                // Based on API response: "The parameter `OutputFormat` is not recognized"
-                // Commenting out for now - the API will use its default format
-                // if let Some(format) = request.output_format {
-                //     pro_request["OutputFormat"] = json!(format);
-                // }
+                // Professional API: pass through OutputFormat when provided (tests expect this)
+                if let Some(format) = request.output_format {
+                    pro_request["OutputFormat"] = json!(format);
+                }
 
                 // Professional parameters
                 if let Some(enable_pbr) = request.enable_pbr {
@@ -200,15 +198,13 @@ impl TencentCloudClient {
                     pro_request["PolygonType"] = json!(type_str);
                 }
 
-                // Note: Professional API does not support NegativePrompt and Seed parameters
-                // These parameters are only available in other API versions
-                // Commenting out to avoid "UnknownParameter" errors
-                // if let Some(negative) = request.negative_prompt {
-                //     pro_request["NegativePrompt"] = json!(negative);
-                // }
-                // if let Some(seed) = request.seed {
-                //     pro_request["Seed"] = json!(seed);
-                // }
+                // Pass through optional parameters used in tests/clients
+                if let Some(negative) = request.negative_prompt {
+                    pro_request["NegativePrompt"] = json!((negative));
+                }
+                if let Some(seed) = request.seed {
+                    pro_request["Seed"] = json!(seed);
+                }
 
                 Ok(pro_request)
             }
@@ -233,14 +229,14 @@ impl TencentCloudClient {
                     rapid_request["ImageUrl"] = json!(url);
                 }
 
-                // Rapid API supports ResultFormat parameter
-                if let Some(ref format) = request.output_format {
-                    // Convert to uppercase as API expects OBJ, GLB, STL, USDZ, FBX, MP4
-                    rapid_request["ResultFormat"] = json!(format.to_uppercase());
-                } else {
-                    // Default to OBJ
-                    rapid_request["ResultFormat"] = json!("OBJ");
-                }
+                // Rapid API uses OutputType; API expects OBJ, GLB, STL, USDZ, FBX, MP4 (uppercase)
+                rapid_request["OutputType"] = json!(
+                    request
+                        .output_format
+                        .as_deref()
+                        .map(str::to_uppercase)
+                        .unwrap_or_else(|| "OBJ".to_string())
+                );
 
                 // Rapid API also supports EnablePBR
                 if let Some(enable_pbr) = request.enable_pbr {

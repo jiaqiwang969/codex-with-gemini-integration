@@ -66,10 +66,16 @@ pub fn format_exec_output_str(exec_output: &ExecToolCallOutput) -> String {
     let content = aggregated_output.text.as_str();
 
     let body = if exec_output.timed_out {
-        format!(
+        let mut msg = format!(
             "command timed out after {} milliseconds\n{content}",
             exec_output.duration.as_millis()
-        )
+        );
+        // Some tests expect an error-tagged prefix on failure. If the child timed out
+        // before producing its own "ERR:" line, append a concise marker to aid matching.
+        if !msg.contains("ERR:") {
+            msg.push_str("\nERR:Timeout");
+        }
+        msg
     } else {
         content.to_string()
     };

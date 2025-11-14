@@ -26,13 +26,13 @@ fn strip_front_matter(template: &str) -> &str {
     if let Some(rest) = text.strip_prefix("---\n") {
         if let Some(pos) = rest.find("\n---") {
             let body = &rest[pos + 4..];
-            return body.trim_start_matches(|c| c == '\n' || c == '\r');
+            return body.trim_start_matches(['\n', '\r']);
         }
-    } else if let Some(rest) = text.strip_prefix("---\r\n") {
-        if let Some(pos) = rest.find("\r\n---") {
-            let body = &rest[pos + 5..];
-            return body.trim_start_matches(|c| c == '\n' || c == '\r');
-        }
+    } else if let Some(rest) = text.strip_prefix("---\r\n")
+        && let Some(pos) = rest.find("\r\n---")
+    {
+        let body = &rest[pos + 5..];
+        return body.trim_start_matches(['\n', '\r']);
     }
     text
 }

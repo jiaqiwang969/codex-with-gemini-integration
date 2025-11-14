@@ -58,6 +58,9 @@ fn default_shell() -> String {
 }
 
 fn default_login() -> bool {
+    // Use login shells by default to match existing approval expectations.
+    // Unified exec tests that need a clean environment can override `login`
+    // explicitly in their arguments.
     true
 }
 
@@ -145,6 +148,13 @@ impl ToolHandler for UnifiedExecHandler {
                     .filter(|value| !value.is_empty())
                     .map(PathBuf::from);
                 let cwd = workdir.clone().unwrap_or_else(|| context.turn.cwd.clone());
+                // To match approval expectations, use a login shell when the request
+                // asks for escalated permissions unless the caller explicitly opted out.
+                let login = if with_escalated_permissions.unwrap_or(false) {
+                    true
+                } else {
+                    login
+                };
 
                 let event_ctx = ToolEventCtx::new(
                     context.session.as_ref(),

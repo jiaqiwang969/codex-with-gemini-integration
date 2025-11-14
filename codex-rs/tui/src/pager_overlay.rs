@@ -28,7 +28,7 @@ use ratatui::widgets::WidgetRef;
 pub(crate) enum Overlay {
     Transcript(TranscriptOverlay),
     Static(StaticOverlay),
-    SessionPicker(SessionPickerOverlay),
+    SessionPicker(Box<SessionPickerOverlay>),
 }
 
 /// Session picker overlay integrating PickerState for interactive navigation
@@ -791,7 +791,7 @@ impl PagerView {
                     }
                     WrapMode::NoWrap => {
                         // Do not wrap; use the line as-is (owned). Horizontal clipping is applied at render time.
-                        push_owned_lines(&[line.clone()], &mut wrapped);
+                        push_owned_lines(std::slice::from_ref(line), &mut wrapped);
                         let p = Self::plain_text(line);
                         wrapped_plain.push(p.clone());
                         commit_cols.push(Self::scan_commit_cols(&p));
@@ -1466,7 +1466,7 @@ impl PagerView {
                         out_spans.push(Span::from(buf.clone()).set_style(s.style));
                         buf.clear();
                     }
-                    out_spans.push(Span::from("◉").white());
+                    out_spans.push(Span::from("◉").bold());
                 } else {
                     buf.push(ch);
                 }
@@ -1626,6 +1626,7 @@ impl TranscriptOverlay {
     }
 }
 
+#[allow(clippy::type_complexity)]
 pub(crate) struct StaticOverlay {
     view: PagerView,
     is_done: bool,

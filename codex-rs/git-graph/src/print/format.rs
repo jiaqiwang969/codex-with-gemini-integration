@@ -549,7 +549,7 @@ pub fn format_relative_time(time: Time) -> String {
                 .timestamp_opt(time.seconds(), 0)
                 .single()
         })
-        .unwrap_or_else(|| Local::now());
+        .unwrap_or_else(Local::now);
     let now = Local::now();
     let duration = now.signed_duration_since(commit_time);
 
