@@ -1,22 +1,7 @@
 <p align="center"><code>npm i -g @jiaqiwang969/codex</code><br />(Fork 版本)</p>
 <p align="center">或安装上游版本：<code>npm i -g @openai/codex</code> / <code>brew install --cask codex</code></p>
 
-### 一键安装（非 npm 方式，仅 macOS Apple Silicon/arm64）
-
-目前仅提供 macOS Apple Silicon (arm64) 的预编译安装脚本，后续将补充其它平台。
-
-- macOS（Apple Silicon / arm64）
-  - 安装最新发布：
-    ```
-    bash -c "$(curl -fsSL https://raw.githubusercontent.com/jiaqiwang969/codex/main/scripts/install-codex.sh)"
-    ```
-  - 指定版本（对应 Release 标签，例如 `fork-v0.58.0-alpha.9-jw.1`）：
-    ```
-    VERSION=fork-v0.58.0-alpha.9-jw.1 bash -c "$(curl -fsSL https://raw.githubusercontent.com/jiaqiwang969/codex/main/scripts/install-codex.sh)"
-    ```
-
-> 安装脚本会自动识别当前平台并从 GitHub Releases 下载对应打包资产（包含 `codex`、`hunyuan-mcp-server`、`rg`），默认安装在 `~/.codex/bin`，必要时提示你将其加入 `PATH`。
-
+<!-- 已移除“非 npm 一键安装”脚本，后续如需再讨论开启 -->
 
 <p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
 </br>

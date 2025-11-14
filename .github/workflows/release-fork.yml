@@ -22,9 +22,6 @@ on:
         required: false
         default: false
         type: boolean
-  push:
-    tags:
-      - "fork-v*"
 
 jobs:
   build:
@@ -38,11 +35,6 @@ jobs:
             exe_suffix: ""
             rg_url: https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-x86_64-unknown-linux-musl.tar.gz
             rg_path: ripgrep-14.1.1-x86_64-unknown-linux-musl/rg
-          - os: ubuntu-24.04-arm
-            triple: aarch64-unknown-linux-musl
-            exe_suffix: ""
-            rg_url: https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-aarch64-unknown-linux-musl.tar.gz
-            rg_path: ripgrep-14.1.1-aarch64-unknown-linux-musl/rg
           - os: macos-13
             triple: x86_64-apple-darwin
             exe_suffix: ""
@@ -58,11 +50,6 @@ jobs:
             exe_suffix: ".exe"
             rg_url: https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-x86_64-pc-windows-msvc.zip
             rg_path: ripgrep-14.1.1-x86_64-pc-windows-msvc/rg.exe
-          - os: windows-11-arm
-            triple: aarch64-pc-windows-msvc
-            exe_suffix: ".exe"
-            rg_url: https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-aarch64-pc-windows-msvc.zip
-            rg_path: ripgrep-14.1.1-aarch64-pc-windows-msvc/rg.exe
     runs-on: ${{ matrix.os }}
     env:
       CARGO_TERM_COLOR: always
@@ -115,31 +102,12 @@ jobs:
           Invoke-WebRequest "${{ matrix.rg_url }}" -OutFile $zip
           Expand-Archive -Path $zip -DestinationPath $tmp -Force
           Copy-Item -Path (Join-Path $tmp "${{ matrix.rg_path }}") -Destination "codex-cli/vendor/${{ matrix.triple }}/path/rg.exe" -Force
-      
-      - name: Pack platform bundle
-        shell: bash
-        run: |
-          set -euo pipefail
-          BDIR="codex-cli/dist/bundles"
-          mkdir -p "$BDIR"
-          STAGE="$(mktemp -d)"
-          # 提取最小运行所需文件到打包根：codex / hunyuan-mcp-server / rg
-          cp -f "codex-cli/vendor/${{ matrix.triple }}/codex/"* "$STAGE/" || true
-          cp -f "codex-cli/vendor/${{ matrix.triple }}/path/"* "$STAGE/" || true
-          tar -C "$STAGE" -czf "$BDIR/codex-bundle-${{ matrix.triple }}.tar.gz" .
-          echo "Packed $BDIR/codex-bundle-${{ matrix.triple }}.tar.gz"
 
       - name: Upload vendor artifact
         uses: actions/upload-artifact@v4
         with:
           name: vendor-${{ matrix.triple }}
           path: codex-cli/vendor/${{ matrix.triple }}
-      
-      - name: Upload bundle artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: bundle-${{ matrix.triple }}
-          path: codex-cli/dist/bundles/codex-bundle-${{ matrix.triple }}.tar.gz
 
   package:
     name: Package npm
@@ -166,20 +134,13 @@ jobs:
           path: codex-cli/vendor
           pattern: vendor-*
           merge-multiple: true
-      
-      - name: Download bundle artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist/bundles
-          pattern: bundle-*
-          merge-multiple: true
 
       - name: Build npm package
         shell: bash
         run: |
           python3 codex-cli/scripts/build_npm_package.py \
             --package codex \
-            --version "${{ inputs.version || github.ref_name }}" \
+            --version "${{ inputs.version }}" \
             --vendor-src codex-cli/vendor \
             --staging-dir ./dist/codex-npm \
             --pack-output ./dist/codex.tgz
@@ -208,15 +169,3 @@ jobs:
           prerelease: ${{ contains(inputs.version, '-') }}
           files: |
             dist/codex.tgz
-            dist/bundles/*.tar.gz
-      - name: Create GitHub release (push tag)
-        if: github.event_name == 'push'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: "Fork Release ${{ github.ref_name }}"
-          draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          files: |
-            dist/codex.tgz
-            dist/bundles/*.tar.gz
