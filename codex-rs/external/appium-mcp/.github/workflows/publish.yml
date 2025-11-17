@@ -1,0 +1,36 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write # to enable use of OIDC for trusted publishing and npm provenance
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          submodules: recursive
+      - name: Setup submodules sparse-checkout
+        run: |
+          chmod +x scripts/setup-submodules-sparse.sh
+          ./scripts/setup-submodules-sparse.sh
+      - uses: actions/setup-node@v3
+        with:
+          node-version: lts/*
+          check-latest: true
+      - run: npm install --no-package-lock --force
+        name: Install dependencies
+      - run: npm run build
+        name: Build
+      - run: npx semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        name: Release
