@@ -41,6 +41,8 @@ use crate::client_common::ResponseStream;
 use crate::client_common::ResponsesApiRequest;
 use crate::client_common::create_reasoning_param_for_request;
 use crate::client_common::create_text_param_for_request;
+use crate::client_common::tools::ResponsesApiTool;
+use crate::client_common::tools::ToolSpec;
 use crate::config::Config;
 use crate::default_client::CodexHttpClient;
 use crate::default_client::create_client;
@@ -211,9 +213,12 @@ impl ModelClient {
             parts: vec![GeminiPartRequest { text: instructions }],
         });
 
+        let tools = build_gemini_tools(&prompt.tools);
+
         let request = GeminiRequest {
             system_instruction,
             contents: std::mem::take(&mut contents),
+            tools,
         };
 
         // Build request with Gemini-specific auth handling
@@ -752,7 +757,15 @@ fn candidate_to_response_item(candidate: GeminiCandidate) -> Option<ResponseItem
     let content = candidate.content?;
     let parts = content.parts.unwrap_or_default();
     let mut response_parts = Vec::new();
+    let mut function_call: Option<GeminiFunctionCall> = None;
+
     for part in parts {
+        if function_call.is_none() {
+            if let Some(call) = part.function_call {
+                function_call = Some(call);
+            }
+        }
+
         if let Some(text) = part.text {
             if text.trim().is_empty() {
                 continue;
@@ -760,6 +773,22 @@ fn candidate_to_response_item(candidate: GeminiCandidate) -> Option<ResponseItem
             response_parts.push(ContentItem::OutputText { text });
         }
     }
+
+    if let Some(call) = function_call {
+        let args = if call.args.is_null() {
+            "{}".to_string()
+        } else {
+            call.args.to_string()
+        };
+
+        return Some(ResponseItem::FunctionCall {
+            id: None,
+            name: call.name,
+            arguments: args,
+            call_id: "gemini-function-call".to_string(),
+        });
+    }
+
     if response_parts.is_empty() {
         None
     } else {
@@ -774,15 +803,28 @@ fn candidate_to_response_item(candidate: GeminiCandidate) -> Option<ResponseItem
 fn build_gemini_contents(items: &[ResponseItem]) -> Vec<GeminiContentRequest> {
     let mut contents = Vec::new();
     for item in items {
-        if let ResponseItem::Message { role, content, .. } = item {
-            let parts = content_to_gemini_parts(content);
-            if parts.is_empty() {
-                continue;
+        match item {
+            ResponseItem::Message { role, content, .. } => {
+                let parts = content_to_gemini_parts(content);
+                if parts.is_empty() {
+                    continue;
+                }
+                contents.push(GeminiContentRequest {
+                    role: Some(map_gemini_role(role)),
+                    parts,
+                });
             }
-            contents.push(GeminiContentRequest {
-                role: Some(map_gemini_role(role)),
-                parts,
-            });
+            ResponseItem::FunctionCallOutput { output, .. } => {
+                let text = output.content.clone();
+                if text.trim().is_empty() {
+                    continue;
+                }
+                contents.push(GeminiContentRequest {
+                    role: Some("user".to_string()),
+                    parts: vec![GeminiPartRequest { text }],
+                });
+            }
+            _ => {}
         }
     }
     contents
@@ -814,12 +856,43 @@ fn content_to_gemini_parts(content: &[ContentItem]) -> Vec<GeminiPartRequest> {
     parts
 }
 
+fn build_gemini_tools(tools: &[ToolSpec]) -> Option<Vec<GeminiTool>> {
+    let mut functions = Vec::new();
+
+    for tool in tools {
+        if let ToolSpec::Function(ResponsesApiTool {
+            name,
+            description,
+            parameters,
+            ..
+        }) = tool
+        {
+            let params = serde_json::to_value(parameters).ok();
+            functions.push(GeminiFunctionDeclaration {
+                name: name.clone(),
+                description: Some(description.clone()),
+                parameters: params,
+            });
+        }
+    }
+
+    if functions.is_empty() {
+        None
+    } else {
+        Some(vec![GeminiTool {
+            function_declarations: Some(functions),
+        }])
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GeminiRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     system_instruction: Option<GeminiContentRequest>,
     contents: Vec<GeminiContentRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<GeminiTool>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -858,6 +931,34 @@ struct GeminiContentResponse {
 struct GeminiPartResponse {
     #[serde(default)]
     text: Option<String>,
+
+    #[serde(rename = "functionCall", default, alias = "function_call")]
+    function_call: Option<GeminiFunctionCall>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiFunctionCall {
+    name: String,
+    #[serde(default)]
+    args: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiTool {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    function_declarations: Option<Vec<GeminiFunctionDeclaration>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiFunctionDeclaration {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parameters: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1382,9 +1483,11 @@ mod tests {
                 parts: Some(vec![
                     GeminiPartResponse {
                         text: Some("Hello".to_string()),
+                        function_call: None,
                     },
                     GeminiPartResponse {
                         text: Some("World".to_string()),
+                        function_call: None,
                     },
                 ]),
             }),
@@ -1402,6 +1505,32 @@ mod tests {
                 );
             }
             _ => panic!("expected assistant message"),
+        }
+    }
+
+    #[test]
+    fn candidate_to_response_item_maps_function_call() {
+        let candidate = GeminiCandidate {
+            content: Some(GeminiContentResponse {
+                parts: Some(vec![GeminiPartResponse {
+                    text: None,
+                    function_call: Some(GeminiFunctionCall {
+                        name: "read_file".to_string(),
+                        args: json!({"file_path": "/tmp/test.txt"}),
+                    }),
+                }]),
+            }),
+        };
+
+        let item = candidate_to_response_item(candidate).expect("response item");
+        match item {
+            ResponseItem::FunctionCall {
+                name, arguments, ..
+            } => {
+                assert_eq!(name, "read_file");
+                assert!(arguments.contains("/tmp/test.txt"));
+            }
+            other => panic!("expected function call, got {other:?}"),
         }
     }
 
