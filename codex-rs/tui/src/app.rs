@@ -10,6 +10,7 @@ use crate::exec_command::strip_bash_lc_and_escape;
 use crate::file_search::FileSearchManager;
 use crate::history_cell::HistoryCell;
 use crate::model_migration::ModelMigrationOutcome;
+use crate::model_migration::migration_copy_for_config;
 use crate::model_migration::run_model_migration_prompt;
 use crate::pager_overlay::Overlay;
 use crate::render::highlight::highlight_bash_to_lines;
@@ -20,13 +21,21 @@ use crate::tui;
 use crate::tui::TuiEvent;
 use crate::update_action::UpdateAction;
 use codex_ansi_escape::ansi_escape_line;
+use codex_app_server_protocol::AuthMode;
+use codex_common::model_presets::HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG;
+use codex_common::model_presets::HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG;
 use codex_common::model_presets::ModelUpgrade;
 use codex_common::model_presets::all_model_presets;
 use codex_core::AuthManager;
 use codex_core::ConversationManager;
 use codex_core::config::Config;
 use codex_core::config::edit::ConfigEditsBuilder;
+#[cfg(target_os = "windows")]
+use codex_core::features::Feature;
 use codex_core::model_family::find_family_for_model;
+use codex_core::protocol::EventMsg;
+use codex_core::protocol::FinalOutput;
+use codex_core::protocol::Op;
 use codex_core::protocol::SessionConfiguredEvent;
 use codex_core::protocol::SessionSource;
 use codex_core::protocol::TokenUsage;
@@ -48,6 +57,8 @@ use crossterm::event::KeyEventKind;
 use ratatui::layout::Rect;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
+use ratatui::widgets::Paragraph;
+use ratatui::widgets::Wrap;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -63,6 +74,9 @@ use tokio::task::JoinHandle;
 
 #[cfg(not(debug_assertions))]
 use crate::history_cell::UpdateAvailableHistoryCell;
+
+const GPT_5_1_MIGRATION_AUTH_MODES: [AuthMode; 2] = [AuthMode::ChatGPT, AuthMode::ApiKey];
+const GPT_5_1_CODEX_MIGRATION_AUTH_MODES: [AuthMode; 1] = [AuthMode::ChatGPT];
 
 #[derive(Debug, Clone)]
 pub struct AppExitInfo {
@@ -84,6 +98,29 @@ pub(crate) enum LayoutMode {
     Collapsed,
 }
 
+fn session_summary(
+    token_usage: TokenUsage,
+    conversation_id: Option<ConversationId>,
+) -> Option<SessionSummary> {
+    if token_usage.is_zero() {
+        return None;
+    }
+
+    let usage_line = FinalOutput::from(token_usage).to_string();
+    let resume_command =
+        conversation_id.map(|conversation_id| format!("codex resume {conversation_id}"));
+    Some(SessionSummary {
+        usage_line,
+        resume_command,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionSummary {
+    usage_line: String,
+    resume_command: Option<String>,
+}
+
 fn should_show_model_migration_prompt(
     current_model: &str,
     target_model: &str,
@@ -99,10 +136,21 @@ fn should_show_model_migration_prompt(
         .any(|preset| preset.model == current_model)
 }
 
+fn migration_prompt_hidden(config: &Config, migration_config_key: &str) -> Option<bool> {
+    match migration_config_key {
+        HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG => {
+            config.notices.hide_gpt_5_1_codex_max_migration_prompt
+        }
+        HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG => config.notices.hide_gpt5_1_migration_prompt,
+        _ => None,
+    }
+}
+
 async fn handle_model_migration_prompt_if_needed(
     tui: &mut tui::Tui,
     config: &mut Config,
     app_event_tx: &AppEventSender,
+    auth_mode: Option<AuthMode>,
 ) -> Option<AppExitInfo> {
     let upgrade = all_model_presets()
         .iter()
@@ -112,18 +160,24 @@ async fn handle_model_migration_prompt_if_needed(
     if let Some(ModelUpgrade {
         id: target_model,
         reasoning_effort_mapping,
+        migration_config_key,
     }) = upgrade
     {
+        if !migration_prompt_allows_auth_mode(auth_mode, migration_config_key) {
+            return None;
+        }
+
         let target_model = target_model.to_string();
-        let hide_prompt_flag = config.notices.hide_gpt5_1_migration_prompt;
+        let hide_prompt_flag = migration_prompt_hidden(config, migration_config_key);
         if !should_show_model_migration_prompt(&config.model, &target_model, hide_prompt_flag) {
             return None;
         }
 
-        match run_model_migration_prompt(tui).await {
+        let prompt_copy = migration_copy_for_config(migration_config_key);
+        match run_model_migration_prompt(tui, prompt_copy).await {
             ModelMigrationOutcome::Accepted => {
                 app_event_tx.send(AppEvent::PersistModelMigrationPromptAcknowledged {
-                    migration_config: "hide_gpt5_1_migration_prompt".to_string(),
+                    migration_config: migration_config_key.to_string(),
                 });
                 config.model = target_model.to_string();
                 if let Some(family) = find_family_for_model(&target_model) {
@@ -148,6 +202,11 @@ async fn handle_model_migration_prompt_if_needed(
                 app_event_tx.send(AppEvent::PersistModelSelection {
                     model: target_model.clone(),
                     effort: mapped_effort,
+                });
+            }
+            ModelMigrationOutcome::Rejected => {
+                app_event_tx.send(AppEvent::PersistModelMigrationPromptAcknowledged {
+                    migration_config: migration_config_key.to_string(),
                 });
             }
             ModelMigrationOutcome::Exit => {
@@ -207,6 +266,9 @@ pub(crate) struct App {
     pub(crate) pending_update_action: Option<UpdateAction>,
     delegate_tree: DelegateTree,
     delegate_status_owner: Option<String>,
+    /// Ignore the next ShutdownComplete event when we're intentionally
+    /// stopping a conversation (e.g., before starting a new one).
+    suppress_shutdown_complete: bool,
     // One-shot suppression of the next world-writable scan after user confirmation.
     skip_world_writable_scan_once: bool,
 }
@@ -311,6 +373,14 @@ impl DelegateTree {
 }
 
 impl App {
+    async fn shutdown_current_conversation(&mut self) {
+        if let Some(conversation_id) = self.chat_widget.conversation_id() {
+            self.suppress_shutdown_complete = true;
+            self.chat_widget.submit_op(Op::Shutdown);
+            self.server.remove_conversation(&conversation_id).await;
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn run(
         tui: &mut tui::Tui,
@@ -327,10 +397,11 @@ impl App {
         let (app_event_tx, mut app_event_rx) = unbounded_channel();
         let app_event_tx = AppEventSender::new(app_event_tx);
 
-        // Handle model migration prompt if needed (upstream addition).
-        if let Some(exit_info) =
-            handle_model_migration_prompt_if_needed(tui, &mut config, &app_event_tx).await
-        {
+        let auth_mode = auth_manager.auth().map(|auth| auth.mode);
+        let exit_info =
+            handle_model_migration_prompt_if_needed(tui, &mut config, &app_event_tx, auth_mode)
+                .await;
+        if let Some(exit_info) = exit_info {
             return Ok(exit_info);
         }
 
@@ -352,7 +423,7 @@ impl App {
 
         let enhanced_keys_supported = tui.enhanced_keys_supported();
 
-        let chat_widget = match resume_selection {
+        let mut chat_widget = match resume_selection {
             ResumeSelection::StartFresh | ResumeSelection::Exit => {
                 let init = crate::chatwidget::ChatWidgetInit {
                     config: config.clone(),
@@ -396,6 +467,8 @@ impl App {
             }
         };
 
+        chat_widget.maybe_prompt_windows_sandbox_enable();
+
         let file_search = FileSearchManager::new(config.cwd.clone(), app_event_tx.clone());
         #[cfg(not(debug_assertions))]
         let upgrade_version = crate::updates::get_upgrade_version(&config);
@@ -428,6 +501,7 @@ impl App {
             pending_update_action: None,
             delegate_tree: DelegateTree::default(),
             delegate_status_owner: None,
+            suppress_shutdown_complete: false,
             skip_world_writable_scan_once: false,
             session_bar,
             panel_focus: PanelFocus::Chat,
@@ -436,7 +510,7 @@ impl App {
 
         app.cxresume_idle.trigger_immediate(&app.app_event_tx);
 
-        // On startup, if Auto mode (workspace-write) or ReadOnly is active, warn about world-writable dirs on Windows.
+        // On startup, if Agent mode (workspace-write) or ReadOnly is active, warn about world-writable dirs on Windows.
         #[cfg(target_os = "windows")]
         {
             let should_check = codex_core::get_platform_sandbox().is_some()
@@ -455,7 +529,8 @@ impl App {
                 let env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
                 let tx = app.app_event_tx.clone();
                 let logs_base_dir = app.config.codex_home.clone();
-                Self::spawn_world_writable_scan(cwd, env_map, logs_base_dir, tx);
+                let sandbox_policy = app.config.sandbox_policy.clone();
+                Self::spawn_world_writable_scan(cwd, env_map, logs_base_dir, sandbox_policy, tx);
             }
         }
 
@@ -669,6 +744,11 @@ impl App {
                 tui.frame_requester().schedule_frame();
             }
             AppEvent::NewSession => {
+                let summary = session_summary(
+                    self.chat_widget.token_usage(),
+                    self.chat_widget.conversation_id(),
+                );
+                self.shutdown_current_conversation().await;
                 let init = crate::chatwidget::ChatWidgetInit {
                     config: self.config.clone(),
                     frame_requester: tui.frame_requester(),
@@ -680,6 +760,14 @@ impl App {
                     feedback: self.feedback.clone(),
                 };
                 self.chat_widget = ChatWidget::new(init, self.server.clone());
+                if let Some(summary) = summary {
+                    let mut lines: Vec<Line<'static>> = vec![summary.usage_line.clone().into()];
+                    if let Some(command) = summary.resume_command {
+                        let spans = vec!["To continue this session, run ".into(), command.cyan()];
+                        lines.push(spans.into());
+                    }
+                    self.chat_widget.add_plain_history_lines(lines);
+                }
 
                 // Switch focus to new chat
                 self.panel_focus = PanelFocus::Chat;
@@ -760,6 +848,12 @@ impl App {
             }
             AppEvent::CodexEvent(event) => {
                 // Backward-compat (should not be used anymore): assume it's for current conversation
+                if self.suppress_shutdown_complete
+                    && matches!(event.msg, EventMsg::ShutdownComplete)
+                {
+                    self.suppress_shutdown_complete = false;
+                    return Ok(true);
+                }
                 self.chat_widget.handle_codex_event(event);
             }
             AppEvent::CodexEventFor {
@@ -805,6 +899,9 @@ impl App {
             AppEvent::FileSearchResult { query, matches } => {
                 self.chat_widget.apply_file_search_result(query, matches);
             }
+            AppEvent::RateLimitSnapshotFetched(snapshot) => {
+                self.chat_widget.on_rate_limit_snapshot(Some(snapshot));
+            }
             AppEvent::UpdateReasoningEffort(effort) => {
                 self.on_update_reasoning_effort(effort);
             }
@@ -843,8 +940,70 @@ impl App {
             AppEvent::OpenFeedbackConsent { category } => {
                 self.chat_widget.open_feedback_consent(category);
             }
-            AppEvent::ShowWindowsAutoModeInstructions => {
-                self.chat_widget.open_windows_auto_mode_instructions();
+            AppEvent::OpenWindowsSandboxEnablePrompt { preset } => {
+                self.chat_widget.open_windows_sandbox_enable_prompt(preset);
+            }
+            AppEvent::EnableWindowsSandboxForAgentMode { preset } => {
+                #[cfg(target_os = "windows")]
+                {
+                    let profile = self.active_profile.as_deref();
+                    let feature_key = Feature::WindowsSandbox.key();
+                    match ConfigEditsBuilder::new(&self.config.codex_home)
+                        .with_profile(profile)
+                        .set_feature_enabled(feature_key, true)
+                        .apply()
+                        .await
+                    {
+                        Ok(()) => {
+                            self.config.set_windows_sandbox_globally(true);
+                            self.chat_widget.clear_forced_auto_mode_downgrade();
+                            if let Some((sample_paths, extra_count, failed_scan)) =
+                                self.chat_widget.world_writable_warning_details()
+                            {
+                                self.app_event_tx.send(
+                                    AppEvent::OpenWorldWritableWarningConfirmation {
+                                        preset: Some(preset.clone()),
+                                        sample_paths,
+                                        extra_count,
+                                        failed_scan,
+                                    },
+                                );
+                            } else {
+                                self.app_event_tx.send(AppEvent::CodexOp(
+                                    Op::OverrideTurnContext {
+                                        cwd: None,
+                                        approval_policy: Some(preset.approval),
+                                        sandbox_policy: Some(preset.sandbox.clone()),
+                                        model: None,
+                                        effort: None,
+                                        summary: None,
+                                    },
+                                ));
+                                self.app_event_tx
+                                    .send(AppEvent::UpdateAskForApprovalPolicy(preset.approval));
+                                self.app_event_tx
+                                    .send(AppEvent::UpdateSandboxPolicy(preset.sandbox.clone()));
+                                self.chat_widget.add_info_message(
+                                    "Enabled experimental Windows sandbox.".to_string(),
+                                    None,
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                error = %err,
+                                "failed to enable Windows sandbox feature"
+                            );
+                            self.chat_widget.add_error_message(format!(
+                                "Failed to enable the Windows sandbox feature: {err}"
+                            ));
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let _ = preset;
+                }
             }
             AppEvent::PersistModelSelection { model, effort } => {
                 let profile = self.active_profile.as_deref();
@@ -855,19 +1014,17 @@ impl App {
                     .await
                 {
                     Ok(()) => {
-                        let effort_label = effort
-                            .map(|eff| format!(" with {eff} reasoning"))
-                            .unwrap_or_else(|| " with default reasoning".to_string());
+                        let reasoning_label = Self::reasoning_label(effort);
                         if let Some(profile) = profile {
                             self.chat_widget.add_info_message(
                                 format!(
-                                    "Model changed to {model}{effort_label} for {profile} profile"
+                                    "Model changed to {model} {reasoning_label} for {profile} profile"
                                 ),
                                 None,
                             );
                         } else {
                             self.chat_widget.add_info_message(
-                                format!("Model changed to {model}{effort_label}"),
+                                format!("Model changed to {model} {reasoning_label}"),
                                 None,
                             );
                         }
@@ -899,6 +1056,13 @@ impl App {
                         | codex_core::protocol::SandboxPolicy::ReadOnly
                 );
 
+                self.config.sandbox_policy = policy.clone();
+                #[cfg(target_os = "windows")]
+                if !matches!(policy, codex_core::protocol::SandboxPolicy::ReadOnly)
+                    || codex_core::get_platform_sandbox().is_some()
+                {
+                    self.config.forced_auto_mode_downgraded_on_windows = false;
+                }
                 self.chat_widget.set_sandbox_policy(policy);
 
                 // If sandbox policy becomes workspace-write or read-only, run the Windows world-writable scan.
@@ -919,7 +1083,14 @@ impl App {
                             std::env::vars().collect();
                         let tx = self.app_event_tx.clone();
                         let logs_base_dir = self.config.codex_home.clone();
-                        Self::spawn_world_writable_scan(cwd, env_map, logs_base_dir, tx);
+                        let sandbox_policy = self.config.sandbox_policy.clone();
+                        Self::spawn_world_writable_scan(
+                            cwd,
+                            env_map,
+                            logs_base_dir,
+                            sandbox_policy,
+                            tx,
+                        );
                     }
                 }
             }
@@ -962,7 +1133,7 @@ impl App {
                         "failed to persist world-writable warning acknowledgement"
                     );
                     self.chat_widget.add_error_message(format!(
-                        "Failed to save Auto mode warning preference: {err}"
+                        "Failed to save Agent mode warning preference: {err}"
                     ));
                 }
             }
@@ -1113,6 +1284,23 @@ impl App {
                     self.overlay = Some(Overlay::new_static_with_lines(
                         full_cmd_lines,
                         "E X E C".to_string(),
+                    ));
+                }
+                ApprovalRequest::McpElicitation {
+                    server_name,
+                    message,
+                    ..
+                } => {
+                    let _ = tui.enter_alt_screen();
+                    let paragraph = Paragraph::new(vec![
+                        Line::from(vec!["Server: ".into(), server_name.bold()]),
+                        Line::from(""),
+                        Line::from(message),
+                    ])
+                    .wrap(Wrap { trim: false });
+                    self.overlay = Some(Overlay::new_static_with_renderables(
+                        vec![Box::new(paragraph)],
+                        "E L I C I T A T I O N".to_string(),
                     ));
                 }
             },
@@ -1424,6 +1612,17 @@ impl App {
         Ok(())
     }
 
+    fn reasoning_label(reasoning_effort: Option<ReasoningEffortConfig>) -> &'static str {
+        match reasoning_effort {
+            Some(ReasoningEffortConfig::Minimal) => "minimal",
+            Some(ReasoningEffortConfig::Low) => "low",
+            Some(ReasoningEffortConfig::Medium) => "medium",
+            Some(ReasoningEffortConfig::High) => "high",
+            Some(ReasoningEffortConfig::XHigh) => "xhigh",
+            None | Some(ReasoningEffortConfig::None) => "default",
+        }
+    }
+
     pub(crate) fn token_usage(&self) -> codex_core::protocol::TokenUsage {
         self.chat_widget.token_usage()
     }
@@ -1707,47 +1906,23 @@ impl App {
         cwd: PathBuf,
         env_map: std::collections::HashMap<String, String>,
         logs_base_dir: PathBuf,
+        sandbox_policy: codex_core::protocol::SandboxPolicy,
         tx: AppEventSender,
     ) {
-        #[inline]
-        fn normalize_windows_path_for_display(p: &std::path::Path) -> String {
-            let canon = dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-            canon.display().to_string().replace('/', "\\")
-        }
         tokio::task::spawn_blocking(move || {
-            let result = codex_windows_sandbox::preflight_audit_everyone_writable(
+            let result = codex_windows_sandbox::apply_world_writable_scan_and_denies(
+                &logs_base_dir,
                 &cwd,
                 &env_map,
+                &sandbox_policy,
                 Some(logs_base_dir.as_path()),
             );
-            if let Ok(ref paths) = result
-                && !paths.is_empty()
-            {
-                let as_strings: Vec<String> = paths
-                    .iter()
-                    .map(|p| normalize_windows_path_for_display(p))
-                    .collect();
-                let sample_paths: Vec<String> = as_strings.iter().take(3).cloned().collect();
-                let extra_count = if as_strings.len() > sample_paths.len() {
-                    as_strings.len() - sample_paths.len()
-                } else {
-                    0
-                };
-
+            if result.is_err() {
+                // Scan failed: warn without examples.
                 tx.send(AppEvent::OpenWorldWritableWarningConfirmation {
                     preset: None,
-                    sample_paths,
-                    extra_count,
-                    failed_scan: false,
-                });
-            } else if result.is_err() {
-                // Scan failed: still warn, but with no examples and mark as failed.
-                let sample_paths: Vec<String> = Vec::new();
-                let extra_count = 0usize;
-                tx.send(AppEvent::OpenWorldWritableWarningConfirmation {
-                    preset: None,
-                    sample_paths,
-                    extra_count,
+                    sample_paths: Vec::new(),
+                    extra_count: 0usize,
                     failed_scan: true,
                 });
             }
@@ -1893,6 +2068,27 @@ fn format_tumix_summary(result: &Round1Result) -> String {
     )
 }
 
+fn migration_prompt_allowed_auth_modes(migration_config_key: &str) -> Option<&'static [AuthMode]> {
+    match migration_config_key {
+        HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG => Some(&GPT_5_1_MIGRATION_AUTH_MODES),
+        HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG => Some(&GPT_5_1_CODEX_MIGRATION_AUTH_MODES),
+        _ => None,
+    }
+}
+
+fn migration_prompt_allows_auth_mode(
+    auth_mode: Option<AuthMode>,
+    migration_config_key: &str,
+) -> bool {
+    if let Some(allowed_modes) = migration_prompt_allowed_auth_modes(migration_config_key) {
+        match auth_mode {
+            None => true,
+            Some(mode) => allowed_modes.contains(&mode),
+        }
+    } else {
+        auth_mode != Some(AuthMode::ApiKey)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1910,7 +2106,10 @@ mod tests {
     use codex_core::CodexAuth;
     use codex_core::ConversationManager;
     use codex_core::config::ConfigOverrides;
-
+    use codex_core::protocol::AskForApproval;
+    use codex_core::protocol::Event;
+    use codex_core::protocol::EventMsg;
+    use codex_core::protocol::SandboxPolicy;
     use codex_core::protocol::SessionConfiguredEvent;
     use codex_core::protocol::SessionSource;
 
@@ -1923,7 +2122,6 @@ mod tests {
     fn make_test_app() -> App {
         let (chat_widget, app_event_tx, _rx, _op_rx) = make_chatwidget_manual_with_sender();
         let config = chat_widget.config_ref().clone();
-
         let server = Arc::new(ConversationManager::with_auth(CodexAuth::from_api_key(
             "Test API Key",
         )));
@@ -1970,6 +2168,9 @@ mod tests {
             active_profile: None,
             file_search,
             transcript_cells: Vec::new(),
+            session_bar,
+            panel_focus: PanelFocus::Chat,
+            layout_mode: LayoutMode::Normal,
             overlay: None,
             deferred_history_lines: Vec::new(),
             has_emitted_history_lines: false,
@@ -1986,11 +2187,89 @@ mod tests {
             pending_update_action: None,
             delegate_tree: DelegateTree::default(),
             delegate_status_owner: None,
-            session_bar,
-            panel_focus: PanelFocus::Chat,
-            layout_mode: LayoutMode::Normal,
+            suppress_shutdown_complete: false,
             skip_world_writable_scan_once: false,
         }
+    }
+
+    fn make_test_app_with_channels() -> (
+        App,
+        tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+        tokio::sync::mpsc::UnboundedReceiver<Op>,
+    ) {
+        let (chat_widget, app_event_tx, rx, op_rx) = make_chatwidget_manual_with_sender();
+        let config = chat_widget.config_ref().clone();
+        let server = Arc::new(ConversationManager::with_auth(CodexAuth::from_api_key(
+            "Test API Key",
+        )));
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+        let file_search = FileSearchManager::new(config.cwd.clone(), app_event_tx.clone());
+        let delegate_orchestrator = Arc::new(AgentOrchestrator::new(
+            config.codex_home.clone(),
+            auth_manager.clone(),
+            SessionSource::Cli,
+            CliConfigOverrides::default(),
+            ConfigOverrides {
+                model: None,
+                review_model: None,
+                cwd: None,
+                approval_policy: None,
+                sandbox_mode: None,
+                model_provider: None,
+                config_profile: None,
+                codex_linux_sandbox_exe: None,
+                base_instructions: None,
+                include_delegate_tool: None,
+                include_apply_patch_tool: None,
+                show_raw_agent_reasoning: None,
+                tools_web_search_request: None,
+                developer_instructions: None,
+                compact_prompt: None,
+                experimental_sandbox_command_assessment: None,
+                additional_writable_roots: Vec::new(),
+            },
+            Vec::new(),
+            config.multi_agent.max_concurrent_delegates,
+        ));
+        let session_bar = SessionBar::new(config.cwd.clone());
+
+        (
+            App {
+                server,
+                app_event_tx,
+                chat_widget,
+                auth_manager,
+                delegate_orchestrator,
+                config,
+                active_profile: None,
+                file_search,
+                transcript_cells: Vec::new(),
+                session_bar,
+                panel_focus: PanelFocus::Chat,
+                layout_mode: LayoutMode::Normal,
+                overlay: None,
+                deferred_history_lines: Vec::new(),
+                has_emitted_history_lines: false,
+                enhanced_keys_supported: false,
+                commit_anim_running: Arc::new(AtomicBool::new(false)),
+                backtrack: BacktrackState::default(),
+                cxresume_cache: None,
+                cxresume_idle: CxresumeIdleLoader::new(Duration::from_secs(2)),
+                feedback: codex_feedback::CodexFeedback::new(),
+                delegate_sessions: HashMap::new(),
+                active_delegate: None,
+                active_delegate_summary: None,
+                primary_chat_backup: None,
+                pending_update_action: None,
+                delegate_tree: DelegateTree::default(),
+                delegate_status_owner: None,
+                suppress_shutdown_complete: false,
+                skip_world_writable_scan_once: false,
+            },
+            rx,
+            op_rx,
+        )
     }
 
     #[test]
@@ -2004,6 +2283,11 @@ mod tests {
         assert!(should_show_model_migration_prompt(
             "gpt-5-codex-mini",
             "gpt-5.1-codex-mini",
+            None
+        ));
+        assert!(should_show_model_migration_prompt(
+            "gpt-5.1-codex",
+            "gpt-5.1-codex-max",
             None
         ));
         assert!(!should_show_model_migration_prompt(
@@ -2064,6 +2348,10 @@ mod tests {
             let event = SessionConfiguredEvent {
                 session_id: ConversationId::new(),
                 model: "gpt-test".to_string(),
+                model_provider_id: "test-provider".to_string(),
+                approval_policy: AskForApproval::Never,
+                sandbox_policy: SandboxPolicy::ReadOnly,
+                cwd: PathBuf::from("/home/user/project"),
                 reasoning_effort: None,
                 history_log_id: 0,
                 history_entry_count: 0,
@@ -2111,6 +2399,10 @@ mod tests {
         let event = SessionConfiguredEvent {
             session_id: ConversationId::new(),
             model: "gpt-test".to_string(),
+            model_provider_id: "test-provider".to_string(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::ReadOnly,
+            cwd: PathBuf::from("/home/user/project"),
             reasoning_effort: None,
             history_log_id: 0,
             history_entry_count: 0,
@@ -2126,5 +2418,104 @@ mod tests {
         assert_eq!(resolved.model, event.model);
         assert_eq!(resolved.history_log_id, event.history_log_id);
         assert_eq!(resolved.history_entry_count, event.history_entry_count);
+    }
+
+    #[tokio::test]
+    async fn new_session_requests_shutdown_for_previous_conversation() {
+        let (mut app, mut app_event_rx, mut op_rx) = make_test_app_with_channels();
+
+        let conversation_id = ConversationId::new();
+        let event = SessionConfiguredEvent {
+            session_id: conversation_id,
+            model: "gpt-test".to_string(),
+            model_provider_id: "test-provider".to_string(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::ReadOnly,
+            cwd: PathBuf::from("/home/user/project"),
+            reasoning_effort: None,
+            history_log_id: 0,
+            history_entry_count: 0,
+            initial_messages: None,
+            rollout_path: PathBuf::new(),
+        };
+
+        app.chat_widget.handle_codex_event(Event {
+            id: String::new(),
+            msg: EventMsg::SessionConfigured(event),
+        });
+
+        while app_event_rx.try_recv().is_ok() {}
+        while op_rx.try_recv().is_ok() {}
+
+        app.shutdown_current_conversation().await;
+
+        match op_rx.try_recv() {
+            Ok(Op::Shutdown) => {}
+            Ok(other) => panic!("expected Op::Shutdown, got {other:?}"),
+            Err(_) => panic!("expected shutdown op to be sent"),
+        }
+    }
+
+    #[test]
+    fn session_summary_skip_zero_usage() {
+        assert!(session_summary(TokenUsage::default(), None).is_none());
+    }
+
+    #[test]
+    fn session_summary_includes_resume_hint() {
+        let usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 2,
+            total_tokens: 12,
+            ..Default::default()
+        };
+        let conversation =
+            ConversationId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap();
+
+        let summary = session_summary(usage, Some(conversation)).expect("summary");
+        assert_eq!(
+            summary.usage_line,
+            "Token usage: total=12 input=10 output=2"
+        );
+        assert_eq!(
+            summary.resume_command,
+            Some("codex resume 123e4567-e89b-12d3-a456-426614174000".to_string())
+        );
+    }
+
+    #[test]
+    fn gpt5_migration_allows_api_key_and_chatgpt() {
+        assert!(migration_prompt_allows_auth_mode(
+            Some(AuthMode::ApiKey),
+            HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG,
+        ));
+        assert!(migration_prompt_allows_auth_mode(
+            Some(AuthMode::ChatGPT),
+            HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG,
+        ));
+    }
+
+    #[test]
+    fn gpt_5_1_codex_max_migration_limits_to_chatgpt() {
+        assert!(migration_prompt_allows_auth_mode(
+            Some(AuthMode::ChatGPT),
+            HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG,
+        ));
+        assert!(!migration_prompt_allows_auth_mode(
+            Some(AuthMode::ApiKey),
+            HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG,
+        ));
+    }
+
+    #[test]
+    fn other_migrations_block_api_key() {
+        assert!(!migration_prompt_allows_auth_mode(
+            Some(AuthMode::ApiKey),
+            "unknown"
+        ));
+        assert!(migration_prompt_allows_auth_mode(
+            Some(AuthMode::ChatGPT),
+            "unknown"
+        ));
     }
 }

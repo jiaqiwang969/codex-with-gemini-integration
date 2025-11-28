@@ -70,6 +70,7 @@ pub(crate) struct BottomPane {
     is_task_running: bool,
     ctrl_c_quit_hint: bool,
     esc_backtrack_hint: bool,
+    animations_enabled: bool,
 
     /// Inline status indicator shown above the composer while a task is running.
     status: Option<StatusIndicatorWidget>,
@@ -86,28 +87,38 @@ pub(crate) struct BottomPaneParams {
     pub(crate) enhanced_keys_supported: bool,
     pub(crate) placeholder_text: String,
     pub(crate) disable_paste_burst: bool,
+    pub(crate) animations_enabled: bool,
 }
 
 impl BottomPane {
     pub fn new(params: BottomPaneParams) -> Self {
-        let enhanced_keys_supported = params.enhanced_keys_supported;
+        let BottomPaneParams {
+            app_event_tx,
+            frame_requester,
+            has_input_focus,
+            enhanced_keys_supported,
+            placeholder_text,
+            disable_paste_burst,
+            animations_enabled,
+        } = params;
         Self {
             composer: ChatComposer::new(
-                params.has_input_focus,
-                params.app_event_tx.clone(),
+                has_input_focus,
+                app_event_tx.clone(),
                 enhanced_keys_supported,
-                params.placeholder_text,
-                params.disable_paste_burst,
+                placeholder_text,
+                disable_paste_burst,
             ),
             view_stack: Vec::new(),
-            app_event_tx: params.app_event_tx,
-            frame_requester: params.frame_requester,
-            has_input_focus: params.has_input_focus,
+            app_event_tx,
+            frame_requester,
+            has_input_focus,
             is_task_running: false,
             ctrl_c_quit_hint: false,
             status: None,
             queued_user_messages: QueuedUserMessages::new(),
             esc_backtrack_hint: false,
+            animations_enabled,
             context_window_percent: None,
             delegate_label: None,
         }
@@ -115,6 +126,11 @@ impl BottomPane {
 
     pub fn status_widget(&self) -> Option<&StatusIndicatorWidget> {
         self.status.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn context_window_percent(&self) -> Option<i64> {
+        self.context_window_percent
     }
 
     fn active_view(&self) -> Option<&dyn BottomPaneView> {
@@ -282,20 +298,24 @@ impl BottomPane {
     // esc_backtrack_hint_visible removed; hints are controlled internally.
 
     pub fn set_task_running(&mut self, running: bool) {
+        let was_running = self.is_task_running;
         self.is_task_running = running;
         self.composer.set_task_running(running);
 
         if running {
-            if self.status.is_none() {
-                self.status = Some(StatusIndicatorWidget::new(
-                    self.app_event_tx.clone(),
-                    self.frame_requester.clone(),
-                ));
+            if !was_running {
+                if self.status.is_none() {
+                    self.status = Some(StatusIndicatorWidget::new(
+                        self.app_event_tx.clone(),
+                        self.frame_requester.clone(),
+                        self.animations_enabled,
+                    ));
+                }
+                if let Some(status) = self.status.as_mut() {
+                    status.set_interrupt_hint_visible(true);
+                }
+                self.request_redraw();
             }
-            if let Some(status) = self.status.as_mut() {
-                status.set_interrupt_hint_visible(true);
-            }
-            self.request_redraw();
         } else {
             // Hide the status indicator when a task completes, but keep other modal views.
             self.hide_status_indicator();
@@ -314,6 +334,7 @@ impl BottomPane {
             self.status = Some(StatusIndicatorWidget::new(
                 self.app_event_tx.clone(),
                 self.frame_requester.clone(),
+                self.animations_enabled,
             ));
             self.request_redraw();
         }
@@ -569,6 +590,7 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            animations_enabled: true,
         });
         pane.push_approval_request(exec_request());
         assert_eq!(CancellationEvent::Handled, pane.on_ctrl_c());
@@ -589,6 +611,7 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            animations_enabled: true,
         });
 
         // Create an approval modal (active view).
@@ -620,6 +643,7 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            animations_enabled: true,
         });
 
         // Start a running task so the status indicator is active above the composer.
@@ -685,6 +709,7 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            animations_enabled: true,
         });
 
         // Begin a task: show initial status.
@@ -710,6 +735,7 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            animations_enabled: true,
         });
 
         // Activate spinner (status view replaces composer) with no live ring.
@@ -739,6 +765,7 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            animations_enabled: true,
         });
 
         pane.set_task_running(true);
@@ -765,6 +792,7 @@ mod tests {
             enhanced_keys_supported: false,
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
+            animations_enabled: true,
         });
 
         pane.set_task_running(true);
