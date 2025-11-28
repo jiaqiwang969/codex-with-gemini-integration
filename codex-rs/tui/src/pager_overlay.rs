@@ -1935,6 +1935,8 @@ impl SessionPickerOverlay {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_core::protocol::ExecCommandSource;
+
     use insta::assert_snapshot;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -2065,7 +2067,9 @@ mod tests {
             "exec-1".into(),
             vec!["bash".into(), "-lc".into(), "ls".into()],
             vec![ParsedCommand::Unknown { cmd: "ls".into() }],
-            false,
+            ExecCommandSource::Agent,
+            None,
+            true,
         );
         exec_cell.complete_call(
             "exec-1",

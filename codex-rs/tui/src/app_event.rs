@@ -4,6 +4,7 @@ use codex_common::approval_presets::ApprovalPreset;
 use codex_common::model_presets::ModelPreset;
 use codex_core::protocol::ConversationPathResponseEvent;
 use codex_core::protocol::Event;
+use codex_core::protocol::RateLimitSnapshot;
 use codex_file_search::FileMatch;
 use codex_multi_agent::DelegateEvent;
 
@@ -61,6 +62,9 @@ pub(crate) enum AppEvent {
         matches: Vec<FileMatch>,
     },
 
+    /// Result of refreshing rate limits
+    RateLimitSnapshotFetched(RateLimitSnapshot),
+
     /// Result of computing a `/diff` command.
     DiffResult(String),
 
@@ -107,9 +111,17 @@ pub(crate) enum AppEvent {
         failed_scan: bool,
     },
 
-    /// Show Windows Subsystem for Linux setup instructions for auto mode.
+    /// Prompt to enable the Windows sandbox feature before using Agent mode.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    ShowWindowsAutoModeInstructions,
+    OpenWindowsSandboxEnablePrompt {
+        preset: ApprovalPreset,
+    },
+
+    /// Enable the Windows sandbox feature and switch to Agent mode.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    EnableWindowsSandboxForAgentMode {
+        preset: ApprovalPreset,
+    },
 
     /// Update the current approval policy in the running app and widget.
     UpdateAskForApprovalPolicy(AskForApproval),
