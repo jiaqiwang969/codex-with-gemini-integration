@@ -16,6 +16,28 @@
 
 ## Quickstart
 
+### 使用本 Fork（Gemini 接入）
+
+本仓库在官方 Codex CLI 的基础上，额外支持通过 Gemini 接入（由 [ppaicode.com](https://api.ppaicode.com) 提供接口代理）。
+
+1. 准备环境变量（放到你的 `~/.zshrc` / `~/.bashrc` 等 shell 配置里）：
+
+   ```shell
+   export GEMINI_BASE_URL="https://api.ppaicode.com/v1"
+   export GEMINI_API_KEY="sk-xxx"
+   export GEMINI_COOKIE="SITE_TOTAL_ID=xxx"
+   ```
+
+2. 编译二进制（参考下方 [Install & build](./docs/install.md)）后，使用方式示例：
+
+   ```shell
+   # 使用 Gemini
+   codex-rs/target/release/codex -p gemini
+
+   # 使用原始 Codex（OpenAI）
+   codex-rs/target/release/codex -p codex
+   ```
+
 ### Installing and running Codex CLI
 
 Install globally with your preferred package manager.
