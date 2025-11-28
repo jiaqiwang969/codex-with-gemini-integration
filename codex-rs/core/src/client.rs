@@ -210,7 +210,10 @@ impl ModelClient {
 
         let system_instruction = (!instructions.trim().is_empty()).then(|| GeminiContentRequest {
             role: None,
-            parts: vec![GeminiPartRequest { text: instructions }],
+            parts: vec![GeminiPartRequest {
+                text: Some(instructions),
+                inline_data: None,
+            }],
         });
 
         let tools = build_gemini_tools(&prompt.tools);
@@ -821,7 +824,10 @@ fn build_gemini_contents(items: &[ResponseItem]) -> Vec<GeminiContentRequest> {
                 }
                 contents.push(GeminiContentRequest {
                     role: Some("user".to_string()),
-                    parts: vec![GeminiPartRequest { text }],
+                    parts: vec![GeminiPartRequest {
+                        text: Some(text),
+                        inline_data: None,
+                    }],
                 });
             }
             _ => {}
@@ -841,19 +847,52 @@ fn map_gemini_role(role: &str) -> String {
 fn content_to_gemini_parts(content: &[ContentItem]) -> Vec<GeminiPartRequest> {
     let mut parts = Vec::new();
     for entry in content {
-        let text = match entry {
-            ContentItem::InputText { text } | ContentItem::OutputText { text } => text.clone(),
-            ContentItem::InputImage { image_url } => {
-                format!("Image reference: {image_url}")
+        match entry {
+            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                if text.trim().is_empty() {
+                    continue;
+                }
+                parts.push(GeminiPartRequest {
+                    text: Some(text.clone()),
+                    inline_data: None,
+                });
             }
-        };
-
-        if text.trim().is_empty() {
-            continue;
+            ContentItem::InputImage { image_url } => {
+                if let Some((mime, data)) = parse_data_url(image_url) {
+                    if data.trim().is_empty() {
+                        continue;
+                    }
+                    parts.push(GeminiPartRequest {
+                        text: None,
+                        inline_data: Some(GeminiInlineData {
+                            mime_type: mime,
+                            data,
+                        }),
+                    });
+                } else if !image_url.trim().is_empty() {
+                    // Fallback: preserve the URL as plain text hint when we cannot
+                    // parse a data URL. This keeps non-data URLs usable even if the
+                    // Gemini endpoint only understands inline data/file references.
+                    parts.push(GeminiPartRequest {
+                        text: Some(format!("Image reference: {image_url}")),
+                        inline_data: None,
+                    });
+                }
+            }
         }
-        parts.push(GeminiPartRequest { text });
     }
     parts
+}
+
+fn parse_data_url(url: &str) -> Option<(String, String)> {
+    // Expected shape: data:<mime>;base64,<data>
+    let without_prefix = url.strip_prefix("data:")?;
+    let (meta, data) = without_prefix.split_once(',')?;
+    let (mime, encoding) = meta.split_once(';')?;
+    if !encoding.eq_ignore_ascii_case("base64") {
+        return None;
+    }
+    Some((mime.to_string(), data.to_string()))
 }
 
 fn build_gemini_tools(tools: &[ToolSpec]) -> Option<Vec<GeminiTool>> {
@@ -904,8 +943,18 @@ struct GeminiContentRequest {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct GeminiPartRequest {
-    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inline_data: Option<GeminiInlineData>,
+}
+
+#[derive(Debug, Serialize)]
+struct GeminiInlineData {
+    mime_type: String,
+    data: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1472,7 +1521,7 @@ mod tests {
         assert_eq!(contents.len(), 2);
         assert_eq!(contents[0].role.as_deref(), Some("user"));
         assert_eq!(contents[0].parts.len(), 1);
-        assert_eq!(contents[0].parts[0].text, "Hello Gemini");
+        assert_eq!(contents[0].parts[0].text.as_deref(), Some("Hello Gemini"));
         assert_eq!(contents[1].role.as_deref(), Some("model"));
     }
 
