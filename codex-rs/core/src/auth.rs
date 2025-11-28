@@ -257,6 +257,7 @@ impl CodexAuth {
     pub fn create_dummy_chatgpt_auth_for_testing() -> Self {
         let auth_dot_json = AuthDotJson {
             openai_api_key: None,
+            gemini_api_key: None,
             tokens: Some(TokenData {
                 id_token: Default::default(),
                 access_token: "Access Token".to_string(),
@@ -293,6 +294,7 @@ impl CodexAuth {
 
 pub const OPENAI_API_KEY_ENV_VAR: &str = "OPENAI_API_KEY";
 pub const CODEX_API_KEY_ENV_VAR: &str = "CODEX_API_KEY";
+pub const GEMINI_API_KEY_ENV_VAR: &str = "GEMINI_API_KEY";
 
 pub fn read_openai_api_key_from_env() -> Option<String> {
     env::var(OPENAI_API_KEY_ENV_VAR)
@@ -306,6 +308,37 @@ pub fn read_codex_api_key_from_env() -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+pub fn read_gemini_api_key_from_env() -> Option<String> {
+    env::var(GEMINI_API_KEY_ENV_VAR)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Read Gemini API key from auth.json file. Returns None if not found.
+pub fn read_gemini_api_key_from_auth_json(
+    codex_home: &Path,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+) -> Option<String> {
+    let storage = create_auth_storage(codex_home.to_path_buf(), auth_credentials_store_mode);
+    let auth = storage.load().ok().flatten()?;
+
+    // Prefer a dedicated Gemini key when present, but fall back to the
+    // OpenAI API key stored in auth.json. This matches the documented
+    // behaviour where Gemini can reuse the shared OpenAI key.
+    let key = auth
+        .gemini_api_key
+        .filter(|k| !k.trim().is_empty())
+        .or(auth.openai_api_key.filter(|k| !k.trim().is_empty()))?;
+
+    let trimmed = key.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 /// Delete the auth.json file inside `codex_home` if it exists. Returns `Ok(true)`
@@ -326,6 +359,7 @@ pub fn login_with_api_key(
 ) -> std::io::Result<()> {
     let auth_dot_json = AuthDotJson {
         openai_api_key: Some(api_key.to_string()),
+        gemini_api_key: None,
         tokens: None,
         last_refresh: None,
     };
@@ -464,6 +498,7 @@ fn load_auth(
 
     let AuthDotJson {
         openai_api_key: auth_json_api_key,
+        gemini_api_key: _,
         tokens,
         last_refresh,
     } = auth_dot_json;
@@ -479,6 +514,7 @@ fn load_auth(
         storage: storage.clone(),
         auth_dot_json: Arc::new(Mutex::new(Some(AuthDotJson {
             openai_api_key: None,
+            gemini_api_key: None,
             tokens,
             last_refresh,
         }))),
@@ -723,6 +759,40 @@ mod tests {
     }
 
     #[test]
+    fn read_gemini_api_key_prefers_dedicated_key_over_openai_key() {
+        let dir = tempdir().unwrap();
+        let auth = AuthDotJson {
+            openai_api_key: Some("sk-openai".to_string()),
+            gemini_api_key: Some("sk-gemini".to_string()),
+            tokens: None,
+            last_refresh: None,
+        };
+        super::save_auth(dir.path(), &auth, AuthCredentialsStoreMode::File)
+            .expect("save_auth should succeed");
+
+        let key =
+            super::read_gemini_api_key_from_auth_json(dir.path(), AuthCredentialsStoreMode::File);
+        assert_eq!(key.as_deref(), Some("sk-gemini"));
+    }
+
+    #[test]
+    fn read_gemini_api_key_falls_back_to_openai_key_when_dedicated_key_missing() {
+        let dir = tempdir().unwrap();
+        let auth = AuthDotJson {
+            openai_api_key: Some("sk-openai".to_string()),
+            gemini_api_key: None,
+            tokens: None,
+            last_refresh: None,
+        };
+        super::save_auth(dir.path(), &auth, AuthCredentialsStoreMode::File)
+            .expect("save_auth should succeed");
+
+        let key =
+            super::read_gemini_api_key_from_auth_json(dir.path(), AuthCredentialsStoreMode::File);
+        assert_eq!(key.as_deref(), Some("sk-openai"));
+    }
+
+    #[test]
     fn missing_auth_json_returns_none() {
         let dir = tempdir().unwrap();
         let auth = CodexAuth::from_auth_storage(dir.path(), AuthCredentialsStoreMode::File)
@@ -765,6 +835,7 @@ mod tests {
         assert_eq!(
             &AuthDotJson {
                 openai_api_key: None,
+                gemini_api_key: None,
                 tokens: Some(TokenData {
                     id_token: IdTokenInfo {
                         email: Some("user@example.com".to_string()),
@@ -807,6 +878,7 @@ mod tests {
         let dir = tempdir()?;
         let auth_dot_json = AuthDotJson {
             openai_api_key: Some("sk-test-key".to_string()),
+            gemini_api_key: None,
             tokens: None,
             last_refresh: None,
         };

@@ -2506,7 +2506,7 @@ mod tests {
 
         assert_eq!(
             out,
-            "command timed out after 1000 milliseconds\nCommand output"
+            "command timed out after 1000 milliseconds\nCommand output\nERR:Timeout"
         );
     }
 

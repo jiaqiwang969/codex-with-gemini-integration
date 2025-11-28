@@ -12,6 +12,7 @@ use codex_otel::otel_event_manager::OtelEventManager;
 use codex_protocol::ConversationId;
 use codex_protocol::config_types::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionSource;
 use eventsource_stream::Eventsource;
@@ -180,7 +181,96 @@ impl ModelClient {
 
                 Ok(ResponseStream { rx_event: rx })
             }
+            WireApi::Gemini => self.stream_gemini(prompt).await,
         }
+    }
+
+    async fn stream_gemini(&self, prompt: &Prompt) -> Result<ResponseStream> {
+        let base_url = self.provider.base_url.as_ref().ok_or_else(|| {
+            CodexErr::UnsupportedOperation("Gemini providers must define a base_url".to_string())
+        })?;
+
+        let url = format!(
+            "{}/models/{}:generateContent",
+            base_url.trim_end_matches('/'),
+            self.config.model
+        );
+
+        let instructions = prompt
+            .get_full_instructions(&self.config.model_family)
+            .to_string();
+        let mut contents = build_gemini_contents(&prompt.get_formatted_input());
+        if contents.is_empty() {
+            return Err(CodexErr::UnsupportedOperation(
+                "Gemini requests require at least one message".to_string(),
+            ));
+        }
+
+        let system_instruction = (!instructions.trim().is_empty()).then(|| GeminiContentRequest {
+            role: None,
+            parts: vec![GeminiPartRequest { text: instructions }],
+        });
+
+        let request = GeminiRequest {
+            system_instruction,
+            contents: std::mem::take(&mut contents),
+        };
+
+        // Build request with Gemini-specific auth handling
+        let mut req_builder = self.client.post(&url);
+        // Always apply provider-level headers so env_http_headers like
+        // GEMINI_COOKIE are respected even when we inject the API key
+        // directly below.
+        req_builder = self.provider.apply_http_headers(req_builder);
+
+        // Try to get GEMINI_API_KEY from auth.json first, then fall back to env var
+        let gemini_api_key = crate::auth::read_gemini_api_key_from_auth_json(
+            &self.config.codex_home,
+            self.config.cli_auth_credentials_store_mode,
+        )
+        .or_else(|| crate::auth::read_gemini_api_key_from_env());
+
+        if let Some(api_key) = gemini_api_key {
+            // Override any existing X-Goog-Api-Key header so we can prefer
+            // a dedicated Gemini key or the shared OPENAI_API_KEY from
+            // auth.json when present.
+            req_builder = req_builder.header("x-goog-api-key", api_key);
+        }
+
+        let response = self
+            .otel_event_manager
+            .log_request(1, || req_builder.json(&request).send())
+            .await
+            .map_err(|err| {
+                CodexErr::ResponseStreamFailed(ResponseStreamFailed {
+                    source: err,
+                    request_id: None,
+                })
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(CodexErr::UnexpectedStatus(UnexpectedResponseError {
+                status,
+                body,
+                request_id: None,
+            }));
+        }
+
+        let body: GeminiResponse = response.json().await.map_err(|err| {
+            CodexErr::ResponseStreamFailed(ResponseStreamFailed {
+                source: err,
+                request_id: None,
+            })
+        })?;
+        let parsed = parse_gemini_response(body)?;
+
+        Ok(spawn_gemini_response_stream(
+            parsed.response_item,
+            parsed.response_id,
+            parsed.token_usage,
+        ))
     }
 
     /// Implementation for the OpenAI *Responses* experimental API.
@@ -597,6 +687,202 @@ struct ResponseCompletedInputTokensDetails {
 #[derive(Debug, Deserialize)]
 struct ResponseCompletedOutputTokensDetails {
     reasoning_tokens: i64,
+}
+
+fn spawn_gemini_response_stream(
+    response_item: Option<ResponseItem>,
+    response_id: String,
+    token_usage: Option<TokenUsage>,
+) -> ResponseStream {
+    let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(8);
+    tokio::spawn(async move {
+        if tx_event.send(Ok(ResponseEvent::Created)).await.is_err() {
+            return;
+        }
+        if let Some(item) = response_item {
+            if tx_event
+                .send(Ok(ResponseEvent::OutputItemAdded(item.clone())))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            if tx_event
+                .send(Ok(ResponseEvent::OutputItemDone(item)))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        let _ = tx_event
+            .send(Ok(ResponseEvent::Completed {
+                response_id,
+                token_usage,
+            }))
+            .await;
+    });
+    ResponseStream { rx_event }
+}
+
+struct GeminiParsedResponse {
+    response_item: Option<ResponseItem>,
+    response_id: String,
+    token_usage: Option<TokenUsage>,
+}
+
+fn parse_gemini_response(body: GeminiResponse) -> Result<GeminiParsedResponse> {
+    let response_id = body
+        .response_id
+        .unwrap_or_else(|| "gemini-response".to_string());
+    let response_item = body
+        .candidates
+        .and_then(|candidates| candidates.into_iter().find_map(candidate_to_response_item));
+
+    let token_usage = body.usage_metadata.map(Into::into);
+
+    Ok(GeminiParsedResponse {
+        response_item,
+        response_id,
+        token_usage,
+    })
+}
+
+fn candidate_to_response_item(candidate: GeminiCandidate) -> Option<ResponseItem> {
+    let content = candidate.content?;
+    let parts = content.parts.unwrap_or_default();
+    let mut response_parts = Vec::new();
+    for part in parts {
+        if let Some(text) = part.text {
+            if text.trim().is_empty() {
+                continue;
+            }
+            response_parts.push(ContentItem::OutputText { text });
+        }
+    }
+    if response_parts.is_empty() {
+        None
+    } else {
+        Some(ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: response_parts,
+        })
+    }
+}
+
+fn build_gemini_contents(items: &[ResponseItem]) -> Vec<GeminiContentRequest> {
+    let mut contents = Vec::new();
+    for item in items {
+        if let ResponseItem::Message { role, content, .. } = item {
+            let parts = content_to_gemini_parts(content);
+            if parts.is_empty() {
+                continue;
+            }
+            contents.push(GeminiContentRequest {
+                role: Some(map_gemini_role(role)),
+                parts,
+            });
+        }
+    }
+    contents
+}
+
+fn map_gemini_role(role: &str) -> String {
+    if role.eq_ignore_ascii_case("assistant") {
+        "model".to_string()
+    } else {
+        "user".to_string()
+    }
+}
+
+fn content_to_gemini_parts(content: &[ContentItem]) -> Vec<GeminiPartRequest> {
+    let mut parts = Vec::new();
+    for entry in content {
+        let text = match entry {
+            ContentItem::InputText { text } | ContentItem::OutputText { text } => text.clone(),
+            ContentItem::InputImage { image_url } => {
+                format!("Image reference: {image_url}")
+            }
+        };
+
+        if text.trim().is_empty() {
+            continue;
+        }
+        parts.push(GeminiPartRequest { text });
+    }
+    parts
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system_instruction: Option<GeminiContentRequest>,
+    contents: Vec<GeminiContentRequest>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiContentRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
+    parts: Vec<GeminiPartRequest>,
+}
+
+#[derive(Debug, Serialize)]
+struct GeminiPartRequest {
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiResponse {
+    candidates: Option<Vec<GeminiCandidate>>,
+    response_id: Option<String>,
+    usage_metadata: Option<GeminiUsageMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiCandidate {
+    content: Option<GeminiContentResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiContentResponse {
+    parts: Option<Vec<GeminiPartResponse>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiPartResponse {
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiUsageMetadata {
+    prompt_token_count: Option<i64>,
+    candidates_token_count: Option<i64>,
+    total_token_count: Option<i64>,
+    thoughts_token_count: Option<i64>,
+}
+
+impl From<GeminiUsageMetadata> for TokenUsage {
+    fn from(meta: GeminiUsageMetadata) -> Self {
+        let input = meta.prompt_token_count.unwrap_or_default();
+        let output = meta.candidates_token_count.unwrap_or_default();
+        let reasoning = meta.thoughts_token_count.unwrap_or_default();
+        let total = meta.total_token_count.unwrap_or(input + output + reasoning);
+        TokenUsage {
+            input_tokens: input,
+            cached_input_tokens: 0,
+            output_tokens: output,
+            reasoning_output_tokens: reasoning,
+            total_tokens: total,
+        }
+    }
 }
 
 fn attach_item_ids(payload_json: &mut Value, original_items: &[ResponseItem]) {
@@ -1062,6 +1348,63 @@ mod tests {
         out
     }
 
+    #[test]
+    fn build_gemini_contents_converts_messages() {
+        let items = vec![
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "Hello Gemini".to_string(),
+                }],
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "Reply".to_string(),
+                }],
+            },
+        ];
+
+        let contents = build_gemini_contents(&items);
+        assert_eq!(contents.len(), 2);
+        assert_eq!(contents[0].role.as_deref(), Some("user"));
+        assert_eq!(contents[0].parts.len(), 1);
+        assert_eq!(contents[0].parts[0].text, "Hello Gemini");
+        assert_eq!(contents[1].role.as_deref(), Some("model"));
+    }
+
+    #[test]
+    fn candidate_to_response_item_maps_text() {
+        let candidate = GeminiCandidate {
+            content: Some(GeminiContentResponse {
+                parts: Some(vec![
+                    GeminiPartResponse {
+                        text: Some("Hello".to_string()),
+                    },
+                    GeminiPartResponse {
+                        text: Some("World".to_string()),
+                    },
+                ]),
+            }),
+        };
+
+        let item = candidate_to_response_item(candidate).expect("response item");
+        match item {
+            ResponseItem::Message { content, .. } => {
+                assert_eq!(content.len(), 2);
+                assert_eq!(
+                    content[0],
+                    ContentItem::OutputText {
+                        text: "Hello".to_string()
+                    }
+                );
+            }
+            _ => panic!("expected assistant message"),
+        }
+    }
+
     fn otel_event_manager() -> OtelEventManager {
         OtelEventManager::new(
             ConversationId::new(),
@@ -1117,6 +1460,7 @@ mod tests {
             env_key: Some("TEST_API_KEY".to_string()),
             env_key_instructions: None,
             experimental_bearer_token: None,
+            auth_json_key: None,
             wire_api: WireApi::Responses,
             query_params: None,
             http_headers: None,
@@ -1181,6 +1525,7 @@ mod tests {
             env_key: Some("TEST_API_KEY".to_string()),
             env_key_instructions: None,
             experimental_bearer_token: None,
+            auth_json_key: None,
             wire_api: WireApi::Responses,
             query_params: None,
             http_headers: None,
@@ -1218,6 +1563,7 @@ mod tests {
             env_key: Some("TEST_API_KEY".to_string()),
             env_key_instructions: None,
             experimental_bearer_token: None,
+            auth_json_key: None,
             wire_api: WireApi::Responses,
             query_params: None,
             http_headers: None,
@@ -1257,6 +1603,7 @@ mod tests {
             env_key: Some("TEST_API_KEY".to_string()),
             env_key_instructions: None,
             experimental_bearer_token: None,
+            auth_json_key: None,
             wire_api: WireApi::Responses,
             query_params: None,
             http_headers: None,
@@ -1292,6 +1639,7 @@ mod tests {
             env_key: Some("TEST_API_KEY".to_string()),
             env_key_instructions: None,
             experimental_bearer_token: None,
+            auth_json_key: None,
             wire_api: WireApi::Responses,
             query_params: None,
             http_headers: None,
@@ -1327,6 +1675,7 @@ mod tests {
             env_key: Some("TEST_API_KEY".to_string()),
             env_key_instructions: None,
             experimental_bearer_token: None,
+            auth_json_key: None,
             wire_api: WireApi::Responses,
             query_params: None,
             http_headers: None,
@@ -1431,6 +1780,7 @@ mod tests {
                 env_key: Some("TEST_API_KEY".to_string()),
                 env_key_instructions: None,
                 experimental_bearer_token: None,
+                auth_json_key: None,
                 wire_api: WireApi::Responses,
                 query_params: None,
                 http_headers: None,

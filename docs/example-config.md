@@ -28,6 +28,21 @@ review_model = "gpt-5-codex"
 # Provider id selected from [model_providers]. Default: "openai".
 model_provider = "openai"
 
+# --- Example: default to Gemini preview provider ---
+# model = "gemini-3-pro-preview"
+# model_provider = "gemini"
+#
+# Authentication options (export before launching Codex):
+#   Option 1: Use dedicated Gemini API key (isolated from Codex)
+#     export GEMINI_API_KEY="sk-..."
+#
+#   Option 2: Use shared key - if GEMINI_API_KEY is not set,
+#     Gemini will use OPENAI_API_KEY from auth.json
+#
+# Optional settings:
+#   export GEMINI_BASE_URL="https://..."  # override default endpoint
+#   export GEMINI_COOKIE="SITE_TOTAL_ID=..."  # optional cookie
+
 # Optional manual model metadata. When unset, Codex auto-detects from model.
 # Uncomment to force values.
 # model_context_window = 128000       # tokens; default: auto for model
@@ -304,6 +319,15 @@ mcp_oauth_credentials_store = "auto"
 # name = "Ollama"
 # base_url = "http://localhost:11434/v1"
 # wire_api = "chat"
+
+# --- Example: Gemini preview provider ---
+# [model_providers.gemini]
+# name = "Gemini (Preview)"
+# base_url = "https://api.ppchat.vip/v1beta"  # or set GEMINI_BASE_URL env var
+# wire_api = "gemini"
+# requires_openai_auth = true  # enables fallback to shared OPENAI_API_KEY
+# env_key_instructions = "Set GEMINI_API_KEY for dedicated key, or use shared OPENAI_API_KEY"
+# env_http_headers = { "X-Goog-Api-Key" = "GEMINI_API_KEY", "Cookie" = "GEMINI_COOKIE" }
 
 ################################################################################
 # Profiles (named presets)

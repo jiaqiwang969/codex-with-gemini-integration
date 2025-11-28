@@ -127,6 +127,7 @@ pub fn write_chatgpt_auth(
 
     let auth = AuthDotJson {
         openai_api_key: None,
+        gemini_api_key: None,
         tokens: Some(tokens),
         last_refresh,
     };

@@ -39,6 +39,9 @@ pub enum WireApi {
     /// Regular Chat Completions compatible with `/v1/chat/completions`.
     #[default]
     Chat,
+
+    /// Google Gemini JSON API exposed via `:generateContent` endpoints.
+    Gemini,
 }
 
 /// Serializable representation of a provider definition.
@@ -59,6 +62,10 @@ pub struct ModelProviderInfo {
     /// config is discouraged in favor of `env_key` for security reasons, but
     /// this may be necessary when using this programmatically.
     pub experimental_bearer_token: Option<String>,
+
+    /// Key name to read from auth.json. Supported values: "OPENAI_API_KEY", "GEMINI_API_KEY".
+    /// If not set and requires_openai_auth is true, defaults to "OPENAI_API_KEY".
+    pub auth_json_key: Option<String>,
 
     /// Which wire protocol this provider expects.
     #[serde(default)]
@@ -109,27 +116,53 @@ impl ModelProviderInfo {
         client: &'a CodexHttpClient,
         auth: &Option<CodexAuth>,
     ) -> crate::error::Result<CodexRequestBuilder> {
-        let effective_auth = if let Some(secret_key) = &self.experimental_bearer_token {
-            Some(CodexAuth::from_api_key(secret_key))
-        } else {
-            match self.api_key() {
-                Ok(Some(key)) => Some(CodexAuth::from_api_key(&key)),
-                Ok(None) => auth.clone(),
-                Err(err) => {
-                    if auth.is_some() {
-                        auth.clone()
-                    } else {
-                        return Err(err);
-                    }
+        let effective_auth = self.resolve_effective_auth(auth)?;
+        let url = self.get_full_url(&effective_auth);
+        self.build_request_builder(client, effective_auth, url)
+            .await
+    }
+
+    pub async fn create_request_builder_for_url<'a>(
+        &'a self,
+        client: &'a CodexHttpClient,
+        auth: &Option<CodexAuth>,
+        url: String,
+    ) -> crate::error::Result<CodexRequestBuilder> {
+        let effective_auth = self.resolve_effective_auth(auth)?;
+        self.build_request_builder(client, effective_auth, url)
+            .await
+    }
+
+    fn resolve_effective_auth(
+        &self,
+        auth: &Option<CodexAuth>,
+    ) -> crate::error::Result<Option<CodexAuth>> {
+        if let Some(secret_key) = &self.experimental_bearer_token {
+            return Ok(Some(CodexAuth::from_api_key(secret_key)));
+        }
+
+        match self.api_key() {
+            Ok(Some(key)) => Ok(Some(CodexAuth::from_api_key(&key))),
+            Ok(None) => Ok(auth.clone()),
+            Err(err) => {
+                if auth.is_some() {
+                    Ok(auth.clone())
+                } else {
+                    Err(err)
                 }
             }
-        };
+        }
+    }
 
-        let url = self.get_full_url(&effective_auth);
-
+    async fn build_request_builder(
+        &self,
+        client: &CodexHttpClient,
+        effective_auth: Option<CodexAuth>,
+        url: String,
+    ) -> crate::error::Result<CodexRequestBuilder> {
         let mut builder = client.post(url);
 
-        if let Some(auth) = effective_auth.as_ref() {
+        if let Some(auth) = effective_auth {
             builder = builder.bearer_auth(auth.get_token().await?);
         }
 
@@ -170,6 +203,7 @@ impl ModelProviderInfo {
         match self.wire_api {
             WireApi::Responses => format!("{base_url}/responses{query_string}"),
             WireApi::Chat => format!("{base_url}/chat/completions{query_string}"),
+            WireApi::Gemini => format!("{base_url}{query_string}"),
         }
     }
 
@@ -191,7 +225,7 @@ impl ModelProviderInfo {
     /// Apply provider-specific HTTP headers (both static and environment-based)
     /// onto an existing [`CodexRequestBuilder`] and return the updated
     /// builder.
-    fn apply_http_headers(&self, mut builder: CodexRequestBuilder) -> CodexRequestBuilder {
+    pub fn apply_http_headers(&self, mut builder: CodexRequestBuilder) -> CodexRequestBuilder {
         if let Some(extra) = &self.http_headers {
             for (k, v) in extra {
                 builder = builder.header(k, v);
@@ -286,6 +320,7 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
                 env_key: None,
                 env_key_instructions: None,
                 experimental_bearer_token: None,
+                auth_json_key: None,
                 wire_api: WireApi::Responses,
                 query_params: None,
                 http_headers: Some(
@@ -308,6 +343,41 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
                 request_max_retries: None,
                 stream_max_retries: None,
                 stream_idle_timeout_ms: None,
+                requires_openai_auth: true,
+            },
+        ),
+        (
+            "gemini",
+            P {
+                name: "Gemini (Preview)".into(),
+                // Allow users to override the default Gemini endpoint by
+                // exporting `GEMINI_BASE_URL`. Falls back to default ppchat proxy.
+                base_url: std::env::var("GEMINI_BASE_URL")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .or_else(|| Some("https://api.ppchat.vip/v1beta".into())),
+                env_key: None,
+                env_key_instructions: Some(
+                    "Set GEMINI_API_KEY to use a dedicated Gemini API key, or leave unset to use the shared OPENAI_API_KEY from auth.json.".into(),
+                ),
+                experimental_bearer_token: None,
+                auth_json_key: Some("GEMINI_API_KEY".to_string()),
+                wire_api: WireApi::Gemini,
+                query_params: None,
+                http_headers: None,
+                env_http_headers: Some(
+                    [
+                        ("X-Goog-Api-Key".to_string(), "GEMINI_API_KEY".to_string()),
+                        ("Cookie".to_string(), "GEMINI_COOKIE".to_string()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                request_max_retries: None,
+                stream_max_retries: None,
+                stream_idle_timeout_ms: None,
+                // Enable OpenAI auth fallback: if GEMINI_API_KEY is not set,
+                // the provider will use the shared OPENAI_API_KEY from auth.json
                 requires_openai_auth: true,
             },
         ),
@@ -346,6 +416,7 @@ pub fn create_oss_provider_with_base_url(base_url: &str) -> ModelProviderInfo {
         env_key: None,
         env_key_instructions: None,
         experimental_bearer_token: None,
+        auth_json_key: None,
         wire_api: WireApi::Chat,
         query_params: None,
         http_headers: None,
@@ -386,6 +457,7 @@ base_url = "http://localhost:11434/v1"
             env_key: None,
             env_key_instructions: None,
             experimental_bearer_token: None,
+            auth_json_key: None,
             wire_api: WireApi::Chat,
             query_params: None,
             http_headers: None,
@@ -414,6 +486,7 @@ query_params = { api-version = "2025-04-01-preview" }
             env_key: Some("AZURE_OPENAI_API_KEY".into()),
             env_key_instructions: None,
             experimental_bearer_token: None,
+            auth_json_key: None,
             wire_api: WireApi::Chat,
             query_params: Some(maplit::hashmap! {
                 "api-version".to_string() => "2025-04-01-preview".to_string(),
@@ -445,6 +518,7 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
             env_key: Some("API_KEY".into()),
             env_key_instructions: None,
             experimental_bearer_token: None,
+            auth_json_key: None,
             wire_api: WireApi::Chat,
             query_params: None,
             http_headers: Some(maplit::hashmap! {
@@ -472,6 +546,7 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
                 env_key: None,
                 env_key_instructions: None,
                 experimental_bearer_token: None,
+                auth_json_key: None,
                 wire_api: WireApi::Responses,
                 query_params: None,
                 http_headers: None,
@@ -505,6 +580,7 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
             env_key: None,
             env_key_instructions: None,
             experimental_bearer_token: None,
+            auth_json_key: None,
             wire_api: WireApi::Responses,
             query_params: None,
             http_headers: None,

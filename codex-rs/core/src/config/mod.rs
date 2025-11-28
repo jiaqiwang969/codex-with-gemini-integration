@@ -2939,6 +2939,7 @@ model_verbosity = "high"
             wire_api: crate::WireApi::Chat,
             env_key_instructions: None,
             experimental_bearer_token: None,
+            auth_json_key: None,
             query_params: None,
             http_headers: None,
             env_http_headers: None,

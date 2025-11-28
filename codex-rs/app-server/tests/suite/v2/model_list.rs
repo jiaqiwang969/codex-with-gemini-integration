@@ -114,6 +114,18 @@ async fn list_models_returns_all_models_with_large_limit() -> Result<()> {
             default_reasoning_effort: ReasoningEffort::Medium,
             is_default: false,
         },
+        Model {
+            id: "gemini-3-pro-preview".to_string(),
+            model: "gemini-3-pro-preview".to_string(),
+            display_name: "gemini-3-pro-preview".to_string(),
+            description: "Google Gemini 3 Pro preview via PPChat proxy.".to_string(),
+            supported_reasoning_efforts: vec![ReasoningEffortOption {
+                reasoning_effort: ReasoningEffort::Medium,
+                description: "Default Gemini reasoning behaviour.".to_string(),
+            }],
+            default_reasoning_effort: ReasoningEffort::Medium,
+            is_default: false,
+        },
     ];
 
     assert_eq!(items, expected_models);
@@ -192,7 +204,29 @@ async fn list_models_pagination_works() -> Result<()> {
 
     assert_eq!(third_items.len(), 1);
     assert_eq!(third_items[0].id, "gpt-5.1");
-    assert!(third_cursor.is_none());
+    let fourth_cursor = third_cursor.ok_or_else(|| anyhow!("cursor for fourth page"))?;
+
+    let fourth_request = mcp
+        .send_list_models_request(ModelListParams {
+            limit: Some(1),
+            cursor: Some(fourth_cursor),
+        })
+        .await?;
+
+    let fourth_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(fourth_request)),
+    )
+    .await??;
+
+    let ModelListResponse {
+        data: fourth_items,
+        next_cursor: final_cursor,
+    } = to_response::<ModelListResponse>(fourth_response)?;
+
+    assert_eq!(fourth_items.len(), 1);
+    assert_eq!(fourth_items[0].id, "gemini-3-pro-preview");
+    assert!(final_cursor.is_none());
     Ok(())
 }
 

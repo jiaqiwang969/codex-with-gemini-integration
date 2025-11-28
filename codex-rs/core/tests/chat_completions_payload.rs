@@ -51,6 +51,7 @@ async fn run_request(input: Vec<ResponseItem>) -> Value {
         env_key: None,
         env_key_instructions: None,
         experimental_bearer_token: None,
+        auth_json_key: None,
         wire_api: WireApi::Chat,
         query_params: None,
         http_headers: None,

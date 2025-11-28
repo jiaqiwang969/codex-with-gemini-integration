@@ -189,6 +189,19 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
                 )])),
             }),
         },
+        ModelPreset {
+            id: "gemini-3-pro-preview",
+            model: "gemini-3-pro-preview",
+            display_name: "gemini-3-pro-preview",
+            description: "Google Gemini 3 Pro preview via PPChat proxy.",
+            default_reasoning_effort: ReasoningEffort::Medium,
+            supported_reasoning_efforts: &[ReasoningEffortPreset {
+                effort: ReasoningEffort::Medium,
+                description: "Default Gemini reasoning behaviour.",
+            }],
+            is_default: false,
+            upgrade: None,
+        },
     ]
 });
 

@@ -131,6 +131,39 @@ http_headers = { "X-Example-Header" = "example-value" }
 env_http_headers = { "X-Example-Features" = "EXAMPLE_FEATURES" }
 ```
 
+#### Gemini preview provider
+
+Codex bundles a provider named `gemini` that targets `https://api.ppchat.vip/v1beta` by default so you can talk to Google's Gemini 3 Pro preview endpoint. To enable it, point `model_provider` and `model` at the Gemini identifiers:
+
+```toml
+model = "gemini-3-pro-preview"
+model_provider = "gemini"
+```
+
+**Authentication options:**
+
+1. **Use dedicated Gemini API key** (isolated from Codex):
+   ```bash
+   export GEMINI_API_KEY="sk-…"    # becomes the X-Goog-Api-Key header
+   ```
+
+2. **Use shared OPENAI_API_KEY** (from auth.json, same as Codex):
+   If `GEMINI_API_KEY` is not set, Gemini will automatically fall back to using the `OPENAI_API_KEY` stored in `~/.codex/auth.json`.
+
+**Custom base URL:**
+
+You can override the default Gemini endpoint by setting:
+```bash
+export GEMINI_BASE_URL="https://your-custom-endpoint.com/v1beta"
+```
+
+**Optional cookie:**
+```bash
+export GEMINI_COOKIE="SITE_TOTAL_ID=…"  # optional cookie forwarded with every call
+```
+
+If the cookie is not needed for your account you may omit `GEMINI_COOKIE`.
+
 #### Azure model provider example
 
 Note that Azure requires `api-version` to be passed as a query parameter, so be sure to specify it as part of `query_params` when defining the Azure provider:

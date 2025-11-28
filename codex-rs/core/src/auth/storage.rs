@@ -39,6 +39,13 @@ pub struct AuthDotJson {
     #[serde(rename = "OPENAI_API_KEY")]
     pub openai_api_key: Option<String>,
 
+    #[serde(
+        rename = "GEMINI_API_KEY",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub gemini_api_key: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens: Option<TokenData>,
 
@@ -296,6 +303,7 @@ mod tests {
         let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
         let auth_dot_json = AuthDotJson {
             openai_api_key: Some("test-key".to_string()),
+            gemini_api_key: None,
             tokens: None,
             last_refresh: Some(Utc::now()),
         };
@@ -315,6 +323,7 @@ mod tests {
         let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
         let auth_dot_json = AuthDotJson {
             openai_api_key: Some("test-key".to_string()),
+            gemini_api_key: None,
             tokens: None,
             last_refresh: Some(Utc::now()),
         };
@@ -336,6 +345,7 @@ mod tests {
         let dir = tempdir()?;
         let auth_dot_json = AuthDotJson {
             openai_api_key: Some("sk-test-key".to_string()),
+            gemini_api_key: None,
             tokens: None,
             last_refresh: None,
         };
@@ -425,6 +435,7 @@ mod tests {
     fn auth_with_prefix(prefix: &str) -> AuthDotJson {
         AuthDotJson {
             openai_api_key: Some(format!("{prefix}-api-key")),
+            gemini_api_key: None,
             tokens: Some(TokenData {
                 id_token: id_token_with_prefix(prefix),
                 access_token: format!("{prefix}-access"),
@@ -445,6 +456,7 @@ mod tests {
         );
         let expected = AuthDotJson {
             openai_api_key: Some("sk-test".to_string()),
+            gemini_api_key: None,
             tokens: None,
             last_refresh: None,
         };
@@ -481,6 +493,7 @@ mod tests {
         std::fs::write(&auth_file, "stale")?;
         let auth = AuthDotJson {
             openai_api_key: None,
+            gemini_api_key: None,
             tokens: Some(TokenData {
                 id_token: Default::default(),
                 access_token: "access".to_string(),
