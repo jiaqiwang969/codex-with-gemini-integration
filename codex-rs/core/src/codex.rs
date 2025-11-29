@@ -2230,6 +2230,21 @@ async fn try_run_turn(
     });
 
     sess.persist_rollout_items(&[rollout_item]).await;
+
+    // Lightweight loop detection for consecutive identical tool calls.
+    //
+    // This mirrors the behavior of Gemini CLI's LoopDetectionService in a simplified form.
+    // When enabled (currently for Gemini-family models), we track the last tool call
+    // issued within this turn using a stable key (tool name + serialized arguments). If
+    // the model keeps issuing the exact same tool call repeatedly, we treat this as a
+    // loop and surface a structured FunctionCallOutput back to the model instead of
+    // continuing to execute the same command indefinitely.
+    let model_family = turn_context.client.get_model_family();
+    let detect_tool_call_loops = model_family.family == "gemini";
+    const TOOL_CALL_LOOP_THRESHOLD: i32 = 5;
+    let mut last_tool_call_key: Option<String> = None;
+    let mut tool_call_repetition_count: i32 = 0;
+
     let mut stream = turn_context
         .client
         .clone()
@@ -2282,6 +2297,52 @@ async fn try_run_turn(
                 let previously_active_item = active_item.take();
                 match ToolRouter::build_tool_call(sess.as_ref(), item.clone()).await {
                     Ok(Some(call)) => {
+                        if detect_tool_call_loops {
+                            // Build a stable key for this tool call based on tool name and
+                            // its arguments payload so identical calls can be detected.
+                            let payload_preview = call.payload.log_payload().into_owned();
+                            let key = format!("{}:{}", call.tool_name, payload_preview);
+
+                            if let Some(last) = &last_tool_call_key {
+                                if last == &key {
+                                    tool_call_repetition_count += 1;
+                                } else {
+                                    last_tool_call_key = Some(key);
+                                    tool_call_repetition_count = 1;
+                                }
+                            } else {
+                                last_tool_call_key = Some(key);
+                                tool_call_repetition_count = 1;
+                            }
+
+                            if tool_call_repetition_count >= TOOL_CALL_LOOP_THRESHOLD {
+                                let loop_message = format!(
+                                    "Loop detected: tool '{}' was called repeatedly \
+with identical arguments. Stopping further tool calls for this turn to avoid \
+an infinite loop. If you intended to keep running this command, please explain \
+why and rephrase your request.",
+                                    call.tool_name,
+                                );
+
+                                let response = ResponseInputItem::FunctionCallOutput {
+                                    call_id: call.call_id.clone(),
+                                    output: FunctionCallOutputPayload {
+                                        content: loop_message,
+                                        success: Some(false),
+                                        ..Default::default()
+                                    },
+                                };
+
+                                add_completed(ProcessedResponseItem {
+                                    item,
+                                    response: Some(response),
+                                });
+
+                                let processed_items = output.try_collect().await?;
+                                return Ok(processed_items);
+                            }
+                        }
+
                         let payload_preview = call.payload.log_payload().into_owned();
                         tracing::info!("ToolCall: {} {}", call.tool_name, payload_preview);
 

@@ -323,9 +323,11 @@ fn finalize_exec_result(
                 exit_code = EXEC_TIMEOUT_EXIT_CODE;
             }
 
-            let stdout = raw_output.stdout.from_utf8_lossy();
-            let stderr = raw_output.stderr.from_utf8_lossy();
-            let aggregated_output = raw_output.aggregated_output.from_utf8_lossy();
+            // Strip ANSI codes for model consumption to avoid confusion
+            // CLI display events still have ANSI codes via ExecCommandOutputDeltaEvent
+            let stdout = raw_output.stdout.from_utf8_lossy_no_ansi();
+            let stderr = raw_output.stderr.from_utf8_lossy_no_ansi();
+            let aggregated_output = raw_output.aggregated_output.from_utf8_lossy_no_ansi();
             let exec_output = ExecToolCallOutput {
                 exit_code,
                 stdout,
@@ -468,11 +470,36 @@ impl StreamOutput<Vec<u8>> {
             truncated_after_lines: self.truncated_after_lines,
         }
     }
+
+    /// Convert to String with ANSI escape codes stripped.
+    /// This is used when sending command output to the model to avoid confusion
+    /// from terminal formatting codes.
+    pub fn from_utf8_lossy_no_ansi(&self) -> StreamOutput<String> {
+        let text = bytes_to_string_smart(&self.text);
+        StreamOutput {
+            text: strip_ansi_codes(&text),
+            truncated_after_lines: self.truncated_after_lines,
+        }
+    }
 }
 
 #[inline]
 fn append_all(dst: &mut Vec<u8>, src: &[u8]) {
     dst.extend_from_slice(src);
+}
+
+/// Strip ANSI escape sequences from a string.
+/// Preserves the text content while removing terminal formatting codes.
+fn strip_ansi_codes(text: &str) -> String {
+    // ANSI escape sequences follow the pattern: ESC [ ... letter
+    // where ESC is \x1b and ... can be various parameters
+    // This regex matches common ANSI escape sequences including:
+    // - Color codes (\x1b[31m, \x1b[0m, etc.)
+    // - Cursor movement and other control sequences
+    use once_cell::sync::Lazy;
+    static ANSI_RE: Lazy<regex::Regex> =
+        Lazy::new(|| regex::Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").unwrap());
+    ANSI_RE.replace_all(text, "").to_string()
 }
 
 #[derive(Clone, Debug)]
@@ -797,6 +824,41 @@ mod tests {
     fn sandbox_detection_ignores_non_sandbox_mode() {
         let output = make_exec_output(1, "", "Operation not permitted", "");
         assert!(!is_likely_sandbox_denied(SandboxType::None, &output));
+    }
+
+    #[test]
+    fn test_strip_ansi_codes_basic_colors() {
+        // Test basic color codes
+        let input = "\x1b[31mRed text\x1b[0m";
+        assert_eq!(super::strip_ansi_codes(input), "Red text");
+    }
+
+    #[test]
+    fn test_strip_ansi_codes_ls_style() {
+        // Test ls-style output with colors
+        let input = "\x1b[34mfile.txt\x1b[0m  \x1b[32mexecutable\x1b[0m";
+        assert_eq!(super::strip_ansi_codes(input), "file.txt  executable");
+    }
+
+    #[test]
+    fn test_strip_ansi_codes_plain_text() {
+        // Test output without ANSI codes remains unchanged
+        let input = "Plain text output";
+        assert_eq!(super::strip_ansi_codes(input), "Plain text output");
+    }
+
+    #[test]
+    fn test_strip_ansi_codes_multiple_sequences() {
+        // Test multiple ANSI sequences in one string
+        let input = "\x1b[1m\x1b[34mBold Blue\x1b[0m\x1b[31m Red \x1b[0m";
+        assert_eq!(super::strip_ansi_codes(input), "Bold Blue Red ");
+    }
+
+    #[test]
+    fn test_strip_ansi_codes_complex() {
+        // Test complex sequences with multiple parameters
+        let input = "\x1b[1;32mBold Green\x1b[0m";
+        assert_eq!(super::strip_ansi_codes(input), "Bold Green");
     }
 
     #[test]

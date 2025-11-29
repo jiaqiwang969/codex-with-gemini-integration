@@ -256,6 +256,20 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
             upgrade: None,
             show_in_picker: true,
         },
+        ModelPreset {
+            id: "gemini-3-pro-preview-codex",
+            model: "gemini-3-pro-preview-codex",
+            display_name: "gemini-3-pro-preview-codex",
+            description: "Gemini 3 Pro preview with Codex-optimized behaviour for code and tools.",
+            default_reasoning_effort: ReasoningEffort::Medium,
+            supported_reasoning_efforts: &[ReasoningEffortPreset {
+                effort: ReasoningEffort::Medium,
+                description: "Default Gemini reasoning behaviour tuned for Codex CLI.",
+            }],
+            is_default: false,
+            upgrade: None,
+            show_in_picker: true,
+        },
     ]
 });
 

@@ -229,6 +229,7 @@ pub async fn process_chat_sse<S>(
                         name: state.name.unwrap_or_default(),
                         arguments: state.arguments,
                         call_id: call_id.clone(),
+                        thought_signature: None,
                     };
                     let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
                 }

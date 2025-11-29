@@ -205,10 +205,15 @@ impl ModelClient {
             CodexErr::UnsupportedOperation("Gemini providers must define a base_url".to_string())
         })?;
 
+        let api_model = self
+            .config
+            .model
+            .strip_suffix("-codex")
+            .unwrap_or(self.config.model.as_str());
+
         let url = format!(
-            "{}/models/{}:generateContent",
+            "{}/models/{api_model}:generateContent",
             base_url.trim_end_matches('/'),
-            self.config.model
         );
 
         let instructions = prompt
@@ -226,16 +231,25 @@ impl ModelClient {
             parts: vec![GeminiPartRequest {
                 text: Some(instructions),
                 inline_data: None,
+                function_call: None,
+                function_response: None,
+                thought_signature: None,
             }],
         });
 
         let tools = build_gemini_tools(&prompt.tools);
 
+        // Ensure the active loop has thought signatures on function calls so
+        // preview models accept the request without 400/429 errors.
+        let contents = ensure_active_loop_has_thought_signatures(&contents);
+
         let request = GeminiRequest {
             system_instruction,
-            contents: std::mem::take(&mut contents),
+            contents,
             tools,
         };
+
+
 
         // Build request with Gemini-specific auth handling
         let client = build_reqwest_client();
@@ -273,6 +287,44 @@ impl ModelClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+
+            // Gemini preview models may reject tool calls when they believe a
+            // function call is missing a thought_signature. When this happens,
+            // degrade gracefully by surfacing a plain assistant message rather
+            // than hard‑failing the turn. The upstream proxy may return either
+            // 400 (Bad Request) or 429 (Too Many Requests) depending on the
+            // validation layer that catches the issue.
+            if (status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::BAD_REQUEST)
+                && body.contains("missing a `thought_signature`")
+            {
+                let mut message =
+                    "Gemini backend rejected this tool call because it expects a thought_signature \
+on shell_command. This Codex build already attempted to provide one, but the upstream \
+proxy still returned a validation error.\n\n\
+As a workaround, please run shell commands using the `codex` profile \
+instead (for example: `codex -p codex`), or execute the command manually in your terminal."
+                        .to_string();
+
+                // Include a trimmed copy of the original error for debugging.
+                if !body.trim().is_empty() {
+                    message.push_str("\n\nUpstream error:\n");
+                    let snippet = body.chars().take(2000).collect::<String>();
+                    message.push_str(&snippet);
+                }
+
+                let item = ResponseItem::Message {
+                    id: None,
+                    role: "assistant".to_string(),
+                    content: vec![ContentItem::OutputText { text: message }],
+                };
+
+                return Ok(spawn_gemini_response_stream(
+                    Some(item),
+                    "gemini-error-thought-signature".to_string(),
+                    None,
+                ));
+            }
+
             return Err(CodexErr::UnexpectedStatus(UnexpectedResponseError {
                 status,
                 body,
@@ -540,12 +592,15 @@ fn candidate_to_response_item(candidate: GeminiCandidate) -> Option<ResponseItem
     let parts = content.parts.unwrap_or_default();
     let mut response_parts = Vec::new();
     let mut function_call: Option<GeminiFunctionCall> = None;
+    let mut thought_signature: Option<String> = None;
 
     for part in parts {
         if function_call.is_none()
             && let Some(call) = part.function_call
         {
             function_call = Some(call);
+            // Capture the thought signature from the same part as the function call.
+            thought_signature = part.thought_signature.clone();
         }
 
         if let Some(text) = part.text {
@@ -568,6 +623,7 @@ fn candidate_to_response_item(candidate: GeminiCandidate) -> Option<ResponseItem
             name: call.name,
             arguments: args,
             call_id: "gemini-function-call".to_string(),
+            thought_signature,
         });
     }
 
@@ -584,6 +640,11 @@ fn candidate_to_response_item(candidate: GeminiCandidate) -> Option<ResponseItem
 
 fn build_gemini_contents(items: &[ResponseItem]) -> Vec<GeminiContentRequest> {
     let mut contents = Vec::new();
+    // Track the last function call so we can pair it with the response and
+    // propagate the Gemini 3 thought_signature back on the function response.
+    let mut last_function_call_name: Option<String> = None;
+    let mut last_function_call_thought_signature: Option<String> = None;
+
     for item in items {
         match item {
             ResponseItem::Message { role, content, .. } => {
@@ -596,16 +657,56 @@ fn build_gemini_contents(items: &[ResponseItem]) -> Vec<GeminiContentRequest> {
                     parts,
                 });
             }
-            ResponseItem::FunctionCallOutput { output, .. } => {
-                let text = output.content.clone();
-                if text.trim().is_empty() {
-                    continue;
-                }
+            // Handle FunctionCall from the model - add to history with role "model"
+            ResponseItem::FunctionCall {
+                name,
+                arguments,
+                thought_signature,
+                ..
+            } => {
+                last_function_call_name = Some(name.clone());
+                last_function_call_thought_signature = thought_signature.clone();
+                let args: serde_json::Value = serde_json::from_str(arguments)
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
                 contents.push(GeminiContentRequest {
-                    role: Some("user".to_string()),
+                    role: Some("model".to_string()),
                     parts: vec![GeminiPartRequest {
-                        text: Some(text),
+                        text: None,
                         inline_data: None,
+                        function_call: Some(GeminiFunctionCallPart {
+                            name: name.clone(),
+                            args,
+                        }),
+                        function_response: None,
+                        // Pass through the thought signature exactly as received.
+                        thought_signature: thought_signature.clone(),
+                    }],
+                });
+            }
+            // Handle FunctionCallOutput - send back to model with role "function"
+            ResponseItem::FunctionCallOutput { output, .. } => {
+                let function_name = last_function_call_name
+                    .take()
+                    .unwrap_or_else(|| "unknown_function".to_string());
+                let thought_signature = last_function_call_thought_signature.take();
+
+                // Build the response object with the output content
+                let response_value = serde_json::json!({
+                    "output": output.content.clone(),
+                    "success": output.success.unwrap_or(true)
+                });
+
+                contents.push(GeminiContentRequest {
+                    role: Some("function".to_string()),
+                    parts: vec![GeminiPartRequest {
+                        text: None,
+                        inline_data: None,
+                        function_call: None,
+                        function_response: Some(GeminiFunctionResponsePart {
+                            name: function_name,
+                            response: response_value,
+                        }),
+                        thought_signature,
                     }],
                 });
             }
@@ -634,6 +735,9 @@ fn content_to_gemini_parts(content: &[ContentItem]) -> Vec<GeminiPartRequest> {
                 parts.push(GeminiPartRequest {
                     text: Some(text.clone()),
                     inline_data: None,
+                    function_call: None,
+                    function_response: None,
+                    thought_signature: None,
                 });
             }
             ContentItem::InputImage { image_url } => {
@@ -647,6 +751,9 @@ fn content_to_gemini_parts(content: &[ContentItem]) -> Vec<GeminiPartRequest> {
                             mime_type: mime,
                             data,
                         }),
+                        function_call: None,
+                        function_response: None,
+                        thought_signature: None,
                     });
                 } else if !image_url.trim().is_empty() {
                     // Fallback: preserve the URL as plain text hint when we cannot
@@ -655,12 +762,51 @@ fn content_to_gemini_parts(content: &[ContentItem]) -> Vec<GeminiPartRequest> {
                     parts.push(GeminiPartRequest {
                         text: Some(format!("Image reference: {image_url}")),
                         inline_data: None,
+                        function_call: None,
+                        function_response: None,
+                        thought_signature: None,
                     });
                 }
             }
         }
     }
     parts
+}
+
+/// Ensures the active loop contains thought signatures on function calls.
+///
+/// This mirrors the logic in the upstream Gemini CLI:
+/// - Find the start of the "active loop" as the last `user` turn that
+///   contains a text part.
+/// - For every subsequent `model` turn, ensure the first `functionCall`
+///   part has a `thoughtSignature`. If missing, synthesize one so that
+///   the Gemini preview models accept the request.
+fn ensure_active_loop_has_thought_signatures(
+    contents: &[GeminiContentRequest],
+) -> Vec<GeminiContentRequest> {
+    const SYNTHETIC_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
+
+    let mut new_contents = contents.to_vec();
+    // Scan all turns, not just the active loop, to ensure history validity.
+    for content in &mut new_contents {
+        if !content
+            .role
+            .as_deref()
+            .map_or(false, |role| role.eq_ignore_ascii_case("model"))
+        {
+            continue;
+        }
+
+        for part in &mut content.parts {
+            if part.function_call.is_some() {
+                if part.thought_signature.is_none() {
+                    part.thought_signature = Some(SYNTHETIC_THOUGHT_SIGNATURE.to_string());
+                }
+            }
+        }
+    }
+
+    new_contents
 }
 
 fn parse_data_url(url: &str) -> Option<(String, String)> {
@@ -741,7 +887,7 @@ struct GeminiRequest {
     tools: Option<Vec<GeminiTool>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct GeminiContentRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -749,16 +895,23 @@ struct GeminiContentRequest {
     parts: Vec<GeminiPartRequest>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct GeminiPartRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     inline_data: Option<GeminiInlineData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    function_call: Option<GeminiFunctionCallPart>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    function_response: Option<GeminiFunctionResponsePart>,
+    /// Gemini 3 thought signature - must be returned exactly as received
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thought_signature: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct GeminiInlineData {
     mime_type: String,
     data: String,
@@ -790,6 +943,10 @@ struct GeminiPartResponse {
 
     #[serde(rename = "functionCall", default, alias = "function_call")]
     function_call: Option<GeminiFunctionCall>,
+
+    /// Gemini 3 thought signature - must be preserved and returned in subsequent requests
+    #[serde(rename = "thoughtSignature", default)]
+    thought_signature: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -798,6 +955,22 @@ struct GeminiFunctionCall {
     name: String,
     #[serde(default)]
     args: serde_json::Value,
+}
+
+/// Used in request parts to represent a function call from the model (for history replay).
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct GeminiFunctionCallPart {
+    name: String,
+    args: serde_json::Value,
+}
+
+/// Used in request parts to represent a function response back to the model.
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct GeminiFunctionResponsePart {
+    name: String,
+    response: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -980,5 +1153,83 @@ impl SseTelemetry for ApiTelemetry {
         duration: Duration,
     ) {
         self.otel_event_manager.log_sse_event(result, duration);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_ensure_active_loop_fixes_all_turns() {
+        let contents = vec![
+            GeminiContentRequest {
+                role: Some("user".to_string()),
+                parts: vec![GeminiPartRequest {
+                    text: Some("turn 1".to_string()),
+                    inline_data: None,
+                    function_call: None,
+                    function_response: None,
+                    thought_signature: None,
+                }],
+            },
+            GeminiContentRequest {
+                role: Some("model".to_string()),
+                parts: vec![GeminiPartRequest {
+                    text: None,
+                    inline_data: None,
+                    function_call: Some(GeminiFunctionCallPart {
+                        name: "func1".to_string(),
+                        args: json!({}),
+                    }),
+                    function_response: None,
+                    thought_signature: None,
+                }],
+            },
+            GeminiContentRequest {
+                role: Some("user".to_string()),
+                parts: vec![GeminiPartRequest {
+                    text: Some("turn 2".to_string()),
+                    inline_data: None,
+                    function_call: None,
+                    function_response: None,
+                    thought_signature: None,
+                }],
+            },
+            GeminiContentRequest {
+                role: Some("model".to_string()),
+                parts: vec![GeminiPartRequest {
+                    text: None,
+                    inline_data: None,
+                    function_call: Some(GeminiFunctionCallPart {
+                        name: "func2".to_string(),
+                        args: json!({}),
+                    }),
+                    function_response: None,
+                    thought_signature: None,
+                }],
+            },
+        ];
+
+        let processed = ensure_active_loop_has_thought_signatures(&contents);
+
+        assert_eq!(processed.len(), 4);
+        
+        // Turn 1 Model (Index 1) - Should be fixed if we scan everything
+        assert_eq!(processed[1].role.as_deref(), Some("model"));
+        assert_eq!(
+            processed[1].parts[0].thought_signature.as_deref(),
+            Some("skip_thought_signature_validator"),
+            "Earlier model turn should have thought signature"
+        );
+
+        // Turn 2 Model (Index 3) - Should be fixed
+        assert_eq!(processed[3].role.as_deref(), Some("model"));
+        assert_eq!(
+            processed[3].parts[0].thought_signature.as_deref(),
+            Some("skip_thought_signature_validator"),
+            "Latest model turn should have thought signature"
+        );
     }
 }
