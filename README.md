@@ -28,7 +28,16 @@
    export GEMINI_COOKIE="SITE_TOTAL_ID=xxx"
    ```
 
-2. 编译二进制（参考下方 [Install & build](./docs/install.md)）后，使用方式示例：
+2. 编译二进制：
+
+   ```shell
+   # 确保在 codex-rs 目录下编译
+   cd codex-rs
+   cargo build --release
+   cd ..
+   ```
+
+   编译完成后，使用方式示例：
 
    ```shell
    # 使用 Gemini

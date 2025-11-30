@@ -219,7 +219,7 @@ impl ModelClient {
         let instructions = prompt
             .get_full_instructions(&self.config.model_family)
             .into_owned();
-        let mut contents = build_gemini_contents(&prompt.get_formatted_input());
+        let contents = build_gemini_contents(&prompt.get_formatted_input());
         if contents.is_empty() {
             return Err(CodexErr::UnsupportedOperation(
                 "Gemini requests require at least one message".to_string(),
@@ -234,6 +234,7 @@ impl ModelClient {
                 function_call: None,
                 function_response: None,
                 thought_signature: None,
+                compat_thought_signature: None,
             }],
         });
 
@@ -249,7 +250,11 @@ impl ModelClient {
             tools,
         };
 
-
+        // Optional debug hook to inspect the exact Gemini request payload.
+        if std::env::var("CODEX_DEBUG_GEMINI_REQUEST").is_ok()
+            && let Ok(json) = serde_json::to_string_pretty(&request) {
+                eprintln!("DEBUG GEMINI REQUEST:\n{json}");
+            }
 
         // Build request with Gemini-specific auth handling
         let client = build_reqwest_client();
@@ -259,12 +264,15 @@ impl ModelClient {
         // directly below.
         req_builder = self.provider.apply_http_headers(req_builder);
 
-        // Try to get GEMINI_API_KEY from auth.json first, then fall back to env var
-        let gemini_api_key = crate::auth::read_gemini_api_key_from_auth_json(
-            &self.config.codex_home,
-            self.config.cli_auth_credentials_store_mode,
-        )
-        .or_else(crate::auth::read_gemini_api_key_from_env);
+        // Prefer GEMINI_API_KEY from the environment, then fall back to auth.json.
+        // This matches the documented behaviour where a dedicated Gemini key
+        // in the env takes precedence over the shared key stored in auth.json.
+        let gemini_api_key = crate::auth::read_gemini_api_key_from_env().or_else(|| {
+            crate::auth::read_gemini_api_key_from_auth_json(
+                &self.config.codex_home,
+                self.config.cli_auth_credentials_store_mode,
+            )
+        });
 
         if let Some(api_key) = gemini_api_key {
             // Override any existing X-Goog-Api-Key header so we can prefer
@@ -316,6 +324,7 @@ instead (for example: `codex -p codex`), or execute the command manually in your
                     id: None,
                     role: "assistant".to_string(),
                     content: vec![ContentItem::OutputText { text: message }],
+                    thought_signature: None,
                 };
 
                 return Ok(spawn_gemini_response_stream(
@@ -592,15 +601,20 @@ fn candidate_to_response_item(candidate: GeminiCandidate) -> Option<ResponseItem
     let parts = content.parts.unwrap_or_default();
     let mut response_parts = Vec::new();
     let mut function_call: Option<GeminiFunctionCall> = None;
-    let mut thought_signature: Option<String> = None;
+    let mut function_call_thought_signature: Option<String> = None;
+    let mut last_part_thought_signature: Option<String> = None;
 
     for part in parts {
+        if let Some(sig) = &part.thought_signature {
+            last_part_thought_signature = Some(sig.clone());
+        }
+
         if function_call.is_none()
             && let Some(call) = part.function_call
         {
             function_call = Some(call);
             // Capture the thought signature from the same part as the function call.
-            thought_signature = part.thought_signature.clone();
+            function_call_thought_signature = part.thought_signature.clone();
         }
 
         if let Some(text) = part.text {
@@ -612,6 +626,13 @@ fn candidate_to_response_item(candidate: GeminiCandidate) -> Option<ResponseItem
     }
 
     if let Some(call) = function_call {
+        // Prefer a thought signature that was attached to the same part as the
+        // function call. If the provider instead attached the thoughtSignature
+        // to a different part (for example, a trailing text part that closes
+        // the step), fall back to the last observed signature for this
+        // message so we do not drop it when replaying the call.
+        let thought_signature = function_call_thought_signature.or(last_part_thought_signature);
+
         let args = if call.args.is_null() {
             "{}".to_string()
         } else {
@@ -634,6 +655,7 @@ fn candidate_to_response_item(candidate: GeminiCandidate) -> Option<ResponseItem
             id: None,
             role: "assistant".to_string(),
             content: response_parts,
+            thought_signature: last_part_thought_signature,
         })
     }
 }
@@ -647,8 +669,13 @@ fn build_gemini_contents(items: &[ResponseItem]) -> Vec<GeminiContentRequest> {
 
     for item in items {
         match item {
-            ResponseItem::Message { role, content, .. } => {
-                let parts = content_to_gemini_parts(content);
+            ResponseItem::Message {
+                role,
+                content,
+                thought_signature,
+                ..
+            } => {
+                let parts = content_to_gemini_parts(content, thought_signature.as_deref());
                 if parts.is_empty() {
                     continue;
                 }
@@ -668,6 +695,7 @@ fn build_gemini_contents(items: &[ResponseItem]) -> Vec<GeminiContentRequest> {
                 last_function_call_thought_signature = thought_signature.clone();
                 let args: serde_json::Value = serde_json::from_str(arguments)
                     .unwrap_or(serde_json::Value::Object(Default::default()));
+                let part_thought_signature = thought_signature.clone();
                 contents.push(GeminiContentRequest {
                     role: Some("model".to_string()),
                     parts: vec![GeminiPartRequest {
@@ -679,7 +707,8 @@ fn build_gemini_contents(items: &[ResponseItem]) -> Vec<GeminiContentRequest> {
                         }),
                         function_response: None,
                         // Pass through the thought signature exactly as received.
-                        thought_signature: thought_signature.clone(),
+                        thought_signature: part_thought_signature.clone(),
+                        compat_thought_signature: part_thought_signature,
                     }],
                 });
             }
@@ -695,6 +724,7 @@ fn build_gemini_contents(items: &[ResponseItem]) -> Vec<GeminiContentRequest> {
                     "output": output.content.clone(),
                     "success": output.success.unwrap_or(true)
                 });
+                let part_thought_signature = thought_signature.clone();
 
                 contents.push(GeminiContentRequest {
                     role: Some("function".to_string()),
@@ -706,7 +736,8 @@ fn build_gemini_contents(items: &[ResponseItem]) -> Vec<GeminiContentRequest> {
                             name: function_name,
                             response: response_value,
                         }),
-                        thought_signature,
+                        thought_signature: part_thought_signature.clone(),
+                        compat_thought_signature: part_thought_signature,
                     }],
                 });
             }
@@ -724,7 +755,10 @@ fn map_gemini_role(role: &str) -> String {
     }
 }
 
-fn content_to_gemini_parts(content: &[ContentItem]) -> Vec<GeminiPartRequest> {
+fn content_to_gemini_parts(
+    content: &[ContentItem],
+    message_thought_signature: Option<&str>,
+) -> Vec<GeminiPartRequest> {
     let mut parts = Vec::new();
     for entry in content {
         match entry {
@@ -738,6 +772,7 @@ fn content_to_gemini_parts(content: &[ContentItem]) -> Vec<GeminiPartRequest> {
                     function_call: None,
                     function_response: None,
                     thought_signature: None,
+                    compat_thought_signature: None,
                 });
             }
             ContentItem::InputImage { image_url } => {
@@ -754,6 +789,7 @@ fn content_to_gemini_parts(content: &[ContentItem]) -> Vec<GeminiPartRequest> {
                         function_call: None,
                         function_response: None,
                         thought_signature: None,
+                        compat_thought_signature: None,
                     });
                 } else if !image_url.trim().is_empty() {
                     // Fallback: preserve the URL as plain text hint when we cannot
@@ -765,40 +801,74 @@ fn content_to_gemini_parts(content: &[ContentItem]) -> Vec<GeminiPartRequest> {
                         function_call: None,
                         function_response: None,
                         thought_signature: None,
+                        compat_thought_signature: None,
                     });
                 }
             }
         }
     }
+    if let Some(sig) = message_thought_signature
+        && !parts.is_empty()
+        && let Some(last) = parts.last_mut()
+            && last.thought_signature.is_none() {
+                last.thought_signature = Some(sig.to_string());
+                last.compat_thought_signature = Some(sig.to_string());
+            }
     parts
 }
 
-/// Ensures the active loop contains thought signatures on function calls.
-///
-/// This mirrors the logic in the upstream Gemini CLI:
-/// - Find the start of the "active loop" as the last `user` turn that
-///   contains a text part.
-/// - For every subsequent `model` turn, ensure the first `functionCall`
-///   part has a `thoughtSignature`. If missing, synthesize one so that
-///   the Gemini preview models accept the request.
 fn ensure_active_loop_has_thought_signatures(
     contents: &[GeminiContentRequest],
 ) -> Vec<GeminiContentRequest> {
     const SYNTHETIC_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
 
     let mut new_contents = contents.to_vec();
-    // Scan all turns, not just the active loop, to ensure history validity.
-    for content in &mut new_contents {
+    // Find the start of the "active loop" as the last `user` turn that
+    // contains a non‑empty text part. Gemini only validates thought signatures
+    // for the current turn, so we avoid mutating earlier history.
+    let mut last_user_with_text: Option<usize> = None;
+    for (idx, content) in new_contents.iter().enumerate() {
         if !content
             .role
             .as_deref()
-            .map_or(false, |role| role.eq_ignore_ascii_case("model"))
+            .is_some_and(|role| role.eq_ignore_ascii_case("user"))
         {
             continue;
         }
 
+        if content
+            .parts
+            .iter()
+            .any(|part| part.text.as_deref().is_some_and(|t| !t.trim().is_empty()))
+        {
+            last_user_with_text = Some(idx);
+        }
+    }
+
+    let Some(start) = last_user_with_text.and_then(|idx| idx.checked_add(1)) else {
+        return new_contents;
+    };
+    if start >= new_contents.len() {
+        return new_contents;
+    }
+
+    // For every subsequent `model` turn in the active loop, ensure the first
+    // `functionCall` part has a `thoughtSignature`. If the model did not
+    // produce one (for example when history was injected), synthesize the
+    // recommended dummy signature so Gemini accepts the request.
+    for content in &mut new_contents[start..] {
+        if !content
+            .role
+            .as_deref()
+            .is_some_and(|role| role.eq_ignore_ascii_case("model"))
+        {
+            continue;
+        }
+
+        let mut patched_first_call = false;
         for part in &mut content.parts {
-            if part.function_call.is_some() {
+            if part.function_call.is_some() && !patched_first_call {
+                patched_first_call = true;
                 if part.thought_signature.is_none() {
                     part.thought_signature = Some(SYNTHETIC_THOUGHT_SIGNATURE.to_string());
                 }
@@ -906,9 +976,16 @@ struct GeminiPartRequest {
     function_call: Option<GeminiFunctionCallPart>,
     #[serde(skip_serializing_if = "Option::is_none")]
     function_response: Option<GeminiFunctionResponsePart>,
-    /// Gemini 3 thought signature - must be returned exactly as received
+    /// Gemini 3 thought signature - must be returned exactly as received.
+    /// Serialized as `thoughtSignature` for the Gemini API.
     #[serde(skip_serializing_if = "Option::is_none")]
     thought_signature: Option<String>,
+    /// Compatibility alias for providers that expect `thought_signature`
+    /// on function call parts (for example, upstream proxies that validate
+    /// thought signatures using snake_case field names). This is always
+    /// serialized with the same value as `thoughtSignature` when present.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "thought_signature")]
+    compat_thought_signature: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -1172,6 +1249,7 @@ mod tests {
                     function_call: None,
                     function_response: None,
                     thought_signature: None,
+                    compat_thought_signature: None,
                 }],
             },
             GeminiContentRequest {
@@ -1185,6 +1263,7 @@ mod tests {
                     }),
                     function_response: None,
                     thought_signature: None,
+                    compat_thought_signature: None,
                 }],
             },
             GeminiContentRequest {
@@ -1195,6 +1274,7 @@ mod tests {
                     function_call: None,
                     function_response: None,
                     thought_signature: None,
+                    compat_thought_signature: None,
                 }],
             },
             GeminiContentRequest {
@@ -1208,6 +1288,7 @@ mod tests {
                     }),
                     function_response: None,
                     thought_signature: None,
+                    compat_thought_signature: None,
                 }],
             },
         ];
@@ -1215,13 +1296,11 @@ mod tests {
         let processed = ensure_active_loop_has_thought_signatures(&contents);
 
         assert_eq!(processed.len(), 4);
-        
-        // Turn 1 Model (Index 1) - Should be fixed if we scan everything
+        // Only the active loop (after the last user-with-text turn) should be patched.
         assert_eq!(processed[1].role.as_deref(), Some("model"));
-        assert_eq!(
-            processed[1].parts[0].thought_signature.as_deref(),
-            Some("skip_thought_signature_validator"),
-            "Earlier model turn should have thought signature"
+        assert!(
+            processed[1].parts[0].thought_signature.is_none(),
+            "Earlier model turn outside active loop should remain unchanged"
         );
 
         // Turn 2 Model (Index 3) - Should be fixed
@@ -1229,7 +1308,84 @@ mod tests {
         assert_eq!(
             processed[3].parts[0].thought_signature.as_deref(),
             Some("skip_thought_signature_validator"),
-            "Latest model turn should have thought signature"
+            "Latest model turn in active loop should have thought signature"
         );
+    }
+
+    #[test]
+    fn candidate_to_response_item_captures_function_call_thought_signature() {
+        let body: GeminiResponse = serde_json::from_value(json!({
+            "responseId": "resp-1",
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "functionCall": {
+                                    "name": "shell_command",
+                                    "args": { "command": "ls" }
+                                },
+                                "thoughtSignature": "sig-func-part"
+                            }
+                        ]
+                    }
+                }
+            ]
+        }))
+        .unwrap();
+
+        let parsed = parse_gemini_response(body).unwrap();
+        let item = parsed.response_item.expect("expected response item");
+        match item {
+            ResponseItem::FunctionCall {
+                name,
+                thought_signature,
+                ..
+            } => {
+                assert_eq!(name, "shell_command");
+                assert_eq!(thought_signature.as_deref(), Some("sig-func-part"));
+            }
+            other => panic!("expected FunctionCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn candidate_to_response_item_uses_last_part_thought_signature_for_function_call() {
+        let body: GeminiResponse = serde_json::from_value(json!({
+            "responseId": "resp-1",
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "functionCall": {
+                                    "name": "shell_command",
+                                    "args": { "command": "ls" }
+                                }
+                            },
+                            {
+                                "text": "running command",
+                                "thoughtSignature": "sig-last-part"
+                            }
+                        ]
+                    }
+                }
+            ]
+        }))
+        .unwrap();
+
+        let parsed = parse_gemini_response(body).unwrap();
+        let item = parsed.response_item.expect("expected response item");
+        match item {
+            ResponseItem::FunctionCall {
+                name,
+                thought_signature,
+                ..
+            } => {
+                assert_eq!(name, "shell_command");
+                assert_eq!(thought_signature.as_deref(), Some("sig-last-part"));
+            }
+            other => panic!("expected FunctionCall, got {other:?}"),
+        }
     }
 }

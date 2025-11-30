@@ -619,6 +619,7 @@ async fn test_tail_includes_last_response_items() -> Result<()> {
                 content: vec![ContentItem::OutputText {
                     text: format!("reply-{idx}"),
                 }],
+                thought_signature: None,
             }),
         };
         writeln!(file, "{}", serde_json::to_string(&response_line)?)?;
@@ -711,6 +712,7 @@ async fn test_tail_handles_short_sessions() -> Result<()> {
                 content: vec![ContentItem::OutputText {
                     text: format!("short-{idx}"),
                 }],
+                thought_signature: None,
             }),
         };
         writeln!(file, "{}", serde_json::to_string(&response_line)?)?;
@@ -805,6 +807,7 @@ async fn test_tail_skips_trailing_non_responses() -> Result<()> {
                 content: vec![ContentItem::OutputText {
                     text: format!("response-{idx}"),
                 }],
+                thought_signature: None,
             }),
         };
         writeln!(file, "{}", serde_json::to_string(&response_line)?)?;

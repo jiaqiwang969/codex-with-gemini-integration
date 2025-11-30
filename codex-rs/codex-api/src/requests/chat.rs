@@ -365,6 +365,7 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: "hi".to_string(),
             }],
+            thought_signature: None,
         }];
         let req = ChatRequestBuilder::new("gpt-test", "inst", &prompt_input, &[])
             .conversation_id(Some("conv-1".into()))

@@ -202,6 +202,7 @@ async fn thread_resume_supports_history_and_overrides() -> Result<()> {
         content: vec![ContentItem::InputText {
             text: history_text.to_string(),
         }],
+        thought_signature: None,
     }];
 
     // Resume with explicit history and override the model.

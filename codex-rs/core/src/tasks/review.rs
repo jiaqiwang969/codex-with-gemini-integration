@@ -222,6 +222,7 @@ pub(crate) async fn exit_review_mode(
                     id: None,
                     role: "user".to_string(),
                     content: vec![ContentItem::InputText { text: user_message }],
+                    thought_signature: None,
                 }],
             )
             .await;

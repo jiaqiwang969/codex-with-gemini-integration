@@ -303,6 +303,7 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: text.to_string(),
             }],
+            thought_signature: None,
         }
     }
     fn assistant_msg(text: &str) -> ResponseItem {
@@ -312,6 +313,7 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: text.to_string(),
             }],
+            thought_signature: None,
         }
     }
 

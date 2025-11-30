@@ -117,6 +117,7 @@ pub(crate) async fn assess_command(
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText { text: user_prompt }],
+            thought_signature: None,
         }],
         tools: Vec::new(),
         parallel_tool_calls: false,

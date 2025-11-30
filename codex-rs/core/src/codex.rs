@@ -3126,6 +3126,7 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: "first user".to_string(),
             }],
+            thought_signature: None,
         };
         live_history.record_items(std::iter::once(&user1), turn_context.truncation_policy);
         rollout_items.push(RolloutItem::ResponseItem(user1.clone()));
@@ -3136,6 +3137,7 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: "assistant reply one".to_string(),
             }],
+            thought_signature: None,
         };
         live_history.record_items(std::iter::once(&assistant1), turn_context.truncation_policy);
         rollout_items.push(RolloutItem::ResponseItem(assistant1.clone()));
@@ -3160,6 +3162,7 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: "second user".to_string(),
             }],
+            thought_signature: None,
         };
         live_history.record_items(std::iter::once(&user2), turn_context.truncation_policy);
         rollout_items.push(RolloutItem::ResponseItem(user2.clone()));
@@ -3170,6 +3173,7 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: "assistant reply two".to_string(),
             }],
+            thought_signature: None,
         };
         live_history.record_items(std::iter::once(&assistant2), turn_context.truncation_policy);
         rollout_items.push(RolloutItem::ResponseItem(assistant2.clone()));
@@ -3194,6 +3198,7 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: "third user".to_string(),
             }],
+            thought_signature: None,
         };
         live_history.record_items(std::iter::once(&user3), turn_context.truncation_policy);
         rollout_items.push(RolloutItem::ResponseItem(user3.clone()));
@@ -3204,6 +3209,7 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: "assistant reply three".to_string(),
             }],
+            thought_signature: None,
         };
         live_history.record_items(std::iter::once(&assistant3), turn_context.truncation_policy);
         rollout_items.push(RolloutItem::ResponseItem(assistant3.clone()));

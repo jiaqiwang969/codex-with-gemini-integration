@@ -53,6 +53,13 @@ pub enum ResponseItem {
         id: Option<String>,
         role: String,
         content: Vec<ContentItem>,
+        /// Optional Gemini thought signature for pure text/model messages.
+        /// This is never serialized on the protocol wire; it is only used
+        /// internally to help Gemini integrations preserve and replay
+        /// thoughtSignature fields between turns.
+        #[serde(default, skip_serializing)]
+        #[ts(skip)]
+        thought_signature: Option<String>,
     },
     Reasoning {
         #[serde(default, skip_serializing)]
@@ -185,6 +192,7 @@ impl From<ResponseInputItem> for ResponseItem {
                 role,
                 content,
                 id: None,
+                thought_signature: None,
             },
             ResponseInputItem::FunctionCallOutput { call_id, output } => {
                 Self::FunctionCallOutput { call_id, output }

@@ -22,6 +22,7 @@ fn assistant_msg(text: &str) -> ResponseItem {
         content: vec![ContentItem::OutputText {
             text: text.to_string(),
         }],
+        thought_signature: None,
     }
 }
 
@@ -40,6 +41,7 @@ fn user_msg(text: &str) -> ResponseItem {
         content: vec![ContentItem::OutputText {
             text: text.to_string(),
         }],
+        thought_signature: None,
     }
 }
 
@@ -82,6 +84,7 @@ fn filters_non_api_messages() {
         content: vec![ContentItem::OutputText {
             text: "ignored".to_string(),
         }],
+        thought_signature: None,
     };
     let reasoning = reasoning_msg("thinking...");
     h.record_items([&system, &reasoning, &ResponseItem::Other], policy);
@@ -110,14 +113,16 @@ fn filters_non_api_messages() {
                 role: "user".to_string(),
                 content: vec![ContentItem::OutputText {
                     text: "hi".to_string()
-                }]
+                }],
+                thought_signature: None,
             },
             ResponseItem::Message {
                 id: None,
                 role: "assistant".to_string(),
                 content: vec![ContentItem::OutputText {
                     text: "hello".to_string()
-                }]
+                }],
+                thought_signature: None,
             }
         ]
     );

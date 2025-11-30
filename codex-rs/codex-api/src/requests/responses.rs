@@ -205,11 +205,13 @@ mod tests {
                 id: Some("m1".into()),
                 role: "assistant".into(),
                 content: Vec::new(),
+                thought_signature: None,
             },
             ResponseItem::Message {
                 id: None,
                 role: "assistant".into(),
                 content: Vec::new(),
+                thought_signature: None,
             },
         ];
 

@@ -1941,6 +1941,7 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
         content: vec![codex_protocol::models::ContentItem::OutputText {
             text: "REMOTE_COMPACT_SUMMARY".to_string(),
         }],
+        thought_signature: None,
     }];
     let compact_mock =
         mount_compact_json_once(&server, serde_json::json!({ "output": compacted_history })).await;

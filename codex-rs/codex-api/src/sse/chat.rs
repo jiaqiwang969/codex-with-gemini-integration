@@ -248,6 +248,7 @@ async fn append_assistant_text(
             id: None,
             role: "assistant".to_string(),
             content: vec![],
+            thought_signature: None,
         };
         *assistant_item = Some(item.clone());
         let _ = tx_event

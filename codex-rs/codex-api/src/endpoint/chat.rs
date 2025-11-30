@@ -179,6 +179,7 @@ impl Stream for AggregatedStream {
                             content: vec![ContentItem::OutputText {
                                 text: std::mem::take(&mut this.cumulative),
                             }],
+                            thought_signature: None,
                         };
                         this.pending
                             .push_back(ResponseEvent::OutputItemDone(aggregated_message));

@@ -90,6 +90,7 @@ async fn responses_stream_includes_subagent_header_on_review() {
         content: vec![ContentItem::InputText {
             text: "hello".into(),
         }],
+        thought_signature: None,
     }];
 
     let mut stream = client.stream(&prompt).await.expect("stream failed");
@@ -181,6 +182,7 @@ async fn responses_stream_includes_subagent_header_on_other() {
         content: vec![ContentItem::InputText {
             text: "hello".into(),
         }],
+        thought_signature: None,
     }];
 
     let mut stream = client.stream(&prompt).await.expect("stream failed");

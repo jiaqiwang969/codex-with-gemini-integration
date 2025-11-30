@@ -186,6 +186,7 @@ impl From<EnvironmentContext> for ResponseItem {
             content: vec![ContentItem::InputText {
                 text: ec.serialize_to_xml(),
             }],
+            thought_signature: None,
         }
     }
 }

@@ -37,6 +37,7 @@ impl From<UserInstructions> for ResponseItem {
                     contents = ui.text
                 ),
             }],
+            thought_signature: None,
         }
     }
 }
@@ -65,6 +66,7 @@ impl From<DeveloperInstructions> for ResponseItem {
             content: vec![ContentItem::InputText {
                 text: di.into_text(),
             }],
+            thought_signature: None,
         }
     }
 }
