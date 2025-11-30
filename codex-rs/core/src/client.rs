@@ -241,13 +241,20 @@ impl ModelClient {
         let tools = build_gemini_tools(&prompt.tools);
 
         // Ensure the active loop has thought signatures on function calls so
-        // preview models accept the request without 400/429 errors.
-        let contents = ensure_active_loop_has_thought_signatures(&contents);
+       // preview models accept the request without 400/429 errors.
+       let contents = ensure_active_loop_has_thought_signatures(&contents);
+
+        let thinking_level = if api_model.contains("thinking") {
+            Some("high".to_string())
+        } else {
+            None
+        };
 
         let request = GeminiRequest {
             system_instruction,
             contents,
             tools,
+            thinking_level,
         };
 
         // Optional debug hook to inspect the exact Gemini request payload.
@@ -955,6 +962,8 @@ struct GeminiRequest {
     contents: Vec<GeminiContentRequest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<GeminiTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_level: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
