@@ -245,12 +245,12 @@ impl ModelClient {
        let contents = ensure_active_loop_has_thought_signatures(&contents);
 
         let thinking_level = if api_model.contains("thinking") {
-            Some("high".to_string())
-        } else {
-            None
-        };
+           Some("high".to_string())
+       } else {
+            Some("low".to_string())
+       };
 
-        let request = GeminiRequest {
+       let request = GeminiRequest {
             system_instruction,
             contents,
             tools,
