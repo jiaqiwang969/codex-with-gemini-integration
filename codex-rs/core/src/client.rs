@@ -257,13 +257,18 @@ impl ModelClient {
        };
 
         // Build generationConfig with thinkingConfig nested properly
+        // Using Gemini CLI defaults: temperature=1, topP=0.95, topK=64
+        // thinkingBudget capped at 8192 to prevent run-away thinking loops
+        let is_thinking_model = api_model.contains("thinking");
         let generation_config = Some(GeminiGenerationConfig {
-            temperature: None,
-            top_k: None,
-            top_p: None,
-            max_output_tokens: None,
+            temperature: Some(1.0),
+            top_k: Some(64),
+            top_p: Some(0.95),
+            max_output_tokens: None, // Let the model decide
             thinking_config: Some(GeminiThinkingConfig {
                 thinking_level,
+                include_thoughts: if is_thinking_model { Some(true) } else { None },
+                thinking_budget: if is_thinking_model { Some(8192) } else { None },
             }),
         });
 
@@ -326,16 +331,55 @@ impl ModelClient {
             req_builder = req_builder.header("x-goog-api-key", api_key);
         }
 
-        let response = self
-            .otel_event_manager
-            .log_request(1, || req_builder.json(&request).send())
-            .await
-            .map_err(|err| {
-                CodexErr::ResponseStreamFailed(ResponseStreamFailed {
-                    source: err,
-                    request_id: None,
-                })
-            })?;
+        // Retry configuration: max 3 attempts with exponential backoff
+        const MAX_ATTEMPTS: u64 = 3;
+        const INITIAL_DELAY_MS: u64 = 5000;
+        const MAX_DELAY_MS: u64 = 30000;
+
+        let mut attempt: u64 = 0;
+        let mut current_delay = INITIAL_DELAY_MS;
+
+        let response = loop {
+            attempt += 1;
+
+            let result = self
+                .otel_event_manager
+                .log_request(attempt, || req_builder.try_clone().unwrap().json(&request).send())
+                .await;
+
+            match result {
+                Ok(resp) => break resp,
+                Err(err) => {
+                    // Check if we should retry
+                    let should_retry = if let Some(status) = err.status() {
+                        // Retry on 429 (Too Many Requests) or 5xx server errors
+                        status == StatusCode::TOO_MANY_REQUESTS
+                            || (status.as_u16() >= 500 && status.as_u16() < 600)
+                    } else {
+                        // Network errors - retry
+                        err.is_connect() || err.is_timeout()
+                    };
+
+                    if should_retry && attempt < MAX_ATTEMPTS {
+                        // Exponential backoff with jitter
+                        let jitter = (current_delay as f64 * 0.3 * (rand::random::<f64>() * 2.0 - 1.0)) as u64;
+                        let delay_with_jitter = current_delay.saturating_add(jitter);
+                        debug!(
+                            "Gemini request attempt {} failed, retrying after {}ms: {}",
+                            attempt, delay_with_jitter, err
+                        );
+                        tokio::time::sleep(Duration::from_millis(delay_with_jitter)).await;
+                        current_delay = std::cmp::min(MAX_DELAY_MS, current_delay * 2);
+                        continue;
+                    }
+
+                    return Err(CodexErr::ResponseStreamFailed(ResponseStreamFailed {
+                        source: err,
+                        request_id: None,
+                    }));
+                }
+            }
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1210,6 +1254,13 @@ struct GeminiGenerationConfig {
 struct GeminiThinkingConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking_level: Option<String>,
+    /// Whether to include model's thoughts in the response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    include_thoughts: Option<bool>,
+    /// Token budget for thinking. Use -1 for no limit, 0 to disable.
+    /// Cap at 8192 to prevent run-away thinking loops (per Gemini CLI).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_budget: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]
