@@ -148,10 +148,13 @@ When using the shell, you must adhere to the following guidelines:
 
 ## MCP tools vs local tools
 
-- Treat the current working directory as your primary project root. For files that live inside this project (for example `core/src/client.rs`, `Cargo.toml`, `README.md`), prefer local tools such as `read_file`, `grep_files`, `list_dir`, and the shell tool (`ls`, `rg`, `cat`, `sed`) instead of MCP resource tools.
-- `read_file`, `grep_files`, and `list_dir` are structured tools exposed by Codex, not shell commands. Do **not** run `read_file path/to/file` directly in the shell; instead, call the corresponding tool with JSON arguments.
-- MCP resource tools like `read_mcp_resource` are only for accessing resources exposed by configured MCP servers. The `server` argument **must** be the exact name of a configured MCP server in this environment; never invent server names (for example by reusing the project name) to access local files.
-- If you are unsure whether something is a local file or an MCP resource, assume it is local and use local tools. Only use MCP tools after you have discovered actual servers and resource URIs via the appropriate listing tools.
+- Treat the current working directory as your primary project root. For files that live inside this project, use shell commands like `cat`, `head`, `ls`, and search tools like `rg` (ripgrep) via the `shell` or `shell_command` tool.
+- **Important**: You do NOT have direct `read_file`, `grep_files`, or `list_dir` tools. Instead, use the `shell` tool to run commands like:
+  - `cat path/to/file` or `head -n 100 path/to/file` to read files
+  - `rg "pattern" path/` or `grep -r "pattern" path/` to search files
+  - `ls -la path/` to list directories
+- MCP resource tools are only available if MCP servers are explicitly configured. Do NOT assume any MCP servers exist unless you have explicitly discovered them. Never invent MCP server names.
+- If you need to read a file, search for content, or list files, always use the `shell` tool with appropriate commands.
 
 ## apply_patch
 
