@@ -292,10 +292,23 @@ impl ModelClient {
             },
         ]);
 
+        // Configure function calling mode to AUTO (model decides)
+        let tool_config = if tools.is_some() {
+            Some(GeminiToolConfig {
+                function_calling_config: Some(GeminiFunctionCallingConfig {
+                    mode: GeminiFunctionCallingMode::Auto,
+                    allowed_function_names: None,
+                }),
+            })
+        } else {
+            None
+        };
+
        let request = GeminiRequest {
             system_instruction,
             contents,
             tools,
+            tool_config,
             generation_config,
             safety_settings,
         };
@@ -1229,9 +1242,46 @@ struct GeminiRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<GeminiTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    tool_config: Option<GeminiToolConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     generation_config: Option<GeminiGenerationConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     safety_settings: Option<Vec<GeminiSafetySetting>>,
+}
+
+/// Tool configuration for function calling behavior.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiToolConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    function_calling_config: Option<GeminiFunctionCallingConfig>,
+}
+
+/// Configuration for function calling mode.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiFunctionCallingConfig {
+    /// Mode of function calling: AUTO, ANY, or NONE.
+    /// - AUTO: Model decides whether to call functions
+    /// - ANY: Model must call one of the allowed functions
+    /// - NONE: Model cannot call functions
+    mode: GeminiFunctionCallingMode,
+    /// List of function names the model is allowed to call.
+    /// Only used when mode is ANY.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allowed_function_names: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[allow(dead_code)]
+enum GeminiFunctionCallingMode {
+    /// Model decides whether to call functions
+    Auto,
+    /// Model must call one of the allowed functions
+    Any,
+    /// Model cannot call functions
+    None,
 }
 
 #[derive(Debug, Serialize)]
