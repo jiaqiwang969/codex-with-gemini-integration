@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use bytes::Bytes;
 use crate::api_bridge::auth_provider_from_auth;
 use crate::api_bridge::map_api_error;
 use codex_api::AggregateStreamExt;
@@ -27,7 +28,9 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionSource;
 use eventsource_stream::Event;
 use eventsource_stream::EventStreamError;
+use eventsource_stream::Eventsource;
 use futures::StreamExt;
+use futures::TryStreamExt;
 use http::HeaderMap as ApiHeaderMap;
 use http::HeaderValue;
 use http::StatusCode as HttpStatusCode;
@@ -37,6 +40,8 @@ use serde::Serialize;
 use serde_json::Value;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::timeout;
+use tracing::debug;
 use tracing::warn;
 
 use crate::AuthManager;
@@ -211,8 +216,9 @@ impl ModelClient {
             .strip_suffix("-codex")
             .unwrap_or(self.config.model.as_str());
 
+        // Use streamGenerateContent endpoint with alt=sse for streaming
         let url = format!(
-            "{}/models/{api_model}:generateContent",
+            "{}/models/{api_model}:streamGenerateContent?alt=sse",
             base_url.trim_end_matches('/'),
         );
 
@@ -380,19 +386,11 @@ instead (for example: `codex -p codex`), or execute the command manually in your
             }));
         }
 
-        let body: GeminiResponse = response.json().await.map_err(|err| {
-            CodexErr::ResponseStreamFailed(ResponseStreamFailed {
-                source: err,
-                request_id: None,
-            })
-        })?;
-        let parsed = parse_gemini_response(body)?;
+        // Stream the SSE response
+        let idle_timeout = self.provider.stream_idle_timeout();
+        let byte_stream = response.bytes_stream();
 
-        Ok(spawn_gemini_response_stream(
-            parsed.response_item,
-            parsed.response_id,
-            parsed.token_usage,
-        ))
+        Ok(spawn_gemini_sse_stream(byte_stream, idle_timeout))
     }
 
     /// Streams a turn via the OpenAI Responses API.
@@ -612,12 +610,203 @@ fn spawn_gemini_response_stream(
     ResponseStream { rx_event }
 }
 
+/// Spawns a task that processes Gemini SSE stream and converts it to ResponseStream.
+fn spawn_gemini_sse_stream<S>(byte_stream: S, idle_timeout: Duration) -> ResponseStream
+where
+    S: futures::Stream<Item = std::result::Result<Bytes, reqwest::Error>>
+        + Unpin
+        + Send
+        + 'static,
+{
+    let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
+    tokio::spawn(async move {
+        process_gemini_sse(byte_stream, tx_event, idle_timeout).await;
+    });
+    ResponseStream { rx_event }
+}
+
+/// Processes Gemini SSE stream and emits ResponseEvents.
+async fn process_gemini_sse<S>(
+    stream: S,
+    tx_event: mpsc::Sender<Result<ResponseEvent>>,
+    idle_timeout: Duration,
+) where
+    S: futures::Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Unpin,
+{
+    // Send Created event first
+    if tx_event.send(Ok(ResponseEvent::Created)).await.is_err() {
+        return;
+    }
+
+    let mut stream = stream
+        .map_ok(|b| b)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        .eventsource();
+
+    // State for accumulating response
+    let mut accumulated_text = String::new();
+    let mut assistant_item_sent = false;
+    let mut function_call: Option<(String, String, Option<String>)> = None; // (name, args, thought_signature)
+    let mut last_response_id = "gemini-stream".to_string();
+    let mut last_token_usage: Option<TokenUsage> = None;
+    let mut last_thought_signature: Option<String> = None;
+
+    loop {
+        let response = timeout(idle_timeout, stream.next()).await;
+
+        let sse = match response {
+            Ok(Some(Ok(sse))) => sse,
+            Ok(Some(Err(e))) => {
+                debug!("Gemini SSE stream error: {}", e);
+                // Don't send error, just break and emit what we have
+                break;
+            }
+            Ok(None) => {
+                // Stream ended - emit final items
+                break;
+            }
+            Err(_) => {
+                debug!("Gemini SSE idle timeout");
+                // On timeout, emit what we have accumulated
+                break;
+            }
+        };
+
+        // Skip empty data
+        if sse.data.trim().is_empty() {
+            continue;
+        }
+
+        // Parse the JSON chunk
+        let chunk: GeminiResponse = match serde_json::from_str(&sse.data) {
+            Ok(val) => val,
+            Err(err) => {
+                debug!(
+                    "Failed to parse Gemini SSE event: {err}, data: {}",
+                    &sse.data
+                );
+                continue;
+            }
+        };
+
+        // Update response ID and token usage if present
+        if let Some(id) = chunk.response_id {
+            last_response_id = id;
+        }
+        if let Some(usage) = chunk.usage_metadata {
+            last_token_usage = Some(usage.into());
+        }
+
+        // Process candidates
+        if let Some(candidates) = chunk.candidates {
+            for candidate in candidates {
+                if let Some(content) = candidate.content {
+                    if let Some(parts) = content.parts {
+                        for part in parts {
+                            // Track thought signature
+                            if let Some(sig) = &part.thought_signature {
+                                last_thought_signature = Some(sig.clone());
+                            }
+
+                            // Handle text content
+                            if let Some(text) = part.text {
+                                if !text.is_empty() {
+                                    // Send OutputItemAdded on first text
+                                    if !assistant_item_sent {
+                                        let item = ResponseItem::Message {
+                                            id: None,
+                                            role: "assistant".to_string(),
+                                            content: vec![],
+                                            thought_signature: None,
+                                        };
+                                        if tx_event
+                                            .send(Ok(ResponseEvent::OutputItemAdded(item)))
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                        assistant_item_sent = true;
+                                    }
+
+                                    // Send text delta
+                                    if tx_event
+                                        .send(Ok(ResponseEvent::OutputTextDelta(text.clone())))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                    accumulated_text.push_str(&text);
+                                }
+                            }
+
+                            // Handle function call
+                            if let Some(call) = part.function_call {
+                                let args = if call.args.is_null() {
+                                    "{}".to_string()
+                                } else {
+                                    call.args.to_string()
+                                };
+                                function_call = Some((
+                                    call.name,
+                                    args,
+                                    part.thought_signature.or(last_thought_signature.clone()),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Emit final items
+    if let Some((name, arguments, thought_signature)) = function_call {
+        // If there was a function call, emit it
+        let item = ResponseItem::FunctionCall {
+            id: None,
+            name,
+            arguments,
+            call_id: "gemini-function-call".to_string(),
+            thought_signature,
+        };
+        let _ = tx_event
+            .send(Ok(ResponseEvent::OutputItemDone(item)))
+            .await;
+    } else if assistant_item_sent {
+        // Emit the complete message
+        let item = ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: accumulated_text,
+            }],
+            thought_signature: last_thought_signature,
+        };
+        let _ = tx_event
+            .send(Ok(ResponseEvent::OutputItemDone(item)))
+            .await;
+    }
+
+    // Send completed event
+    let _ = tx_event
+        .send(Ok(ResponseEvent::Completed {
+            response_id: last_response_id,
+            token_usage: last_token_usage,
+        }))
+        .await;
+}
+
+// The following functions are kept for potential fallback to non-streaming mode
+#[allow(dead_code)]
 struct GeminiParsedResponse {
     response_item: Option<ResponseItem>,
     response_id: String,
     token_usage: Option<TokenUsage>,
 }
 
+#[allow(dead_code)]
 fn parse_gemini_response(body: GeminiResponse) -> Result<GeminiParsedResponse> {
     let response_id = body
         .response_id
@@ -635,6 +824,7 @@ fn parse_gemini_response(body: GeminiResponse) -> Result<GeminiParsedResponse> {
     })
 }
 
+#[allow(dead_code)]
 fn candidate_to_response_item(candidate: GeminiCandidate) -> Option<ResponseItem> {
     let content = candidate.content?;
     let parts = content.parts.unwrap_or_default();
