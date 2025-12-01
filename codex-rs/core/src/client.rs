@@ -250,11 +250,43 @@ impl ModelClient {
             Some("low".to_string())
        };
 
+        // Build generationConfig with thinkingConfig nested properly
+        let generation_config = Some(GeminiGenerationConfig {
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            max_output_tokens: None,
+            thinking_config: Some(GeminiThinkingConfig {
+                thinking_level,
+            }),
+        });
+
+        // Default safety settings to allow code-related content
+        let safety_settings = Some(vec![
+            GeminiSafetySetting {
+                category: GeminiHarmCategory::HarmCategoryHarassment,
+                threshold: GeminiHarmBlockThreshold::BlockOnlyHigh,
+            },
+            GeminiSafetySetting {
+                category: GeminiHarmCategory::HarmCategoryHateSpeech,
+                threshold: GeminiHarmBlockThreshold::BlockOnlyHigh,
+            },
+            GeminiSafetySetting {
+                category: GeminiHarmCategory::HarmCategorySexuallyExplicit,
+                threshold: GeminiHarmBlockThreshold::BlockOnlyHigh,
+            },
+            GeminiSafetySetting {
+                category: GeminiHarmCategory::HarmCategoryDangerousContent,
+                threshold: GeminiHarmBlockThreshold::BlockOnlyHigh,
+            },
+        ]);
+
        let request = GeminiRequest {
             system_instruction,
             contents,
             tools,
-            thinking_level,
+            generation_config,
+            safety_settings,
         };
 
         // Optional debug hook to inspect the exact Gemini request payload.
@@ -963,7 +995,57 @@ struct GeminiRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<GeminiTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    generation_config: Option<GeminiGenerationConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    safety_settings: Option<Vec<GeminiSafetySetting>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiGenerationConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_k: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_config: Option<GeminiThinkingConfig>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiThinkingConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
     thinking_level: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum GeminiHarmCategory {
+    HarmCategoryHarassment,
+    HarmCategoryHateSpeech,
+    HarmCategorySexuallyExplicit,
+    HarmCategoryDangerousContent,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[allow(dead_code)]
+enum GeminiHarmBlockThreshold {
+    BlockNone,
+    BlockOnlyHigh,
+    BlockMediumAndAbove,
+    BlockLowAndAbove,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiSafetySetting {
+    category: GeminiHarmCategory,
+    threshold: GeminiHarmBlockThreshold,
 }
 
 #[derive(Debug, Serialize, Clone)]
