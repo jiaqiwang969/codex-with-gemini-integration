@@ -2241,7 +2241,7 @@ async fn try_run_turn(
     // continuing to execute the same command indefinitely.
     let model_family = turn_context.client.get_model_family();
     let detect_tool_call_loops = model_family.family == "gemini";
-    const TOOL_CALL_LOOP_THRESHOLD: i32 = 5;
+    const TOOL_CALL_LOOP_THRESHOLD: i32 = 100;
     let mut last_tool_call_key: Option<String> = None;
     let mut tool_call_repetition_count: i32 = 0;
 

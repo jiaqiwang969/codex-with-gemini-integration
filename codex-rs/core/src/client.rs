@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use bytes::Bytes;
 use crate::api_bridge::auth_provider_from_auth;
 use crate::api_bridge::map_api_error;
+use bytes::Bytes;
 use codex_api::AggregateStreamExt;
 use codex_api::ChatClient as ApiChatClient;
 use codex_api::CompactClient as ApiCompactClient;
@@ -247,14 +247,14 @@ impl ModelClient {
         let tools = build_gemini_tools(&prompt.tools);
 
         // Ensure the active loop has thought signatures on function calls so
-       // preview models accept the request without 400/429 errors.
-       let contents = ensure_active_loop_has_thought_signatures(&contents);
+        // preview models accept the request without 400/429 errors.
+        let contents = ensure_active_loop_has_thought_signatures(&contents);
 
         let thinking_level = if api_model.contains("thinking") {
-           Some("high".to_string())
-       } else {
+            Some("high".to_string())
+        } else {
             Some("low".to_string())
-       };
+        };
 
         // Build generationConfig with thinkingConfig nested properly
         // Using Gemini CLI defaults: temperature=1, topP=0.95, topK=64
@@ -292,7 +292,7 @@ impl ModelClient {
             },
         ]);
 
-       let request = GeminiRequest {
+        let request = GeminiRequest {
             system_instruction,
             contents,
             tools,
@@ -302,9 +302,10 @@ impl ModelClient {
 
         // Optional debug hook to inspect the exact Gemini request payload.
         if std::env::var("CODEX_DEBUG_GEMINI_REQUEST").is_ok()
-            && let Ok(json) = serde_json::to_string_pretty(&request) {
-                eprintln!("DEBUG GEMINI REQUEST:\n{json}");
-            }
+            && let Ok(json) = serde_json::to_string_pretty(&request)
+        {
+            eprintln!("DEBUG GEMINI REQUEST:\n{json}");
+        }
 
         // Build request with Gemini-specific auth handling
         let client = build_reqwest_client();
@@ -344,7 +345,9 @@ impl ModelClient {
 
             let result = self
                 .otel_event_manager
-                .log_request(attempt, || req_builder.try_clone().unwrap().json(&request).send())
+                .log_request(attempt, || {
+                    req_builder.try_clone().unwrap().json(&request).send()
+                })
                 .await;
 
             match result {
@@ -362,7 +365,9 @@ impl ModelClient {
 
                     if should_retry && attempt < MAX_ATTEMPTS {
                         // Exponential backoff with jitter
-                        let jitter = (current_delay as f64 * 0.3 * (rand::random::<f64>() * 2.0 - 1.0)) as u64;
+                        let jitter =
+                            (current_delay as f64 * 0.3 * (rand::random::<f64>() * 2.0 - 1.0))
+                                as u64;
                         let delay_with_jitter = current_delay.saturating_add(jitter);
                         debug!(
                             "Gemini request attempt {} failed, retrying after {}ms: {}",
@@ -657,10 +662,7 @@ fn spawn_gemini_response_stream(
 /// Spawns a task that processes Gemini SSE stream and converts it to ResponseStream.
 fn spawn_gemini_sse_stream<S>(byte_stream: S, idle_timeout: Duration) -> ResponseStream
 where
-    S: futures::Stream<Item = std::result::Result<Bytes, reqwest::Error>>
-        + Unpin
-        + Send
-        + 'static,
+    S: futures::Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
 {
     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
     tokio::spawn(async move {
@@ -684,7 +686,7 @@ async fn process_gemini_sse<S>(
 
     let mut stream = stream
         .map_ok(|b| b)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        .map_err(|e| std::io::Error::other(e.to_string()))
         .eventsource();
 
     // State for accumulating response
@@ -744,8 +746,8 @@ async fn process_gemini_sse<S>(
         // Process candidates
         if let Some(candidates) = chunk.candidates {
             for candidate in candidates {
-                if let Some(content) = candidate.content {
-                    if let Some(parts) = content.parts {
+                if let Some(content) = candidate.content
+                    && let Some(parts) = content.parts {
                         for part in parts {
                             // Track thought signature
                             if let Some(sig) = &part.thought_signature {
@@ -753,8 +755,8 @@ async fn process_gemini_sse<S>(
                             }
 
                             // Handle text content
-                            if let Some(text) = part.text {
-                                if !text.is_empty() {
+                            if let Some(text) = part.text
+                                && !text.is_empty() {
                                     // Send OutputItemAdded on first text
                                     if !assistant_item_sent {
                                         let item = ResponseItem::Message {
@@ -783,7 +785,6 @@ async fn process_gemini_sse<S>(
                                     }
                                     accumulated_text.push_str(&text);
                                 }
-                            }
 
                             // Handle function call
                             if let Some(call) = part.function_call {
@@ -800,7 +801,6 @@ async fn process_gemini_sse<S>(
                             }
                         }
                     }
-                }
             }
         }
     }
@@ -815,9 +815,7 @@ async fn process_gemini_sse<S>(
             call_id: "gemini-function-call".to_string(),
             thought_signature,
         };
-        let _ = tx_event
-            .send(Ok(ResponseEvent::OutputItemDone(item)))
-            .await;
+        let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
     } else if assistant_item_sent {
         // Emit the complete message
         let item = ResponseItem::Message {
@@ -828,9 +826,7 @@ async fn process_gemini_sse<S>(
             }],
             thought_signature: last_thought_signature,
         };
-        let _ = tx_event
-            .send(Ok(ResponseEvent::OutputItemDone(item)))
-            .await;
+        let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
     }
 
     // Send completed event
@@ -1083,10 +1079,11 @@ fn content_to_gemini_parts(
     if let Some(sig) = message_thought_signature
         && !parts.is_empty()
         && let Some(last) = parts.last_mut()
-            && last.thought_signature.is_none() {
-                last.thought_signature = Some(sig.to_string());
-                last.compat_thought_signature = Some(sig.to_string());
-            }
+        && last.thought_signature.is_none()
+    {
+        last.thought_signature = Some(sig.to_string());
+        last.compat_thought_signature = Some(sig.to_string());
+    }
     parts
 }
 
