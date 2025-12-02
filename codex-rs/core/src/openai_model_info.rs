@@ -2,6 +2,7 @@ use crate::model_family::ModelFamily;
 
 // Shared constants for commonly used window/token sizes.
 pub(crate) const CONTEXT_WINDOW_272K: i64 = 272_000;
+pub(crate) const CONTEXT_WINDOW_1M: i64 = 1_000_000;
 
 /// Metadata about a model, particularly OpenAI models.
 /// We may want to consider including details like the pricing for
@@ -75,6 +76,11 @@ pub(crate) fn get_model_info(model_family: &ModelFamily) -> Option<ModelInfo> {
         _ if slug.starts_with("gpt-5") => Some(ModelInfo::new(CONTEXT_WINDOW_272K)),
 
         _ if slug.starts_with("codex-") => Some(ModelInfo::new(CONTEXT_WINDOW_272K)),
+
+        // Default Gemini context window. Gemini 3 Pro preview supports a 1M token
+        // context window; we mirror that here so both the core and TUI can show
+        // an accurate "context left" indicator when using Gemini-family models.
+        _ if slug.starts_with("gemini-") => Some(ModelInfo::new(CONTEXT_WINDOW_1M)),
 
         _ => None,
     }

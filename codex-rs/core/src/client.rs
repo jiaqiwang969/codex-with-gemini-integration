@@ -747,60 +747,62 @@ async fn process_gemini_sse<S>(
         if let Some(candidates) = chunk.candidates {
             for candidate in candidates {
                 if let Some(content) = candidate.content
-                    && let Some(parts) = content.parts {
-                        for part in parts {
-                            // Track thought signature
-                            if let Some(sig) = &part.thought_signature {
-                                last_thought_signature = Some(sig.clone());
-                            }
+                    && let Some(parts) = content.parts
+                {
+                    for part in parts {
+                        // Track thought signature
+                        if let Some(sig) = &part.thought_signature {
+                            last_thought_signature = Some(sig.clone());
+                        }
 
-                            // Handle text content
-                            if let Some(text) = part.text
-                                && !text.is_empty() {
-                                    // Send OutputItemAdded on first text
-                                    if !assistant_item_sent {
-                                        let item = ResponseItem::Message {
-                                            id: None,
-                                            role: "assistant".to_string(),
-                                            content: vec![],
-                                            thought_signature: None,
-                                        };
-                                        if tx_event
-                                            .send(Ok(ResponseEvent::OutputItemAdded(item)))
-                                            .await
-                                            .is_err()
-                                        {
-                                            return;
-                                        }
-                                        assistant_item_sent = true;
-                                    }
-
-                                    // Send text delta
-                                    if tx_event
-                                        .send(Ok(ResponseEvent::OutputTextDelta(text.clone())))
-                                        .await
-                                        .is_err()
-                                    {
-                                        return;
-                                    }
-                                    accumulated_text.push_str(&text);
-                                }
-
-                            // Handle function call
-                            if let Some(call) = part.function_call {
-                                let args = if call.args.is_null() {
-                                    "{}".to_string()
-                                } else {
-                                    call.args.to_string()
+                        // Handle text content
+                        if let Some(text) = part.text
+                            && !text.is_empty()
+                        {
+                            // Send OutputItemAdded on first text
+                            if !assistant_item_sent {
+                                let item = ResponseItem::Message {
+                                    id: None,
+                                    role: "assistant".to_string(),
+                                    content: vec![],
+                                    thought_signature: None,
                                 };
-                                function_call = Some((
-                                    call.name,
-                                    args,
-                                    part.thought_signature.or(last_thought_signature.clone()),
-                                ));
+                                if tx_event
+                                    .send(Ok(ResponseEvent::OutputItemAdded(item)))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                assistant_item_sent = true;
                             }
+
+                            // Send text delta
+                            if tx_event
+                                .send(Ok(ResponseEvent::OutputTextDelta(text.clone())))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            accumulated_text.push_str(&text);
+                        }
+
+                        // Handle function call
+                        if let Some(call) = part.function_call {
+                            let args = if call.args.is_null() {
+                                "{}".to_string()
+                            } else {
+                                call.args.to_string()
+                            };
+                            function_call = Some((
+                                call.name,
+                                args,
+                                part.thought_signature.or(last_thought_signature.clone()),
+                            ));
                         }
                     }
+                }
             }
         }
     }

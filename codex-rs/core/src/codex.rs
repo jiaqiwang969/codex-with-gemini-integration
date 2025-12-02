@@ -1161,15 +1161,28 @@ impl Session {
         turn_context: &TurnContext,
         token_usage: Option<&TokenUsage>,
     ) {
-        {
-            let mut state = self.state.lock().await;
-            if let Some(token_usage) = token_usage {
+        if let Some(token_usage) = token_usage {
+            {
+                let mut state = self.state.lock().await;
                 state.update_token_info_from_usage(
                     token_usage,
                     turn_context.client.get_model_context_window(),
                 );
             }
+            self.send_token_count_event(turn_context).await;
+            return;
         }
+
+        // Gemini streaming responses may omit usage metadata at the end of SSE.
+        // To keep the "context left" indicator working when using Gemini-family
+        // models, fall back to estimating usage from the current conversation
+        // history when no usage data is available.
+        let model_family = turn_context.client.get_model_family();
+        if model_family.family == "gemini" {
+            self.recompute_token_usage(turn_context).await;
+            return;
+        }
+
         self.send_token_count_event(turn_context).await;
     }
 
