@@ -298,6 +298,20 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
             upgrade: None,
             show_in_picker: true,
         },
+        ModelPreset {
+            id: "gemini-3-pro-preview-thinking-germini",
+            model: "gemini-3-pro-preview-thinking-germini",
+            display_name: "gemini-3-pro-preview-thinking-germini",
+            description: "Gemini 3 Pro preview with thinking capability and Germini-style system prompt.",
+            default_reasoning_effort: ReasoningEffort::Medium,
+            supported_reasoning_efforts: &[ReasoningEffortPreset {
+                effort: ReasoningEffort::Medium,
+                description: "Gemini reasoning behaviour tuned for Germini-style workflows.",
+            }],
+            is_default: false,
+            upgrade: None,
+            show_in_picker: true,
+        },
     ]
 });
 

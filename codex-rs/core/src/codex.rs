@@ -362,6 +362,27 @@ impl SessionConfiguration {
         let mut next_configuration = self.clone();
         if let Some(model) = updates.model.clone() {
             next_configuration.model = model;
+            // When the model changes, switch between built‑in OpenAI and Gemini
+            // providers if the new slug clearly belongs to the other family.
+            let current_provider_id = self
+                .original_config_do_not_use
+                .model_providers
+                .iter()
+                .find(|(_, provider)| *provider == &self.provider)
+                .map(|(id, _)| id.as_str());
+            if let Some(provider_id) = self
+                .original_config_do_not_use
+                .preferred_model_provider_id_for_model(
+                    current_provider_id,
+                    &next_configuration.model,
+                )
+                && let Some(provider) = self
+                    .original_config_do_not_use
+                    .model_providers
+                    .get(&provider_id)
+            {
+                next_configuration.provider = provider.clone();
+            }
         }
         if let Some(effort) = updates.reasoning_effort {
             next_configuration.model_reasoning_effort = effort;

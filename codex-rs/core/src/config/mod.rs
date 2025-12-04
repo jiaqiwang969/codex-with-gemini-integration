@@ -327,6 +327,69 @@ impl Config {
 
         Self::load_from_base_config_with_overrides(cfg, overrides, codex_home)
     }
+
+    /// Determine if switching to a different model should also switch the
+    /// configured model provider.
+    ///
+    /// Today this is only used to move between the built‑in OpenAI (`openai`)
+    /// and Gemini (`gemini`) providers when users pick models from those
+    /// families via the TUI. The logic is intentionally conservative:
+    ///
+    /// - Selecting a `gemini-*` model will switch to the `gemini` provider
+    ///   *only* if the current provider is not already `gemini`.
+    /// - Selecting a non‑Gemini model will switch **away** from the `gemini`
+    ///   provider to `openai` (if configured) so that users can move back
+    ///   to GPT‑style models from a Gemini session.
+    ///
+    /// Third‑party providers (e.g. openrouter) are never auto‑switched by
+    /// this helper; they must be selected explicitly via config profiles.
+    pub fn preferred_model_provider_id_for_model(
+        &self,
+        current_provider_id: Option<&str>,
+        model: &str,
+    ) -> Option<String> {
+        // Determine the effective current provider id. Callers can pass an
+        // explicit id (e.g. derived from SessionConfiguration); otherwise we
+        // fall back to the Config's own model_provider_id / provider map.
+        let current_provider_id = current_provider_id.or_else(|| {
+            // Fast path: Config already knows its provider id.
+            let id = self.model_provider_id.as_str();
+            if self.model_providers.contains_key(id) {
+                Some(id)
+            } else {
+                // Fallback: look up by provider value in case the Config's
+                // provider was replaced or cloned.
+                self.model_providers.iter().find_map(|(key, provider)| {
+                    if *provider == self.model_provider {
+                        Some(key.as_str())
+                    } else {
+                        None
+                    }
+                })
+            }
+        });
+
+        let is_gemini_model = model.starts_with("gemini-");
+
+        if is_gemini_model {
+            // Switch to the built‑in Gemini provider when selecting a
+            // Gemini‑family model from a non‑Gemini provider.
+            if current_provider_id == Some("gemini") {
+                return None;
+            }
+            if self.model_providers.contains_key("gemini") {
+                return Some("gemini".to_string());
+            }
+        } else if current_provider_id == Some("gemini")
+            && self.model_providers.contains_key("openai")
+        {
+            // When starting from a Gemini provider, switch back to OpenAI
+            // for non‑Gemini models (e.g. gpt‑5.1‑codex).
+            return Some("openai".to_string());
+        }
+
+        None
+    }
 }
 
 pub async fn load_config_as_toml_with_cli_overrides(
@@ -3401,6 +3464,44 @@ model_verbosity = "high"
         };
 
         assert_eq!(expected_gpt5_profile_config, gpt5_profile_config);
+
+        Ok(())
+    }
+
+    #[test]
+    fn preferred_model_provider_id_switches_between_openai_and_gemini() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let config = Config::load_from_base_config_with_overrides(
+            ConfigToml::default(),
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        // When selecting a Gemini model from a non‑Gemini provider, prefer the
+        // built‑in `gemini` provider.
+        let provider_for_gemini =
+            config.preferred_model_provider_id_for_model(Some("openai"), "gemini-3-pro-preview");
+        assert_eq!(provider_for_gemini.as_deref(), Some("gemini"));
+
+        // When starting from Gemini and selecting a non‑Gemini model, prefer
+        // the built‑in `openai` provider.
+        let provider_for_gpt =
+            config.preferred_model_provider_id_for_model(Some("gemini"), "gpt-5.1-codex");
+        assert_eq!(provider_for_gpt.as_deref(), Some("openai"));
+
+        // Selecting a Gemini model while already on the Gemini provider should
+        // not propose a change.
+        let no_change = config.preferred_model_provider_id_for_model(
+            Some("gemini"),
+            "gemini-3-pro-preview-thinking-codex",
+        );
+        assert_eq!(no_change, None);
+
+        // Similarly, selecting a non‑Gemini model while already on OpenAI
+        // should keep the current provider.
+        let no_change =
+            config.preferred_model_provider_id_for_model(Some("openai"), "gpt-5.1-codex-max");
+        assert_eq!(no_change, None);
 
         Ok(())
     }

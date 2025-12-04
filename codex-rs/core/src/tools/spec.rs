@@ -304,7 +304,7 @@ fn create_shell_tool() -> ToolSpec {
         },
     );
 
-    let description  = if cfg!(windows) {
+    let description = if cfg!(windows) {
         r#"Runs a Powershell command (Windows) and returns its output. Arguments to `shell` will be passed to CreateProcessW(). Most commands should be prefixed with ["powershell.exe", "-Command"].
         
 Examples of valid command strings:
@@ -318,7 +318,8 @@ Examples of valid command strings:
     } else {
         r#"Runs a shell command and returns its output.
 - The arguments to `shell` will be passed to execvp(). Most terminal commands should be prefixed with ["bash", "-lc"].
-- Always set the `workdir` param when using the shell function. Do not use `cd` unless absolutely necessary."#
+- Always set the `workdir` param when using the shell function. Do not use `cd` unless absolutely necessary.
+- When searching code, prefer commands of the form ["bash","-lc","rg <pattern> ."] or ["bash","-lc","rg <pattern> <path>"], where <path> is "." or a real directory/file name (never a bare number like "5")."#
     }.to_string();
 
     ToolSpec::Function(ResponsesApiTool {
@@ -381,7 +382,8 @@ Examples of valid command strings:
 - running an inline Python script: "@'\\nprint('Hello, world!')\\n'@ | python -"#
     } else {
         r#"Runs a shell command and returns its output.
-- Always set the `workdir` param when using the shell_command function. Do not use `cd` unless absolutely necessary."#
+- Always set the `workdir` param when using the shell_command function. Do not use `cd` unless absolutely necessary.
+- When searching code, prefer commands like "rg <pattern> ." or "rg <pattern> <path>" where <path> is "." or a real directory/file name (never a bare number like "5")."#
     }.to_string();
 
     ToolSpec::Function(ResponsesApiTool {
@@ -1974,8 +1976,10 @@ Examples of valid command strings:
         } else {
             r#"Runs a shell command and returns its output.
 - The arguments to `shell` will be passed to execvp(). Most terminal commands should be prefixed with ["bash", "-lc"].
-- Always set the `workdir` param when using the shell function. Do not use `cd` unless absolutely necessary."#
-        }.to_string();
+- Always set the `workdir` param when using the shell function. Do not use `cd` unless absolutely necessary.
+- When searching code, prefer commands of the form ["bash","-lc","rg <pattern> ."] or ["bash","-lc","rg <pattern> <path>"], where <path> is "." or a real directory/file name (never a bare number like "5")."#
+        }
+        .to_string();
         assert_eq!(description, &expected);
     }
 
@@ -2003,7 +2007,8 @@ Examples of valid command strings:
 - running an inline Python script: "@'\\nprint('Hello, world!')\\n'@ | python -"#.to_string()
         } else {
             r#"Runs a shell command and returns its output.
-- Always set the `workdir` param when using the shell_command function. Do not use `cd` unless absolutely necessary."#.to_string()
+- Always set the `workdir` param when using the shell_command function. Do not use `cd` unless absolutely necessary.
+- When searching code, prefer commands like "rg <pattern> ." or "rg <pattern> <path>" where <path> is "." or a real directory/file name (never a bare number like "5")."#.to_string()
         };
         assert_eq!(description, &expected);
     }

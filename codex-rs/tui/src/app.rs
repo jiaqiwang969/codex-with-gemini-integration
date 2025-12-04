@@ -911,6 +911,20 @@ impl App {
                 if let Some(family) = find_family_for_model(&model) {
                     self.config.model_family = family;
                 }
+
+                // Keep the in‑memory provider configuration aligned with the
+                // selected model family. This mirrors the logic used inside
+                // `SessionConfiguration::apply` so that the TUI's status
+                // output and session logs reflect the effective provider.
+                let current_provider_id = Some(self.config.model_provider_id.as_str());
+                if let Some(provider_id) = self
+                    .config
+                    .preferred_model_provider_id_for_model(current_provider_id, &model)
+                    && let Some(provider) = self.config.model_providers.get(&provider_id)
+                {
+                    self.config.model_provider_id = provider_id;
+                    self.config.model_provider = provider.clone();
+                }
             }
             AppEvent::OpenReasoningPopup { model } => {
                 self.chat_widget.open_reasoning_popup(model);

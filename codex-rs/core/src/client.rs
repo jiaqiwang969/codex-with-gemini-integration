@@ -210,11 +210,16 @@ impl ModelClient {
             CodexErr::UnsupportedOperation("Gemini providers must define a base_url".to_string())
         })?;
 
-        let api_model = self
-            .config
-            .model
-            .strip_suffix("-codex")
-            .unwrap_or(self.config.model.as_str());
+        let api_model = {
+            let mut api_model = self.config.model.as_str();
+            if let Some(stripped) = api_model.strip_suffix("-codex") {
+                api_model = stripped;
+            }
+            if let Some(stripped) = api_model.strip_suffix("-germini") {
+                api_model = stripped;
+            }
+            api_model
+        };
 
         // Use streamGenerateContent endpoint with alt=sse for streaming
         let url = format!(
@@ -256,19 +261,23 @@ impl ModelClient {
             Some("low".to_string())
         };
 
-        // Build generationConfig with thinkingConfig nested properly
-        // Using Gemini CLI defaults: temperature=1, topP=0.95, topK=64
-        // thinkingBudget capped at 8192 to prevent run-away thinking loops
+        // Build generationConfig with thinkingConfig nested properly.
+        // Gemini defaults to temperature=1.0; Codex uses a slightly
+        // lower temperature (0.8) to encourage more stable, less
+        // speculative reasoning while still allowing exploration.
+        // For Gemini 3 models, we allow a higher thinkingBudget (32768 tokens)
+        // even when `thinkingLevel` is "low" so both regular and thinking
+        // variants can sustain long, multi-step reasoning.
         let is_thinking_model = api_model.contains("thinking");
         let generation_config = Some(GeminiGenerationConfig {
-            temperature: Some(1.0),
+            temperature: Some(0.8),
             top_k: Some(64),
             top_p: Some(0.95),
             max_output_tokens: None, // Let the model decide
             thinking_config: Some(GeminiThinkingConfig {
                 thinking_level,
                 include_thoughts: if is_thinking_model { Some(true) } else { None },
-                thinking_budget: if is_thinking_model { Some(8192) } else { None },
+                thinking_budget: Some(32768),
             }),
         });
 
@@ -1162,6 +1171,26 @@ fn parse_data_url(url: &str) -> Option<(String, String)> {
     Some((mime.to_string(), data.to_string()))
 }
 
+fn strip_additional_properties(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            // Gemini function declaration schemas do not recognize
+            // `additionalProperties`; drop it and recurse into all
+            // nested values so schemas remain broadly compatible.
+            map.remove("additionalProperties");
+            for v in map.values_mut() {
+                strip_additional_properties(v);
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                strip_additional_properties(v);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
 fn build_gemini_tools(tools: &[ToolSpec]) -> Option<Vec<GeminiTool>> {
     let mut functions = Vec::new();
 
@@ -1173,7 +1202,10 @@ fn build_gemini_tools(tools: &[ToolSpec]) -> Option<Vec<GeminiTool>> {
             ..
         }) = tool
         {
-            let params = serde_json::to_value(parameters).ok();
+            let params = serde_json::to_value(parameters).ok().map(|mut v| {
+                strip_additional_properties(&mut v);
+                v
+            });
             functions.push(GeminiFunctionDeclaration {
                 name: name.clone(),
                 description: Some(description.clone()),
@@ -1257,7 +1289,8 @@ struct GeminiThinkingConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     include_thoughts: Option<bool>,
     /// Token budget for thinking. Use -1 for no limit, 0 to disable.
-    /// Cap at 8192 to prevent run-away thinking loops (per Gemini CLI).
+    /// Codex caps this at 32768 tokens to better support long, multi-step
+    /// reasoning while still bounding worst-case cost.
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking_budget: Option<i32>,
 }

@@ -1,0 +1,581 @@
+\documentclass[12pt]{ctexart}
+\usepackage[a4paper,margin=2.5cm]{geometry}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{longtable}
+
+% 为 listings 定义 Rust 语言高亮，避免 language=Rust 报错
+\lstdefinelanguage{Rust}{
+  keywords={typeof, new, true, false, catch, function, return, null, switch, var,
+    if, in, while, do, else, case, break, let, mut, match, use, mod, pub, struct,
+    impl, enum, fn, async, await, move, trait, where, type, dyn, crate, self, Self},
+  keywordstyle=\bfseries\color{blue!70!black},
+  sensitive=true,
+  comment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  commentstyle=\itshape\color{green!40!black},
+  stringstyle=\color{red!60!black},
+  morestring=[b]",
+  morestring=[b]'
+}
+
+\lstdefinestyle{code}{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  tabsize=2,
+  columns=fullflexible,
+  showstringspaces=false,
+  keywordstyle=\bfseries\color{blue!70!black},
+  commentstyle=\itshape\color{green!40!black},
+  stringstyle=\color{red!60!black}
+}
+\lstset{style=code}
+
+\title{Codex CLI 中 Gemini 3 Pro 接入技术报告}
+\author{基于本地分支的集成实践}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本文系统梳理了在 Codex CLI 中接入 Gemini 3 Pro Preview 的技术路线。
+目标是让后续开发者能够看懂、照做、改进，而不是停留在模糊的术语层面。
+报告重点围绕三个关键点展开：
+
+\begin{itemize}
+  \item 如何在 Codex 的通用架构下，把 Gemini 3 Pro（低思考版和高思考版）接入进来；
+  \item 工具调用循环（function call loop）在底层是怎样运转的；
+  \item thoughtSignature 是如何在整个调用链路中被接收、保存、回放的。
+\end{itemize}
+
+文中所有说明都以当前仓库的 Rust 代码为依据，尽量避免空洞的概念描述。
+\end{abstract}
+
+\tableofcontents
+
+\section{当前集成的模型与目标}
+
+\subsection{使用的 Gemini 模型}
+
+当前 Codex 集成的是 Gemini 3 Pro Preview 模型族，具体包括：
+
+\begin{itemize}
+  \item \texttt{gemini-3-pro-preview}：基础版（低思考，默认不输出 thoughts）；
+  \item \texttt{gemini-3-pro-preview-codex}：为 Codex 行为微调 Prompt 的低思考变体；
+  \item \texttt{gemini-3-pro-preview-thinking}：高思考版本，支持输出 thoughts；
+  \item \texttt{gemini-3-pro-preview-thinking-codex}：高思考 + Codex 优化 Prompt。
+\end{itemize}
+
+也就是说，Codex 侧实际支持的是“Gemini 3 Pro Preview 3.0”的两个思考档位：
+
+\begin{itemize}
+  \item \textbf{Low thinking}：\texttt{gemini-3-pro-preview(-codex)}；
+  \item \textbf{High thinking}：\texttt{gemini-3-pro-preview-thinking(-codex)}。
+\end{itemize}
+
+在请求的 \verb|generationConfig| 中，我们用 \verb|thinkingConfig| 来区分
+低思考和高思考模型：
+
+\begin{itemize}
+  \item 非 thinking 模型：\verb|thinkingLevel = "low"|，不主动请求 thoughts；
+  \item thinking 模型：\verb|thinkingLevel = "high"|，且 \verb|includeThoughts = true|。
+\end{itemize}
+
+为了保证“低思考”版本在工具循环中同样能坚持“寻根究底”，我们对两类模型
+\textbf{统一设置}了较大的思考预算：
+
+\begin{itemize}
+  \item \verb|thinkingBudget = 32768|（低思考、高思考版本完全一致）。
+\end{itemize}
+
+即使从官方文档角度看，Gemini 3 Pro 更推荐用 \verb|thinkingLevel| 控制思考量，
+但 Codex 仍显式设置一个较高的 \verb|thinkingBudget|，目的是在代理或旧实现
+仍检查此字段时，给出足够的预算，不让长链路工具调用过早被截断。
+
+\subsection{集成目标}
+
+从第一性原理出发，本次 Gemini 接入的目标可以拆成三点：
+
+\begin{enumerate}
+  \item \textbf{调用通路打通}：
+  在不破坏 Codex 现有 OpenAI 流程的前提下，为 Gemini 单独实现
+  HTTP 调用、SSE 解析、错误处理等逻辑，并与 OpenAI 提供方完全隔离。
+  \item \textbf{工具调用行为对齐 GPT-5.1}：
+  包括：敢用工具、连用工具、长时间用工具，而不是查两下就开始“编故事”。
+  \item \textbf{上下文与 UI 行为一致}：
+  TUI 中的 \verb|context left|、“运行中 / 就绪” 状态，对 Gemini 和 GPT-5.1
+  都要准确，不因为换了模型就乱。
+\end{enumerate}
+
+\section{整体架构：从 Provider 到 TUI}
+
+\subsection{ModelProviderInfo：把 Gemini 当成一个独立的 Provider}
+
+Codex 使用 \verb|ModelProviderInfo| 描述每一个“模型提供方”，定义在
+\verb|codex-rs/core/src/model_provider_info.rs|。关键字段包括：
+
+\begin{itemize}
+  \item \verb|name|：用于界面显示的名称；
+  \item \verb|base_url|：HTTP API 的基础 URL；
+  \item \verb|wire_api|：使用的协议类型（Responses / Chat / Gemini）；
+  \item \verb|auth_json_key| / \verb|env_http_headers|：
+  如何从环境变量或 \verb|auth.json| 读取 key，并注入到请求头。
+\end{itemize}
+
+Gemini 的默认 provider 在 \verb|built_in_model_providers()| 中定义，大致如下（简化版）：
+
+\begin{lstlisting}[language=Rust]
+("gemini",
+ P {
+     name: "Gemini (Preview)".into(),
+     base_url: std::env::var("GEMINI_BASE_URL")
+         .ok()
+         .filter(|v| !v.trim().is_empty())
+         .or_else(|| Some("https://api.ppchat.vip/v1beta".into())),
+     auth_json_key: Some("GEMINI_API_KEY".to_string()),
+     wire_api: WireApi::Gemini,
+     env_http_headers: Some(
+         [
+             ("X-Goog-Api-Key".to_string(), "GEMINI_API_KEY".to_string()),
+             ("Cookie".to_string(), "GEMINI_COOKIE".to_string()),
+         ]
+         .into_iter()
+         .collect(),
+     ),
+     requires_openai_auth: true,
+ })
+\end{lstlisting}
+
+这里有几点需要特别说明：
+
+\begin{itemize}
+  \item \textbf{OpenAI 与 Gemini 完全隔离}：
+  OpenAI 使用 Responses API（\verb|/v1/responses|），Gemini 使用
+  自己的 \verb|:generateContent| / \verb|:streamGenerateContent| 协议，
+  两者通过 \verb|wire_api| 明确区分，走的是不同的 base\_url 和认证逻辑。
+  \item \textbf{Base URL 可切换代理}：
+  \verb|GEMINI_BASE_URL| 可以指向官方 GCP，也可以指向
+  \verb|https://api.vectorengine.ai/v1beta| 等代理。
+  Codex 不关心具体是哪家服务，只要遵守 Gemini 3 Pro 的协议即可。
+  \item \textbf{Key 读取顺序}：
+  优先从环境变量 \verb|GEMINI_API_KEY| 读取；如果缺失，再从
+  \verb|auth.json| 中读取同名 key。对于部分代理，也支持从
+  \verb|OPENAI_API_KEY| 复用共享 key。
+\end{itemize}
+
+\subsection{ModelClient 与 stream\_gemini：专门走 Gemini 协议的通路}
+
+在 \verb|codex-rs/core/src/client.rs| 中，\verb|ModelClient| 为不同 provider
+实现了不同的调用通路：
+
+\begin{itemize}
+  \item OpenAI Responses：\verb|stream_responses_api(...)|；
+  \item Chat Completions：\verb|stream_chat_completions_api(...)|；
+  \item Gemini：\verb|stream_gemini(...)|。
+\end{itemize}
+
+对 Gemini，调用的是 \verb|models/{api_model}:streamGenerateContent?alt=sse|，
+使用 SSE 流式输出。整体流程是：
+
+\begin{enumerate}[label=\arabic*)]
+  \item 根据当前模型名（例如 \verb|gemini-3-pro-preview-codex|）去掉 \verb|-codex| 后缀，得到真正的 API 模型名 \verb|gemini-3-pro-preview|。
+  \item 使用 provider 的 \verb|base_url| 构造 SSE URL。
+  \item 将 Codex 内部的 \verb|Prompt| 转为 Gemini 的 \verb|contents|：
+  既包括 system 指令，也包括历史消息（用户消息、模型回复、工具调用和工具结果）。
+  \item 使用 \verb|build_gemini_tools(...)| 把 Codex 的工具定义映射为
+  Gemini 的 \verb|functionDeclarations|。
+  \item 生成 \verb|generationConfig|，配置温度、思考等级和思考预算等：
+  \begin{itemize}
+    \item \verb|temperature = 0.8|（比官方默认 1.0 略低，鼓励更稳定但仍有探索的推理）；
+    \item \verb|topK = 64|、\verb|topP = 0.95|；
+    \item \verb|thinkingConfig| 如前所述（low/high + 统一的 \verb|32768| 预算）。
+  \end{itemize}
+  \item 从环境变量或 \verb|auth.json| 中读取 Gemini key，放到
+  \verb|X-Goog-Api-Key| 请求头。
+  \item 发送请求，并将返回的 SSE 字节流交给
+  \verb|process_gemini_sse(...)| 解析。
+\end{enumerate}
+
+这一层的本质工作是：“把 Codex 的内部世界翻译成 Gemini API 要求的 JSON”，
+并在这一层处理好错误和重试，让上层逻辑保持干净。
+
+\subsection{常见错误与重试策略}
+
+在 \verb|stream_gemini| 中，Codex 对网络错误、429 和 5xx 做了统一处理：
+
+\begin{itemize}
+  \item 至多 3 次重试，指数退避（5000ms 起步，含随机抖动，上限 30000ms）；
+  \item 对纯网络错误（连接中断、超时）同样重试；
+  \item 若连续失败，则向上抛出 \verb|ResponseStreamFailed|，由上层展示错误。
+\end{itemize}
+
+如果上游代理返回的是中文错误如：
+
+\begin{quote}
+\verb|429 Too Many Requests: 该令牌状态不可用|
+\end{quote}
+
+这类错误通常表示“当前 token 不可用或被限流”，而不是 Codex 侧的协议错误。
+可以直接用手工 \verb|curl| 复现（例如使用 \verb|:generateContent|），确认
+代理本身是否健康。
+
+此外，还有一类特殊的 400/429 错误：如果上游认为某次工具调用缺少
+thoughtSignature，会返回“missing a \verb|thought_signature|”之类的信息。
+对于这种情况，Codex 会兜底生成一条普通的 assistant 消息，把错误解释展示给用户，
+而不是直接让整次对话失败（后文会详细说明 thoughtSignature 的处理）。
+
+\section{工具调用循环：模型、工具和 Codex 之间的闭环}
+
+\subsection{一个完整的 function call loop 是怎样运转的？}
+
+从 Codex 视角，一次“Gemini 带工具”的调用循环可以拆成四步：
+
+\begin{enumerate}[label=\arabic*)]
+  \item \textbf{发起请求}：带上完整上下文（包括以往的 functionCall 和 functionResponse）。
+  \item \textbf{解析 SSE 输出}：从模型输出中抓出文本增量和 functionCall。
+  \item \textbf{执行工具}：遇到 functionCall 就调用本地工具（shell、MCP 等），得到结果。
+  \item \textbf{回放工具结果}：把 functionCall 和 functionResponse 作为新的一对消息，加到历史里，再发给模型。
+\end{enumerate}
+
+Codex 的核心循环在 \verb|codex-rs/core/src/codex.rs| 的
+\verb|try_run_turn(...)| 中，大致逻辑是：
+
+\begin{itemize}
+  \item 使用当前 Prompt 调用 \verb|client.stream(...)|（Gemini 时即为 \verb|stream_gemini|），得到一个 \verb|ResponseEvent| 流；
+  \item 监听这个流：
+  \begin{itemize}
+    \item 文本增量 \verb|OutputTextDelta| → 直接显示；
+    \item \verb|OutputItemDone(item)|：
+    如果能解析出工具调用（\verb|ToolRouter::build_tool_call| 返回 Some），说明模型发了 functionCall，这时：
+    \begin{enumerate}[label=\arabic*)]
+      \item 做 loop 检测（避免死循环，后文详述）；
+      \item 把 functionCall 交给 \verb|ToolCallRuntime| 执行；
+      \item 把执行结果打包成 \verb|FunctionCallOutput|，记录到上下文；
+    \end{enumerate}
+    如果解析不出工具调用，就是普通消息，按文本处理。
+  \end{itemize}
+  \item 执行完工具后，Codex 会基于更新后的历史再次调用模型，如此往复，直到没有新的 functionCall 为止。
+\end{itemize}
+
+这就是你看到的“Gemini 连续 functionCall”的真实结构：每一轮都是
+“模型 → 工具调用 → 工具执行 → 工具结果回放 → 再次调用模型”的闭环。
+
+\subsection{SSE 解析：从 JSON 分块到 ResponseEvent}
+
+解析逻辑在 \verb|process_gemini_sse(...)| 中。核心思路：
+
+\begin{lstlisting}[language=Rust]
+loop {
+    let sse = next_sse_chunk()?;
+    if sse.data.trim().is_empty() { continue; }
+
+    let chunk: GeminiResponse = serde_json::from_str(&sse.data)?;
+
+    // 更新 response_id 和 usage_metadata
+    if let Some(id) = chunk.response_id { last_response_id = id; }
+    if let Some(usage) = chunk.usage_metadata { last_token_usage = Some(usage.into()); }
+
+    // 处理 candidates[*].content.parts[*]
+    if let Some(candidates) = chunk.candidates {
+        for candidate in candidates {
+            if let Some(content) = candidate.content
+                && let Some(parts) = content.parts {
+                for part in parts {
+                    // 1) 记录 thoughtSignature
+                    if let Some(sig) = &part.thought_signature {
+                        last_thought_signature = Some(sig.clone());
+                    }
+
+                    // 2) 文本内容 → OutputTextDelta
+                    if let Some(text) = part.text && !text.is_empty() {
+                        // 第一次文本先发 OutputItemAdded(Message)
+                        // 然后每块发 OutputTextDelta
+                    }
+
+                    // 3) functionCall → 记下 (name, args, thoughtSignature)
+                    if let Some(call) = part.function_call {
+                        ...
+                        function_call = Some((call.name, args, part.thought_signature
+                            .or(last_thought_signature.clone())));
+                    }
+                }
+            }
+        }
+    }
+}
+\end{lstlisting}
+
+流结束时，如果存在 \verb|function_call|，就发出一条
+\verb|ResponseItem::FunctionCall|，否则发一条普通的文本消息。
+
+\section{thoughtSignature 的完整链路}
+
+\subsection{thoughtSignature 是什么？我们对它做了什么？}
+
+在 Gemini 3 Pro 中，\verb|thoughtSignature| 是服务端用来约束多轮
+function calling 的“思考步骤标识”。文档给出的关键信息是：
+
+\begin{itemize}
+  \item 每一个 functionCall / functionResponse 所在的“思考步”都会带一个签名；
+  \item 服务端在多轮调用中会检查这些签名是否一致、是否缺失；
+  \item 签名本身对客户端是“不透明的字符串”，客户端只需要正确传递。
+\end{itemize}
+
+Codex 的策略很简单：\textbf{不解释含义，只做正确搬运和兜底}：
+
+\begin{itemize}
+  \item 在解析 SSE 时，把所有出现的 thoughtSignature 记录下来；
+  \item 在回放 functionCall 和 functionResponse 时原样传回；
+  \item 在历史被裁剪或重建导致缺失时，按官方建议填入一个特殊值，让服务端验证通过。
+\end{itemize}
+
+\subsection{部分一：从 SSE 中找到 thoughtSignature}
+
+如前所述，在 \verb|process_gemini_sse| 中，任何包含
+\verb|part.thought_signature| 的块，都会更新 \verb|last_thought_signature|。
+当一个 part 同时包含 \verb|functionCall| 时，会优先使用该 part 上的签名；
+若为空，则使用 \verb|last_thought_signature| 兜底。
+
+最终发出的 \verb|ResponseItem::FunctionCall| 结构是：
+
+\begin{lstlisting}[language=Rust]
+ResponseItem::FunctionCall {
+    id: None,
+    name,
+    arguments,
+    call_id: "gemini-function-call".to_string(),
+    thought_signature, // Option<String>
+}
+\end{lstlisting}
+
+这一步的目的就是：把模型 SSE 中散落的 thoughtSignature 信号，整理成“这一轮函数调用对应的签名”。
+
+\subsection{部分二：把 functionCall 和 functionResponse 串起来}
+
+下一轮请求时，我们会把历史里的 \verb|FunctionCall| 和
+\verb|FunctionCallOutput| 重新编码为 Gemini 所需的 \verb|contents|。
+代码在 \verb|build_gemini_contents(...)| 中。
+
+\paragraph{FunctionCall 部分}
+
+\begin{lstlisting}[language=Rust]
+ResponseItem::FunctionCall { name, arguments, thought_signature, .. } => {
+    last_function_call_name = Some(name.clone());
+    last_function_call_thought_signature = thought_signature.clone();
+    let args: serde_json::Value = serde_json::from_str(arguments)
+        .unwrap_or(serde_json::Value::Object(Default::default()));
+    let part_thought_signature = thought_signature.clone();
+    contents.push(GeminiContentRequest {
+        role: Some("model".to_string()),
+        parts: vec![GeminiPartRequest {
+            text: None,
+            inline_data: None,
+            function_call: Some(GeminiFunctionCallPart { name: name.clone(), args }),
+            function_response: None,
+            thought_signature: part_thought_signature.clone(),
+            compat_thought_signature: part_thought_signature,
+        }],
+    });
+}
+\end{lstlisting}
+
+要点：
+
+\begin{itemize}
+  \item role 设为 \verb|"model"|，表示这是模型上一次发出的函数调用；
+  \item \verb|thoughtSignature| 原样放在这个 part 上，同时在
+  \verb|compat_thought_signature| 上再打一份，以兼容某些只认 snake\_case 的代理；
+  \item \verb|last_function_call_name| 和
+  \verb|last_function_call_thought_signature| 被保存下来，供下一条 functionResponse 使用。
+\end{itemize}
+
+\paragraph{FunctionCallOutput 部分}
+
+\begin{lstlisting}[language=Rust]
+ResponseItem::FunctionCallOutput { output, .. } => {
+    let function_name = last_function_call_name
+        .take()
+        .unwrap_or_else(|| "unknown_function".to_string());
+    let thought_signature = last_function_call_thought_signature.take();
+
+    let response_value = serde_json::json!({
+        "output": output.content.clone(),
+        "success": output.success.unwrap_or(true)
+    });
+    let part_thought_signature = thought_signature.clone();
+
+    contents.push(GeminiContentRequest {
+        role: Some("function".to_string()),
+        parts: vec![GeminiPartRequest {
+            text: None,
+            inline_data: None,
+            function_call: None,
+            function_response: Some(GeminiFunctionResponsePart {
+                name: function_name,
+                response: response_value,
+            }),
+            thought_signature: part_thought_signature.clone(),
+            compat_thought_signature: part_thought_signature,
+        }],
+    });
+}
+\end{lstlisting}
+
+也就是说：\textbf{同一个工具调用的 functionCall 和 functionResponse，共用同一个 thoughtSignature}。
+这正是 Gemini 3 Pro 文档所要求的行为。
+
+\subsection{部分三：缺失签名时的兜底}
+
+在真实环境中，有时历史会因为裁剪、合并或代理行为而丢失签名。
+为避免这类情况直接导致 400/429，我们增加了
+\verb|ensure_active_loop_has_thought_signatures(...)|：
+
+\begin{itemize}
+  \item 找到“当前活跃 loop”的起点：最后一个带文本内容的 user 消息；
+  \item 从这一点之后的所有 role=\verb|"model"| 的内容中，找到第一个
+  \verb|functionCall| part；
+  \item 如果它缺少 \verb|thoughtSignature|，就填入一个约定的 dummy 值
+  \verb|"skip_thought_signature_validator"|。
+\end{itemize}
+
+这样可以保证：即使我们对历史做了技术性处理，发送到 Gemini 的
+“当前回合函数调用”始终满足服务端验证器的要求。
+
+\section{工具调用 loop 检测与防止死循环}
+
+\subsection{为什么只对 Gemini 做 loop 检测？}
+
+在 \verb|codex-rs/core/src/codex.rs| 的
+\verb|try_run_turn(...)| 中，我们引入了一个轻量级 loop 检测逻辑：
+
+\begin{lstlisting}[language=Rust]
+let model_family = turn_context.client.get_model_family();
+let detect_tool_call_loops = model_family.family == "gemini";
+const TOOL_CALL_LOOP_THRESHOLD: i32 = 100;
+let mut last_tool_call_key: Option<String> = None;
+let mut tool_call_repetition_count: i32 = 0;
+\end{lstlisting}
+
+只对 family 为 \verb|"gemini"| 的模型启用，原因有两点：
+
+\begin{enumerate}
+  \item 在早期测试中，确实观察到 Gemini 可能在“意外卡死”时不断用完全相同的参数重复发同一个工具调用；
+  \item 我们不希望对 GPT-5.1 等模型引入额外限制。
+\end{enumerate}
+
+\subsection{具体检测规则}
+
+当 \verb|ToolRouter::build_tool_call(...)| 返回一个工具调用时，我们构造一个稳定的 key：
+
+\begin{lstlisting}[language=Rust]
+let payload_preview = call.payload.log_payload().into_owned();
+let key = format!("{}:{}", call.tool_name, payload_preview);
+\end{lstlisting}
+
+然后：
+
+\begin{itemize}
+  \item 如果 key 与上一次相同，则 \verb|tool_call_repetition_count += 1|；
+  \item 否则重置为 1，并更新 \verb|last_tool_call_key|；
+  \item 当计数达到 \verb|TOOL_CALL_LOOP_THRESHOLD = 100| 时，认为进入死循环。
+\end{itemize}
+
+此时，我们不会再次执行工具，而是构造一个失败的函数调用输出：
+
+\begin{lstlisting}[language=Rust]
+let loop_message = format!(
+    "Loop detected: tool '{}' was called repeatedly \
+with identical arguments. Stopping further tool calls for this turn to avoid \
+an infinite loop. If you intended to keep running this command, please explain \
+why and rephrase your request.",
+    call.tool_name,
+);
+
+let response = ResponseInputItem::FunctionCallOutput {
+    call_id: call.call_id.clone(),
+    output: FunctionCallOutputPayload {
+        content: loop_message,
+        success: Some(false),
+        ..Default::default()
+    },
+};
+\end{lstlisting}
+
+这条消息被当作正常的 \verb|FunctionCallOutput| 返回给模型和 UI，使用户看到清晰的解释，同时终止当前 turn 后续的工具调用。
+
+注意，这里只对“完全相同的工具名 + 参数”进行统计，所以正常“多轮 bash 搜索”不会触发此保护。
+
+\section{TUI 集成：上下文窗口与运行状态}
+
+\subsection{上下文窗口与 context left 指示器}
+
+Gemini 3 Pro Preview 的上下文窗口为约 1M tokens。
+为了让 TUI 底部的 “xx\% context left” 正确反映这一点，我们在
+\verb|codex-rs/core/src/openai_model_info.rs| 中为
+\verb|slug.starts_with("gemini-")| 的模型配置：
+
+\begin{lstlisting}[language=Rust]
+pub(crate) const CONTEXT_WINDOW_1M: i64 = 1_000_000;
+
+_ if slug.starts_with("gemini-") => Some(ModelInfo::new(CONTEXT_WINDOW_1M)),
+\end{lstlisting}
+
+同时，在 \verb|Session::update_token_usage_info(...)| 中，当
+Gemini 流式响应缺少 usage 元数据时，我们会调用
+\verb|recompute_token_usage(...)| 基于历史估算 token 使用量，
+不会让 context left 永远停在 100\%。
+
+\subsection{“运行中” / “就绪” 状态的修正}
+
+最初 TUI 侧边栏的状态字符串只依赖底部状态指示器是否可见和 exec 活动。
+在长时间 Gemini 任务下，这会出现“流式内容结束后就被误判为就绪”的问题。
+
+为此我们在 \verb|ChatWidget::sidebar_status(...)| 中改为：
+
+\begin{lstlisting}[language=Rust]
+pub(crate) fn sidebar_status(&self) -> String {
+    // 只要底部 Pane 认为有任务在运行，就视为「运行中」，不依赖状态指示器是否可见。
+    if self.bottom_pane.is_task_running() {
+        return "运行中".to_string();
+    }
+
+    // 其次看 execCell 和 running_commands
+    ...
+
+    "就绪".to_string()
+}
+\end{lstlisting}
+
+这里的 \verb|is_task_running| 是由核心任务事件驱动的：只有当整个 turn 确认完成，才会被置为 false。
+这样，即使为了 UI 效果临时隐藏底部状态指示器，侧边栏仍然可以正确反映 Gemini 任务的真实状态。
+
+\section{演进路径概览与对后续接入的启示}
+
+从本地起点（例如 \verb|914f31b1c7db...|）到当前最新提交，围绕 Gemini 的工作大致经历了以下阶段：
+
+\begin{enumerate}[label=\arabic*)]
+  \item 引入 Gemini provider 与基本模型预设；
+  \item 实现 \verb|stream_gemini|，打通 SSE 流式通路；
+  \item 把 \verb|thinkingLevel| / \verb|thinkingConfig| 接到 generationConfig 上；
+  \item 统一设置较大的 \verb|thinkingBudget = 32768|，让 low/high 版本都能支撑长链路工具调用；
+  \item 实现 thoughtSignature 的完整传递：解析、存储、回放，并在缺失时兜底；
+  \item 增加针对 Gemini 的工具调用 loop 检测，阈值从 5 提升到 100；
+  \item 修复 JSON Schema 不兼容 \verb|additionalProperties| 的问题；
+  \item 在 TUI 中修正 context left 与 “运行中 / 就绪” 状态，使之与 Gemini 的真实行为一致。
+\end{enumerate}
+
+这些实践为未来接入其他 API 提供了两点重要经验：
+
+\begin{itemize}
+  \item \textbf{协议适配要在边缘做透}：
+  SSE、JSON Schema、错误格式等差异，最好集中在 provider 和 client 层消化，
+  上层统一用 Codex 自己的模型表示。
+  \item \textbf{工具循环和思考链要端到端设计}：
+  不仅要会发送 functionCall，还要正确回放 functionResponse 和 thoughtSignature，
+  并通过 Prompt、预算和 loop 检测配合起来，才能得到稳定的“长时间寻根究底”行为。
+\end{itemize}
+
+\end{document}

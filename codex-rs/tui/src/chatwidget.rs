@@ -3570,10 +3570,14 @@ impl ChatWidget {
     }
 
     /// A lightweight status string for the sidebar, derived from existing UI state.
-    /// Currently distinguishes between "运行中" and "就绪" based on Exec activity.
+    /// 优先根据 TaskRunning 状态区分「运行中」和「就绪」，否则再回退到 Exec 活动。
+    ///
+    /// 这样即使为了 UI 效果临时隐藏底部状态指示器（例如流式最终答案已经落盘到历史，
+    /// 但 Task 仍在进行中），会话栏仍然反映「运行中」直到整个任务真正结束
+    ///（核心层发出 TaskComplete 事件）。
     pub(crate) fn sidebar_status(&self) -> String {
-        // 检查底部状态指示器或活跃 Exec
-        if self.bottom_pane.status_widget().is_some() {
+        // 只要底部 Pane 认为有任务在运行，就视为「运行中」，不依赖状态指示器是否可见。
+        if self.bottom_pane.is_task_running() {
             return "运行中".to_string();
         }
 
