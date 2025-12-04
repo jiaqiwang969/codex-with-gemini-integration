@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_app_server_protocol::AuthMode;
 use codex_backend_client::Client as BackendClient;
 use codex_core::config::Config;
@@ -39,6 +41,7 @@ use codex_core::protocol::McpToolCallEndEvent;
 use codex_core::protocol::Op;
 use codex_core::protocol::PatchApplyBeginEvent;
 use codex_core::protocol::RateLimitSnapshot;
+use codex_core::protocol::RawResponseItemEvent;
 use codex_core::protocol::ReviewRequest;
 use codex_core::protocol::StreamErrorEvent;
 use codex_core::protocol::TaskCompleteEvent;
@@ -55,6 +58,8 @@ use codex_core::protocol::WebSearchBeginEvent;
 use codex_core::protocol::WebSearchEndEvent;
 use codex_protocol::ConversationId;
 use codex_protocol::approvals::ElicitationRequestEvent;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::parse_command::ParsedCommand;
 use codex_protocol::user_input::UserInput;
 use crossterm::event::KeyCode;
@@ -348,6 +353,10 @@ pub(crate) struct ChatWidget {
     feedback: codex_feedback::CodexFeedback,
     // Current session rollout path (if known)
     current_rollout_path: Option<PathBuf>,
+    // Monotonic counter for generated images in this session.
+    next_generated_image_index: u64,
+    // Last generated image path for quick reopening via slash command.
+    last_generated_image_path: Option<PathBuf>,
 }
 
 struct UserMessage {
@@ -1436,6 +1445,8 @@ impl ChatWidget {
             last_rendered_width: std::cell::Cell::new(None),
             feedback,
             current_rollout_path: None,
+            next_generated_image_index: 0,
+            last_generated_image_path: None,
         };
 
         widget.prefetch_rate_limits();
@@ -1526,6 +1537,8 @@ impl ChatWidget {
             last_rendered_width: std::cell::Cell::new(None),
             feedback,
             current_rollout_path: None,
+            next_generated_image_index: 0,
+            last_generated_image_path: None,
         };
 
         widget.prefetch_rate_limits();
@@ -1708,6 +1721,9 @@ impl ChatWidget {
                     };
                     tx.send(AppEvent::DiffResult(text));
                 });
+            }
+            SlashCommand::OpenImage => {
+                self.open_last_generated_image();
             }
             SlashCommand::Mention => {
                 self.insert_str("@");
@@ -2020,6 +2036,9 @@ impl ChatWidget {
             EventMsg::StreamError(StreamErrorEvent { message, .. }) => {
                 self.on_stream_error(message)
             }
+            EventMsg::RawResponseItem(ev) => {
+                self.on_raw_response_item(ev);
+            }
             EventMsg::UserMessage(ev) => {
                 if from_replay {
                     self.on_user_message_event(ev);
@@ -2030,8 +2049,7 @@ impl ChatWidget {
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
             EventMsg::ContextCompacted(_) => self.on_agent_message("Context compacted".to_owned()),
-            EventMsg::RawResponseItem(_)
-            | EventMsg::ItemStarted(_)
+            EventMsg::ItemStarted(_)
             | EventMsg::ItemCompleted(_)
             | EventMsg::AgentMessageContentDelta(_)
             | EventMsg::ReasoningContentDelta(_)
@@ -2101,6 +2119,152 @@ impl ChatWidget {
 
     fn request_exit(&self) {
         self.app_event_tx.send(AppEvent::ExitRequest);
+    }
+
+    fn on_raw_response_item(&mut self, event: RawResponseItemEvent) {
+        let RawResponseItemEvent { item } = event;
+        let ResponseItem::Message { role, content, .. } = item else {
+            return;
+        };
+
+        if role != "assistant" {
+            return;
+        }
+
+        let Some(conversation_id) = self.conversation_id else {
+            return;
+        };
+
+        let mut saved_any = false;
+        let mut last_saved_path: Option<PathBuf> = None;
+
+        for content_item in content {
+            if let ContentItem::InputImage { image_url } = content_item
+                && let Some(path) = self.save_generated_image(&conversation_id, &image_url) {
+                    saved_any = true;
+                    last_saved_path = Some(path);
+                }
+        }
+
+        if let (true, Some(path)) = (saved_any, last_saved_path) {
+            let display = display_path_for(&path, &self.config.cwd);
+            let hint = format!("{display} · run /open-image to open it");
+            self.add_to_history(history_cell::new_info_event(
+                "Generated image saved".to_string(),
+                Some(hint),
+            ));
+            self.last_generated_image_path = Some(path);
+            self.request_redraw();
+        }
+    }
+
+    fn save_generated_image(
+        &mut self,
+        conversation_id: &ConversationId,
+        image_url: &str,
+    ) -> Option<PathBuf> {
+        // Only handle data URLs of the form data:<mime>;base64,<data>.
+        let without_prefix = image_url.strip_prefix("data:")?;
+        let (meta, data_base64) = without_prefix.split_once(',')?;
+        let (mime, encoding) = meta.split_once(';')?;
+        if !encoding.eq_ignore_ascii_case("base64") {
+            return None;
+        }
+
+        let bytes = match BASE64_STANDARD.decode(data_base64) {
+            Ok(b) => b,
+            Err(err) => {
+                tracing::warn!("failed to decode generated image data: {err}");
+                return None;
+            }
+        };
+
+        let ext = match mime {
+            "image/jpeg" | "image/jpg" => "jpg",
+            "image/png" => "png",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            other => {
+                tracing::warn!("saving generated image with unrecognized mime type `{other}`");
+                "bin"
+            }
+        };
+
+        let dir = self
+            .config
+            .codex_home
+            .join("images")
+            .join(conversation_id.to_string());
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            tracing::warn!("failed to create images directory {}: {err}", dir.display());
+            return None;
+        }
+
+        let index = self.next_generated_image_index;
+        self.next_generated_image_index = self.next_generated_image_index.saturating_add(1);
+        let filename = format!("{index:06}.{ext}");
+        let path = dir.join(filename);
+        if let Err(err) = std::fs::write(&path, &bytes) {
+            tracing::warn!(
+                "failed to write generated image to {}: {err}",
+                path.display()
+            );
+            return None;
+        }
+
+        Some(path)
+    }
+
+    fn open_last_generated_image(&mut self) {
+        let Some(path) = self.last_generated_image_path.clone() else {
+            self.add_to_history(history_cell::new_info_event(
+                "No generated image is available to open yet.".to_string(),
+                None,
+            ));
+            self.request_redraw();
+            return;
+        };
+
+        let display = display_path_for(&path, &self.config.cwd);
+
+        match Self::open_image_in_viewer(&path) {
+            Ok(()) => {
+                self.add_to_history(history_cell::new_info_event(
+                    "Opening generated image".to_string(),
+                    Some(display),
+                ));
+            }
+            Err(error) => {
+                self.add_to_history(history_cell::new_error_event(format!(
+                    "Failed to open generated image: {error}"
+                )));
+            }
+        }
+
+        self.request_redraw();
+    }
+
+    fn open_image_in_viewer(path: &Path) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        let cmd_result = std::process::Command::new("open").arg(path).spawn();
+
+        #[cfg(target_os = "linux")]
+        let cmd_result = std::process::Command::new("xdg-open").arg(path).spawn();
+
+        #[cfg(target_os = "windows")]
+        let cmd_result = std::process::Command::new("cmd")
+            .args(["/C", "start", "", &path.to_string_lossy()])
+            .spawn();
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        let cmd_result = Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "opening images is not supported on this platform",
+        ));
+
+        cmd_result
+            .map(|_| ())
+            .map_err(|error| format!("failed to spawn image viewer: {error}"))
     }
 
     pub(crate) fn request_redraw(&mut self) {

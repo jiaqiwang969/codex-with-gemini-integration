@@ -1268,6 +1268,7 @@ version = "0.64.0-alpha.9-gemini-cbd7d0d5"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "base64",
  "clap",
  "codex-arg0",
  "codex-common",

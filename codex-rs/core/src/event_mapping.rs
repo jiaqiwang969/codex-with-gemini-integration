@@ -61,11 +61,18 @@ fn parse_agent_message(id: Option<&String>, message: &[ContentItem]) -> AgentMes
             ContentItem::OutputText { text } => {
                 content.push(AgentMessageContent::Text { text: text.clone() });
             }
-            _ => {
-                warn!(
-                    "Unexpected content item in agent message: {:?}",
-                    content_item
-                );
+            ContentItem::InputImage { .. } => {
+                // Represent image-only responses as a short textual marker so UIs
+                // can surface them without needing image support at this layer.
+                content.push(AgentMessageContent::Text {
+                    text: "[generated image output]".to_string(),
+                });
+            }
+            ContentItem::InputText { text } => {
+                // Treat stray input text in agent messages as regular text but
+                // keep a warning to help catch unexpected wiring issues.
+                warn!("Input text in agent message: {}", text);
+                content.push(AgentMessageContent::Text { text: text.clone() });
             }
         }
     }

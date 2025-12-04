@@ -389,6 +389,8 @@ fn make_chatwidget_manual() -> (
         last_rendered_width: std::cell::Cell::new(None),
         feedback: codex_feedback::CodexFeedback::new(),
         current_rollout_path: None,
+        next_generated_image_index: 0,
+        last_generated_image_path: None,
     };
     (widget, rx, op_rx)
 }

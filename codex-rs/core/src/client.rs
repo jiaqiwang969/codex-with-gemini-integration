@@ -705,6 +705,7 @@ async fn process_gemini_sse<S>(
     let mut last_response_id = "gemini-stream".to_string();
     let mut last_token_usage: Option<TokenUsage> = None;
     let mut last_thought_signature: Option<String> = None;
+    let mut last_inline_image: Option<(String, String)> = None; // (mime_type, data_base64)
 
     loop {
         let response = timeout(idle_timeout, stream.next()).await;
@@ -797,6 +798,15 @@ async fn process_gemini_sse<S>(
                             accumulated_text.push_str(&text);
                         }
 
+                        // Handle image content from image-capable Gemini models.
+                        if let Some(inline_data) = part.inline_data {
+                            if !inline_data.data.trim().is_empty()
+                                && !inline_data.mime_type.is_empty()
+                            {
+                                last_inline_image = Some((inline_data.mime_type, inline_data.data));
+                            }
+                        }
+
                         // Handle function call
                         if let Some(call) = part.function_call {
                             let args = if call.args.is_null() {
@@ -827,17 +837,30 @@ async fn process_gemini_sse<S>(
             thought_signature,
         };
         let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
-    } else if assistant_item_sent {
-        // Emit the complete message
-        let item = ResponseItem::Message {
-            id: None,
-            role: "assistant".to_string(),
-            content: vec![ContentItem::OutputText {
+    } else if assistant_item_sent || last_inline_image.is_some() {
+        // Emit the complete message, which may include text, an image, or both.
+        let mut content = Vec::new();
+        if !accumulated_text.is_empty() {
+            content.push(ContentItem::OutputText {
                 text: accumulated_text,
-            }],
-            thought_signature: last_thought_signature,
-        };
-        let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+            });
+        }
+        if let Some((mime_type, data)) = last_inline_image {
+            if !mime_type.is_empty() && !data.trim().is_empty() {
+                let image_url = format!("data:{mime_type};base64,{data}");
+                content.push(ContentItem::InputImage { image_url });
+            }
+        }
+
+        if !content.is_empty() {
+            let item = ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content,
+                thought_signature: last_thought_signature,
+            };
+            let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+        }
     }
 
     // Send completed event
@@ -946,6 +969,7 @@ fn build_gemini_contents(items: &[ResponseItem]) -> Vec<GeminiContentRequest> {
     // propagate the Gemini 3 thought_signature back on the function response.
     let mut last_function_call_name: Option<String> = None;
     let mut last_function_call_thought_signature: Option<String> = None;
+    let mut total_inline_images: usize = 0;
 
     for item in items {
         match item {
@@ -955,10 +979,39 @@ fn build_gemini_contents(items: &[ResponseItem]) -> Vec<GeminiContentRequest> {
                 thought_signature,
                 ..
             } => {
-                let parts = content_to_gemini_parts(content, thought_signature.as_deref());
+                let mut parts = content_to_gemini_parts(content, thought_signature.as_deref());
                 if parts.is_empty() {
                     continue;
                 }
+
+                // Enforce a soft cap on the number of inlineData image parts we send
+                // back to Gemini preview image models. Cursor's Nano Banana Pro docs
+                // recommend at most 14 reference images; once we exceed this budget
+                // we drop older images from earlier history while keeping text and
+                // tool call content intact. This keeps typical "edit last image"
+                // workflows fully powered while avoiding protocol-level limits.
+                const MAX_INLINE_IMAGES: usize = 14;
+                if total_inline_images >= MAX_INLINE_IMAGES {
+                    parts.retain(|part| part.inline_data.is_none());
+                } else {
+                    let available = MAX_INLINE_IMAGES.saturating_sub(total_inline_images);
+                    let mut kept_inline = 0usize;
+                    for part in &mut parts {
+                        if part.inline_data.is_some() {
+                            if kept_inline < available {
+                                kept_inline = kept_inline.saturating_add(1);
+                            } else {
+                                part.inline_data = None;
+                            }
+                        }
+                    }
+                    total_inline_images = total_inline_images.saturating_add(kept_inline);
+                }
+
+                if parts.is_empty() {
+                    continue;
+                }
+
                 contents.push(GeminiContentRequest {
                     role: Some(map_gemini_role(role)),
                     parts,
@@ -1352,7 +1405,8 @@ struct GeminiPartRequest {
     compat_thought_signature: Option<String>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct GeminiInlineData {
     mime_type: String,
     data: String,
@@ -1381,6 +1435,10 @@ struct GeminiContentResponse {
 struct GeminiPartResponse {
     #[serde(default)]
     text: Option<String>,
+
+    /// Image payloads returned by image-capable Gemini models (e.g. inlineData).
+    #[serde(rename = "inlineData", default)]
+    inline_data: Option<GeminiInlineData>,
 
     #[serde(rename = "functionCall", default, alias = "function_call")]
     function_call: Option<GeminiFunctionCall>,

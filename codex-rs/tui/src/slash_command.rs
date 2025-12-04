@@ -22,6 +22,7 @@ pub enum SlashCommand {
     Compact,
     Undo,
     Diff,
+    OpenImage,
     Mention,
     Agent,
     Status,
@@ -48,6 +49,7 @@ impl SlashCommand {
             SlashCommand::Undo => "ask Codex to undo a turn",
             SlashCommand::Quit | SlashCommand::Exit => "exit Codex",
             SlashCommand::Diff => "show git diff (including untracked files)",
+            SlashCommand::OpenImage => "open the most recently generated image",
             SlashCommand::Mention => "mention a file",
             SlashCommand::Agent => "switch into a delegated agent session",
             SlashCommand::Status => "show current session configuration and token usage",
@@ -79,6 +81,7 @@ impl SlashCommand {
             | SlashCommand::Review
             | SlashCommand::Logout => false,
             SlashCommand::Diff
+            | SlashCommand::OpenImage
             | SlashCommand::Mention
             | SlashCommand::Agent
             | SlashCommand::Status

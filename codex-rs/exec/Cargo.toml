@@ -47,6 +47,7 @@ ts-rs = { workspace = true, features = [
     "serde-json-impl",
     "no-serde-warnings",
 ] }
+base64 = { workspace = true }
 
 
 [dev-dependencies]

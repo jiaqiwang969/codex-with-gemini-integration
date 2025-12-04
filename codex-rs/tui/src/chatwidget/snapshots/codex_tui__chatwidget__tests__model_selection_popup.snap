@@ -5,9 +5,22 @@ expression: popup
   Select Model and Effort
   Access legacy models by running codex -m <model_name> or in your config.toml
 
-› 1. gpt-5.1-codex       Optimized for codex.
-  2. gpt-5.1-codex-mini  Optimized for codex. Cheaper, faster, but less
-                         capable.
-  3. gpt-5.1             Broad world knowledge with strong general reasoning.
+› 1. gpt-5.1-codex                          Optimized for codex.
+  2. gpt-5.1-codex-mini                     Optimized for codex. Cheaper,
+                                            faster, but less capable.
+  3. gpt-5.1                                Broad world knowledge with strong
+                                            general reasoning.
+  4. gemini-3-pro-preview                   Google Gemini 3 Pro preview.
+  5. gemini-3-pro-preview-codex             Gemini 3 Pro preview with Codex-
+                                            optimized behaviour for code and
+                                            tools.
+  6. gemini-3-pro-preview-thinking          Google Gemini 3 Pro preview with
+                                            thinking capability.
+  7. gemini-3-pro-preview-thinking-codex    Gemini 3 Pro preview with thinking
+                                            capability and Codex-optimized
+                                            behaviour.
+  8. gemini-3-pro-preview-thinking-germini  Gemini 3 Pro preview with thinking
+                                            capability and Germini-style
+                                            system prompt.
 
   Press enter to select reasoning effort, or esc to dismiss.

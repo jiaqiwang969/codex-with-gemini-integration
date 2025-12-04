@@ -16,6 +16,7 @@ use codex_core::protocol::McpToolCallBeginEvent;
 use codex_core::protocol::McpToolCallEndEvent;
 use codex_core::protocol::PatchApplyBeginEvent;
 use codex_core::protocol::PatchApplyEndEvent;
+use codex_core::protocol::RawResponseItemEvent;
 use codex_core::protocol::SessionConfiguredEvent;
 use codex_core::protocol::StreamErrorEvent;
 use codex_core::protocol::TaskCompleteEvent;
@@ -23,6 +24,9 @@ use codex_core::protocol::TurnAbortReason;
 use codex_core::protocol::TurnDiffEvent;
 use codex_core::protocol::WarningEvent;
 use codex_core::protocol::WebSearchEndEvent;
+use codex_protocol::ConversationId;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::num_format::format_with_separators;
 use owo_colors::OwoColorize;
 use owo_colors::Style;
@@ -34,6 +38,8 @@ use std::time::Instant;
 use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
 use crate::event_processor::handle_last_message;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_common::create_config_summary_entries;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
@@ -63,6 +69,9 @@ pub(crate) struct EventProcessorWithHumanOutput {
     last_message_path: Option<PathBuf>,
     last_total_token_usage: Option<codex_core::protocol::TokenUsageInfo>,
     final_message: Option<String>,
+    codex_home: PathBuf,
+    conversation_id: Option<ConversationId>,
+    next_generated_image_index: u64,
 }
 
 impl EventProcessorWithHumanOutput {
@@ -89,6 +98,9 @@ impl EventProcessorWithHumanOutput {
                 last_message_path,
                 last_total_token_usage: None,
                 final_message: None,
+                codex_home: config.codex_home.clone(),
+                conversation_id: None,
+                next_generated_image_index: 0,
             }
         } else {
             Self {
@@ -106,6 +118,9 @@ impl EventProcessorWithHumanOutput {
                 last_message_path,
                 last_total_token_usage: None,
                 final_message: None,
+                codex_home: config.codex_home.clone(),
+                conversation_id: None,
+                next_generated_image_index: 0,
             }
         }
     }
@@ -506,6 +521,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
 
                 ts_msg!(self, "model: {}", model);
                 eprintln!();
+                self.conversation_id = Some(conversation_id);
             }
             EventMsg::PlanUpdate(plan_update_event) => {
                 let UpdatePlanArgs { explanation, plan } = plan_update_event;
@@ -563,6 +579,9 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 ts_msg!(self, "context compacted");
             }
             EventMsg::ShutdownComplete => return CodexStatus::Shutdown,
+            EventMsg::RawResponseItem(ev) => {
+                self.on_raw_response_item(ev);
+            }
             EventMsg::WebSearchBegin(_)
             | EventMsg::ExecApprovalRequest(_)
             | EventMsg::ApplyPatchApprovalRequest(_)
@@ -570,7 +589,6 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             | EventMsg::GetHistoryEntryResponse(_)
             | EventMsg::McpListToolsResponse(_)
             | EventMsg::ListCustomPromptsResponse(_)
-            | EventMsg::RawResponseItem(_)
             | EventMsg::UserMessage(_)
             | EventMsg::EnteredReviewMode(_)
             | EventMsg::ExitedReviewMode(_)
@@ -609,6 +627,104 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 println!("{message}");
             }
         }
+    }
+}
+
+impl EventProcessorWithHumanOutput {
+    fn on_raw_response_item(&mut self, event: RawResponseItemEvent) {
+        let RawResponseItemEvent { item } = event;
+        let ResponseItem::Message { role, content, .. } = item else {
+            return;
+        };
+
+        if role != "assistant" {
+            return;
+        }
+
+        let Some(conversation_id) = self.conversation_id.clone() else {
+            return;
+        };
+
+        let mut saved_any = false;
+        let mut last_saved_path: Option<PathBuf> = None;
+
+        for content_item in content {
+            if let ContentItem::InputImage { image_url } = content_item {
+                if let Some(path) = self.save_generated_image(&conversation_id, &image_url) {
+                    saved_any = true;
+                    last_saved_path = Some(path);
+                }
+            }
+        }
+
+        if let (true, Some(path)) = (saved_any, last_saved_path) {
+            ts_msg!(
+                self,
+                "{} {}",
+                "generated image saved".style(self.magenta),
+                path.display()
+            );
+        }
+    }
+
+    fn save_generated_image(
+        &mut self,
+        conversation_id: &ConversationId,
+        image_url: &str,
+    ) -> Option<PathBuf> {
+        let without_prefix = image_url.strip_prefix("data:")?;
+        let (meta, data_base64) = without_prefix.split_once(',')?;
+        let (mime, encoding) = meta.split_once(';')?;
+        if !encoding.eq_ignore_ascii_case("base64") {
+            return None;
+        }
+
+        let bytes = match BASE64_STANDARD.decode(data_base64) {
+            Ok(b) => b,
+            Err(err) => {
+                tracing::warn!("failed to decode generated image data (exec): {err}");
+                return None;
+            }
+        };
+
+        let ext = match mime {
+            "image/jpeg" | "image/jpg" => "jpg",
+            "image/png" => "png",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            other => {
+                tracing::warn!(
+                    "saving generated image with unrecognized mime type `{other}` (exec)"
+                );
+                "bin"
+            }
+        };
+
+        let dir = self
+            .codex_home
+            .join("images")
+            .join(conversation_id.to_string());
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(
+                "failed to create images directory {} (exec): {err}",
+                dir.display()
+            );
+            return None;
+        }
+
+        let index = self.next_generated_image_index;
+        self.next_generated_image_index = self.next_generated_image_index.saturating_add(1);
+        let filename = format!("{index:06}.{ext}");
+        let path = dir.join(filename);
+        if let Err(err) = std::fs::write(&path, &bytes) {
+            tracing::warn!(
+                "failed to write generated image to {} (exec): {err}",
+                path.display()
+            );
+            return None;
+        }
+
+        Some(path)
     }
 }
 
