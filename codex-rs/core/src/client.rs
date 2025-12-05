@@ -605,9 +605,10 @@ instead (for example: `codex -p codex`), or execute the command manually in your
         let instructions = prompt
             .get_full_instructions(&self.config.model_family)
             .into_owned();
+        let sanitized_input = strip_thought_signatures_from_input(&prompt.input);
         let payload = ApiCompactionInput {
             model: &self.config.model,
-            input: &prompt.input,
+            input: &sanitized_input,
             instructions: &instructions,
         };
 
@@ -802,10 +803,10 @@ async fn process_gemini_sse<S>(
                         // Handle image content from image-capable Gemini models.
                         if let Some(inline_data) = part.inline_data
                             && !inline_data.data.trim().is_empty()
-                                && !inline_data.mime_type.is_empty()
-                            {
-                                last_inline_image = Some((inline_data.mime_type, inline_data.data));
-                            }
+                            && !inline_data.mime_type.is_empty()
+                        {
+                            last_inline_image = Some((inline_data.mime_type, inline_data.data));
+                        }
 
                         // Handle function call
                         if let Some(call) = part.function_call {
@@ -846,10 +847,12 @@ async fn process_gemini_sse<S>(
             });
         }
         if let Some((mime_type, data)) = last_inline_image
-            && !mime_type.is_empty() && !data.trim().is_empty() {
-                let image_url = format!("data:{mime_type};base64,{data}");
-                content.push(ContentItem::InputImage { image_url });
-            }
+            && !mime_type.is_empty()
+            && !data.trim().is_empty()
+        {
+            let image_url = format!("data:{mime_type};base64,{data}");
+            content.push(ContentItem::InputImage { image_url });
+        }
 
         if !content.is_empty() {
             let item = ResponseItem::Message {
@@ -1301,11 +1304,35 @@ impl ModelClient {
     }
 }
 
+/// Produces a sanitized copy of the input transcript where any Gemini‑specific
+/// `thought_signature` metadata attached to function calls is stripped.
+///
+/// This keeps internal Gemini state available inside `ResponseItem`s for
+/// Gemini requests while ensuring we do not send unknown fields such as
+/// `input[*].thought_signature` to non‑Gemini providers (for example the
+/// OpenAI Responses API).
+fn strip_thought_signatures_from_input(input: &[ResponseItem]) -> Vec<ResponseItem> {
+    input
+        .iter()
+        .cloned()
+        .map(|mut item| {
+            if let ResponseItem::FunctionCall {
+                thought_signature, ..
+            } = &mut item
+            {
+                *thought_signature = None;
+            }
+            item
+        })
+        .collect()
+}
+
 /// Adapts the core `Prompt` type into the `codex-api` payload shape.
 fn build_api_prompt(prompt: &Prompt, instructions: String, tools_json: Vec<Value>) -> ApiPrompt {
+    let input = strip_thought_signatures_from_input(&prompt.get_formatted_input());
     ApiPrompt {
         instructions,
-        input: prompt.get_formatted_input(),
+        input,
         tools: tools_json,
         parallel_tool_calls: prompt.parallel_tool_calls,
         output_schema: prompt.output_schema.clone(),

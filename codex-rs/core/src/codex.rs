@@ -1695,9 +1695,10 @@ mod handlers {
                 && let Some(ContentItem::InputImage { image_url }) = content
                     .into_iter()
                     .find(|entry| matches!(entry, ContentItem::InputImage { .. }))
-                    && !image_url.trim().is_empty() {
-                        images.push(image_url);
-                    }
+                && !image_url.trim().is_empty()
+            {
+                images.push(image_url);
+            }
         }
 
         let mut state = sess.state.lock().await;
@@ -2607,18 +2608,20 @@ fn derive_reference_images_for_turn(input: &[ResponseItem]) -> Vec<String> {
         .rposition(|item| matches!(item, ResponseItem::Message { role, .. } if role == "user"));
 
     if let Some(index) = last_user_index
-        && let ResponseItem::Message { content, .. } = &input[index] {
-            let mut urls: Vec<String> = Vec::new();
-            for entry in content {
-                if let ContentItem::InputImage { image_url } = entry
-                    && !image_url.trim().is_empty() {
-                        urls.push(image_url.clone());
-                    }
-            }
-            if !urls.is_empty() {
-                return urls;
+        && let ResponseItem::Message { content, .. } = &input[index]
+    {
+        let mut urls: Vec<String> = Vec::new();
+        for entry in content {
+            if let ContentItem::InputImage { image_url } = entry
+                && !image_url.trim().is_empty()
+            {
+                urls.push(image_url.clone());
             }
         }
+        if !urls.is_empty() {
+            return urls;
+        }
+    }
 
     // Otherwise, fall back to the last assistant message that carried an image.
     for item in input.iter().rev() {
@@ -2629,9 +2632,10 @@ fn derive_reference_images_for_turn(input: &[ResponseItem]) -> Vec<String> {
 
             for entry in content.iter().rev() {
                 if let ContentItem::InputImage { image_url } = entry
-                    && !image_url.trim().is_empty() {
-                        return vec![image_url.clone()];
-                    }
+                    && !image_url.trim().is_empty()
+                {
+                    return vec![image_url.clone()];
+                }
             }
         }
     }
