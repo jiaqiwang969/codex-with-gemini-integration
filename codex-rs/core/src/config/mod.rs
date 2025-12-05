@@ -331,15 +331,19 @@ impl Config {
     /// Determine if switching to a different model should also switch the
     /// configured model provider.
     ///
-    /// Today this is only used to move between the built‑in OpenAI (`openai`)
-    /// and Gemini (`gemini`) providers when users pick models from those
-    /// families via the TUI. The logic is intentionally conservative:
+    /// Today this is only used to move between the built‑in OpenAI‑style
+    /// providers (`openai`, `openai-proxy`) and Gemini (`gemini`) when
+    /// users pick models from those families via the TUI. The logic is
+    /// intentionally conservative:
     ///
     /// - Selecting a `gemini-*` model will switch to the `gemini` provider
     ///   *only* if the current provider is not already `gemini`.
     /// - Selecting a non‑Gemini model will switch **away** from the `gemini`
-    ///   provider to `openai` (if configured) so that users can move back
-    ///   to GPT‑style models from a Gemini session.
+    ///   provider to an OpenAI‑style provider so that users can move back
+    ///   to GPT‑style models from a Gemini session. When both an explicit
+    ///   `openai-proxy` and the built‑in `openai` providers are configured,
+    ///   `openai-proxy` is preferred to keep traffic flowing through the
+    ///   proxy even when users switch models mid‑session.
     ///
     /// Third‑party providers (e.g. openrouter) are never auto‑switched by
     /// this helper; they must be selected explicitly via config profiles.
@@ -348,17 +352,33 @@ impl Config {
         current_provider_id: Option<&str>,
         model: &str,
     ) -> Option<String> {
-        // Determine the effective current provider id. Callers can pass an
-        // explicit id (e.g. derived from SessionConfiguration); otherwise we
-        // fall back to the Config's own model_provider_id / provider map.
-        let current_provider_id = current_provider_id.or_else(|| {
-            // Fast path: Config already knows its provider id.
+        let current_provider_id = self.effective_provider_id(current_provider_id);
+
+        if model.starts_with("gemini-") {
+            return self.preferred_gemini_provider_id(current_provider_id);
+        }
+
+        if current_provider_id == Some("gemini") {
+            return self.preferred_openai_like_provider_id();
+        }
+
+        None
+    }
+}
+
+impl Config {
+    /// Determine the effective current provider id. Callers can pass an
+    /// explicit id (e.g. derived from `SessionConfiguration`); otherwise we
+    /// fall back to the Config's own `model_provider_id` / provider map.
+    fn effective_provider_id<'a>(
+        &'a self,
+        current_provider_id: Option<&'a str>,
+    ) -> Option<&'a str> {
+        current_provider_id.or_else(|| {
             let id = self.model_provider_id.as_str();
             if self.model_providers.contains_key(id) {
                 Some(id)
             } else {
-                // Fallback: look up by provider value in case the Config's
-                // provider was replaced or cloned.
                 self.model_providers.iter().find_map(|(key, provider)| {
                     if *provider == self.model_provider {
                         Some(key.as_str())
@@ -367,38 +387,31 @@ impl Config {
                     }
                 })
             }
-        });
+        })
+    }
 
-        let is_gemini_model = model.starts_with("gemini-");
-
-        if is_gemini_model {
-            // Switch to the built‑in Gemini provider when selecting a
-            // Gemini‑family model from a non‑Gemini provider.
-            if current_provider_id == Some("gemini") {
-                return None;
-            }
-            if self.model_providers.contains_key("gemini") {
-                return Some("gemini".to_string());
-            }
-        } else if current_provider_id == Some("gemini") {
-            // When starting from a Gemini provider, switch back to an
-            // OpenAI‑style provider for non‑Gemini models (e.g. gpt‑5.1‑codex).
-            //
-            // Prefer an explicit `openai-proxy` entry when present so that
-            // deployments using `codex-responses-api-proxy` or a similar
-            // hardened gateway continue to route GPT traffic through that
-            // proxy even when users switch models mid‑session.
-            if self.model_providers.contains_key("openai-proxy") {
-                return Some("openai-proxy".to_string());
-            }
-
-            // Fall back to the built‑in `openai` provider when no proxy is
-            // configured.
-            if self.model_providers.contains_key("openai") {
-                return Some("openai".to_string());
-            }
+    /// Returns the preferred Gemini provider id for a `gemini-*` model,
+    /// taking the current provider into account.
+    fn preferred_gemini_provider_id(&self, current_provider_id: Option<&str>) -> Option<String> {
+        if current_provider_id == Some("gemini") {
+            return None;
         }
+        if self.model_providers.contains_key("gemini") {
+            return Some("gemini".to_string());
+        }
+        None
+    }
 
+    /// Returns the preferred OpenAI‑style provider id when switching away
+    /// from the `gemini` provider. Prefers an explicit `openai-proxy` entry
+    /// when present, otherwise falls back to the built‑in `openai` provider.
+    fn preferred_openai_like_provider_id(&self) -> Option<String> {
+        if self.model_providers.contains_key("openai-proxy") {
+            return Some("openai-proxy".to_string());
+        }
+        if self.model_providers.contains_key("openai") {
+            return Some("openai".to_string());
+        }
         None
     }
 }
