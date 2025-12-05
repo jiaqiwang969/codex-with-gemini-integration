@@ -1691,16 +1691,13 @@ mod handlers {
 
             let input = UserInput::LocalImage { path: absolute };
             let item = ResponseInputItem::from(vec![input]);
-            if let ResponseInputItem::Message { content, .. } = item {
-                if let Some(ContentItem::InputImage { image_url }) = content
+            if let ResponseInputItem::Message { content, .. } = item
+                && let Some(ContentItem::InputImage { image_url }) = content
                     .into_iter()
                     .find(|entry| matches!(entry, ContentItem::InputImage { .. }))
-                {
-                    if !image_url.trim().is_empty() {
+                    && !image_url.trim().is_empty() {
                         images.push(image_url);
                     }
-                }
-            }
         }
 
         let mut state = sess.state.lock().await;
@@ -2609,21 +2606,19 @@ fn derive_reference_images_for_turn(input: &[ResponseItem]) -> Vec<String> {
         .iter()
         .rposition(|item| matches!(item, ResponseItem::Message { role, .. } if role == "user"));
 
-    if let Some(index) = last_user_index {
-        if let ResponseItem::Message { content, .. } = &input[index] {
+    if let Some(index) = last_user_index
+        && let ResponseItem::Message { content, .. } = &input[index] {
             let mut urls: Vec<String> = Vec::new();
             for entry in content {
-                if let ContentItem::InputImage { image_url } = entry {
-                    if !image_url.trim().is_empty() {
+                if let ContentItem::InputImage { image_url } = entry
+                    && !image_url.trim().is_empty() {
                         urls.push(image_url.clone());
                     }
-                }
             }
             if !urls.is_empty() {
                 return urls;
             }
         }
-    }
 
     // Otherwise, fall back to the last assistant message that carried an image.
     for item in input.iter().rev() {
@@ -2633,11 +2628,10 @@ fn derive_reference_images_for_turn(input: &[ResponseItem]) -> Vec<String> {
             }
 
             for entry in content.iter().rev() {
-                if let ContentItem::InputImage { image_url } = entry {
-                    if !image_url.trim().is_empty() {
+                if let ContentItem::InputImage { image_url } = entry
+                    && !image_url.trim().is_empty() {
                         return vec![image_url.clone()];
                     }
-                }
             }
         }
     }

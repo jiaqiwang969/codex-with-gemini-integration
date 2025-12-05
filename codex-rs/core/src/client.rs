@@ -800,13 +800,12 @@ async fn process_gemini_sse<S>(
                         }
 
                         // Handle image content from image-capable Gemini models.
-                        if let Some(inline_data) = part.inline_data {
-                            if !inline_data.data.trim().is_empty()
+                        if let Some(inline_data) = part.inline_data
+                            && !inline_data.data.trim().is_empty()
                                 && !inline_data.mime_type.is_empty()
                             {
                                 last_inline_image = Some((inline_data.mime_type, inline_data.data));
                             }
-                        }
 
                         // Handle function call
                         if let Some(call) = part.function_call {
@@ -846,12 +845,11 @@ async fn process_gemini_sse<S>(
                 text: accumulated_text,
             });
         }
-        if let Some((mime_type, data)) = last_inline_image {
-            if !mime_type.is_empty() && !data.trim().is_empty() {
+        if let Some((mime_type, data)) = last_inline_image
+            && !mime_type.is_empty() && !data.trim().is_empty() {
                 let image_url = format!("data:{mime_type};base64,{data}");
                 content.push(ContentItem::InputImage { image_url });
             }
-        }
 
         if !content.is_empty() {
             let item = ResponseItem::Message {

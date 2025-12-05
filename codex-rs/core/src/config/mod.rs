@@ -380,12 +380,23 @@ impl Config {
             if self.model_providers.contains_key("gemini") {
                 return Some("gemini".to_string());
             }
-        } else if current_provider_id == Some("gemini")
-            && self.model_providers.contains_key("openai")
-        {
-            // When starting from a Gemini provider, switch back to OpenAI
-            // for non‑Gemini models (e.g. gpt‑5.1‑codex).
-            return Some("openai".to_string());
+        } else if current_provider_id == Some("gemini") {
+            // When starting from a Gemini provider, switch back to an
+            // OpenAI‑style provider for non‑Gemini models (e.g. gpt‑5.1‑codex).
+            //
+            // Prefer an explicit `openai-proxy` entry when present so that
+            // deployments using `codex-responses-api-proxy` or a similar
+            // hardened gateway continue to route GPT traffic through that
+            // proxy even when users switch models mid‑session.
+            if self.model_providers.contains_key("openai-proxy") {
+                return Some("openai-proxy".to_string());
+            }
+
+            // Fall back to the built‑in `openai` provider when no proxy is
+            // configured.
+            if self.model_providers.contains_key("openai") {
+                return Some("openai".to_string());
+            }
         }
 
         None
@@ -3516,7 +3527,7 @@ model_verbosity = "high"
         assert_eq!(provider_for_gemini.as_deref(), Some("gemini"));
 
         // When starting from Gemini and selecting a non‑Gemini model, prefer
-        // the built‑in `openai` provider.
+        // the built‑in `openai` provider when no proxy is configured.
         let provider_for_gpt =
             config.preferred_model_provider_id_for_model(Some("gemini"), "gpt-5.1-codex");
         assert_eq!(provider_for_gpt.as_deref(), Some("openai"));
@@ -3534,6 +3545,53 @@ model_verbosity = "high"
         let no_change =
             config.preferred_model_provider_id_for_model(Some("openai"), "gpt-5.1-codex-max");
         assert_eq!(no_change, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn preferred_model_provider_id_prefers_openai_proxy_when_present() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+
+        // Start from the default config, then inject an explicit openai‑proxy
+        // provider so we can verify that the helper prefers it over the
+        // built‑in openai provider when switching away from Gemini.
+        let mut cfg = ConfigToml::default();
+        cfg.model_providers.insert(
+            "openai-proxy".to_string(),
+            ModelProviderInfo {
+                name: "Codex OpenAI Proxy".to_string(),
+                base_url: Some("https://proxy.example.com/v1".to_string()),
+                env_key: None,
+                env_key_instructions: None,
+                experimental_bearer_token: None,
+                auth_json_key: None,
+                wire_api: crate::WireApi::Responses,
+                query_params: None,
+                http_headers: None,
+                env_http_headers: None,
+                request_max_retries: None,
+                stream_max_retries: None,
+                stream_idle_timeout_ms: None,
+                requires_openai_auth: true,
+            },
+        );
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        // Sanity‑check: both providers are visible to the config.
+        assert!(config.model_providers.contains_key("openai"));
+        assert!(config.model_providers.contains_key("openai-proxy"));
+
+        // When starting from Gemini and selecting a non‑Gemini model, prefer
+        // the explicit `openai-proxy` provider over the built‑in `openai`.
+        let provider_for_gpt =
+            config.preferred_model_provider_id_for_model(Some("gemini"), "gpt-5.1-codex");
+        assert_eq!(provider_for_gpt.as_deref(), Some("openai-proxy"));
 
         Ok(())
     }
