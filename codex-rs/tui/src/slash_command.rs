@@ -23,6 +23,9 @@ pub enum SlashCommand {
     Undo,
     Diff,
     OpenImage,
+    RefImage,
+    RefLastImage,
+    ClearRef,
     Mention,
     Agent,
     Status,
@@ -50,6 +53,11 @@ impl SlashCommand {
             SlashCommand::Quit | SlashCommand::Exit => "exit Codex",
             SlashCommand::Diff => "show git diff (including untracked files)",
             SlashCommand::OpenImage => "open the most recently generated image",
+            SlashCommand::RefImage => "set reference images for image models",
+            SlashCommand::RefLastImage => {
+                "use the last generated image as the only reference image"
+            }
+            SlashCommand::ClearRef => "clear active reference images",
             SlashCommand::Mention => "mention a file",
             SlashCommand::Agent => "switch into a delegated agent session",
             SlashCommand::Status => "show current session configuration and token usage",
@@ -82,6 +90,9 @@ impl SlashCommand {
             | SlashCommand::Logout => false,
             SlashCommand::Diff
             | SlashCommand::OpenImage
+            | SlashCommand::RefImage
+            | SlashCommand::RefLastImage
+            | SlashCommand::ClearRef
             | SlashCommand::Mention
             | SlashCommand::Agent
             | SlashCommand::Status

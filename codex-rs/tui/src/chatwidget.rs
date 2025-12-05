@@ -1725,6 +1725,72 @@ impl ChatWidget {
             SlashCommand::OpenImage => {
                 self.open_last_generated_image();
             }
+            SlashCommand::RefImage => {
+                let raw = args.unwrap_or_default();
+                let paths: Vec<String> = raw
+                    .split_whitespace()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                if paths.is_empty() {
+                    self.add_info_message(
+                        "Usage: /ref-image <path1> <path2> ...".to_string(),
+                        None,
+                    );
+                    return;
+                }
+
+                let resolved: Vec<PathBuf> = paths
+                    .iter()
+                    .map(PathBuf::from)
+                    .map(|p| {
+                        if p.is_absolute() {
+                            p
+                        } else {
+                            self.config.cwd.join(p)
+                        }
+                    })
+                    .collect();
+
+                self.app_event_tx
+                    .send(AppEvent::CodexOp(Op::SetReferenceImages {
+                        paths: resolved.clone(),
+                    }));
+
+                let display_paths: Vec<String> = resolved
+                    .iter()
+                    .map(|p| display_path_for(p, &self.config.cwd))
+                    .collect();
+                self.add_info_message(
+                    format!("Reference images set: {}", display_paths.join(", ")),
+                    None,
+                );
+            }
+            SlashCommand::RefLastImage => {
+                let Some(path) = self.last_generated_image_path.clone() else {
+                    self.add_info_message(
+                        "No generated image is available to use as a reference yet.".to_string(),
+                        None,
+                    );
+                    return;
+                };
+
+                self.app_event_tx
+                    .send(AppEvent::CodexOp(Op::SetReferenceImages {
+                        paths: vec![path.clone()],
+                    }));
+
+                let display = display_path_for(&path, &self.config.cwd);
+                self.add_info_message(
+                    format!("Reference image set to last generated image: {display}"),
+                    None,
+                );
+            }
+            SlashCommand::ClearRef => {
+                self.app_event_tx
+                    .send(AppEvent::CodexOp(Op::ClearReferenceImages));
+                self.add_info_message("Reference images cleared.".to_string(), None);
+            }
             SlashCommand::Mention => {
                 self.insert_str("@");
             }
@@ -2140,10 +2206,11 @@ impl ChatWidget {
 
         for content_item in content {
             if let ContentItem::InputImage { image_url } = content_item
-                && let Some(path) = self.save_generated_image(&conversation_id, &image_url) {
-                    saved_any = true;
-                    last_saved_path = Some(path);
-                }
+                && let Some(path) = self.save_generated_image(&conversation_id, &image_url)
+            {
+                saved_any = true;
+                last_saved_path = Some(path);
+            }
         }
 
         if let (true, Some(path)) = (saved_any, last_saved_path) {

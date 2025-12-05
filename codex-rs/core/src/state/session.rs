@@ -14,6 +14,10 @@ pub(crate) struct SessionState {
     pub(crate) session_configuration: SessionConfiguration,
     pub(crate) history: ContextManager,
     pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
+    /// Active reference images for this session. When non-empty, these override
+    /// per-turn heuristics for selecting image inlineData in image-capable
+    /// models.
+    pub(crate) active_reference_images: Vec<String>,
 }
 
 impl SessionState {
@@ -24,6 +28,7 @@ impl SessionState {
             session_configuration,
             history,
             latest_rate_limits: None,
+            active_reference_images: Vec::new(),
         }
     }
 
@@ -77,5 +82,17 @@ impl SessionState {
 
     pub(crate) fn get_total_token_usage(&self) -> i64 {
         self.history.get_total_token_usage()
+    }
+
+    pub(crate) fn set_reference_images(&mut self, images: Vec<String>) {
+        self.active_reference_images = images;
+    }
+
+    pub(crate) fn clear_reference_images(&mut self) {
+        self.active_reference_images.clear();
+    }
+
+    pub(crate) fn reference_images(&self) -> &[String] {
+        &self.active_reference_images
     }
 }

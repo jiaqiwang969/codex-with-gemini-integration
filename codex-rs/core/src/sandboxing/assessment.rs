@@ -111,7 +111,6 @@ pub(crate) async fn assess_command(
         .unwrap_or(user_prompt_section)
         .trim()
         .to_string();
-
     let prompt = Prompt {
         input: vec![ResponseItem::Message {
             id: None,
@@ -119,6 +118,7 @@ pub(crate) async fn assess_command(
             content: vec![ContentItem::InputText { text: user_prompt }],
             thought_signature: None,
         }],
+        reference_images: Vec::new(),
         tools: Vec::new(),
         parallel_tool_calls: false,
         base_instructions_override: Some(system_prompt),

@@ -196,6 +196,21 @@ pub enum Op {
     /// Request a code review from the agent.
     Review { review_request: ReviewRequest },
 
+    /// Set the active reference images for subsequent turns in this session.
+    ///
+    /// Paths may be absolute or relative to the session `cwd`. The core
+    /// session will resolve them and convert each path into an image
+    /// data URL suitable for inlineData image models.
+    SetReferenceImages {
+        /// Image paths to treat as reference images, in user-specified order.
+        paths: Vec<PathBuf>,
+    },
+
+    /// Clear any active reference images so subsequent turns use only
+    /// per-turn heuristics (such as explicit user images or the last
+    /// assistant image) when selecting inlineData.
+    ClearReferenceImages,
+
     /// Request to shut down codex instance.
     Shutdown,
 

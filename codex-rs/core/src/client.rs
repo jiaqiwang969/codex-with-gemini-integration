@@ -230,7 +230,8 @@ impl ModelClient {
         let instructions = prompt
             .get_full_instructions(&self.config.model_family)
             .into_owned();
-        let contents = build_gemini_contents(&prompt.get_formatted_input());
+        let contents =
+            build_gemini_contents(&prompt.get_formatted_input(), &prompt.reference_images);
         if contents.is_empty() {
             return Err(CodexErr::UnsupportedOperation(
                 "Gemini requests require at least one message".to_string(),
@@ -963,13 +964,15 @@ fn candidate_to_response_item(candidate: GeminiCandidate) -> Option<ResponseItem
     }
 }
 
-fn build_gemini_contents(items: &[ResponseItem]) -> Vec<GeminiContentRequest> {
+fn build_gemini_contents(
+    items: &[ResponseItem],
+    reference_images: &[String],
+) -> Vec<GeminiContentRequest> {
     let mut contents = Vec::new();
     // Track the last function call so we can pair it with the response and
     // propagate the Gemini 3 thought_signature back on the function response.
     let mut last_function_call_name: Option<String> = None;
     let mut last_function_call_thought_signature: Option<String> = None;
-    let mut total_inline_images: usize = 0;
 
     for item in items {
         match item {
@@ -979,35 +982,7 @@ fn build_gemini_contents(items: &[ResponseItem]) -> Vec<GeminiContentRequest> {
                 thought_signature,
                 ..
             } => {
-                let mut parts = content_to_gemini_parts(content, thought_signature.as_deref());
-                if parts.is_empty() {
-                    continue;
-                }
-
-                // Enforce a soft cap on the number of inlineData image parts we send
-                // back to Gemini preview image models. Cursor's Nano Banana Pro docs
-                // recommend at most 14 reference images; once we exceed this budget
-                // we drop older images from earlier history while keeping text and
-                // tool call content intact. This keeps typical "edit last image"
-                // workflows fully powered while avoiding protocol-level limits.
-                const MAX_INLINE_IMAGES: usize = 14;
-                if total_inline_images >= MAX_INLINE_IMAGES {
-                    parts.retain(|part| part.inline_data.is_none());
-                } else {
-                    let available = MAX_INLINE_IMAGES.saturating_sub(total_inline_images);
-                    let mut kept_inline = 0usize;
-                    for part in &mut parts {
-                        if part.inline_data.is_some() {
-                            if kept_inline < available {
-                                kept_inline = kept_inline.saturating_add(1);
-                            } else {
-                                part.inline_data = None;
-                            }
-                        }
-                    }
-                    total_inline_images = total_inline_images.saturating_add(kept_inline);
-                }
-
+                let parts = content_to_gemini_parts(content, thought_signature.as_deref());
                 if parts.is_empty() {
                     continue;
                 }
@@ -1077,6 +1052,9 @@ fn build_gemini_contents(items: &[ResponseItem]) -> Vec<GeminiContentRequest> {
             _ => {}
         }
     }
+
+    append_reference_images_to_contents(&mut contents, reference_images);
+
     contents
 }
 
@@ -1094,50 +1072,18 @@ fn content_to_gemini_parts(
 ) -> Vec<GeminiPartRequest> {
     let mut parts = Vec::new();
     for entry in content {
-        match entry {
-            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-                if text.trim().is_empty() {
-                    continue;
-                }
-                parts.push(GeminiPartRequest {
-                    text: Some(text.clone()),
-                    inline_data: None,
-                    function_call: None,
-                    function_response: None,
-                    thought_signature: None,
-                    compat_thought_signature: None,
-                });
+        if let ContentItem::InputText { text } | ContentItem::OutputText { text } = entry {
+            if text.trim().is_empty() {
+                continue;
             }
-            ContentItem::InputImage { image_url } => {
-                if let Some((mime, data)) = parse_data_url(image_url) {
-                    if data.trim().is_empty() {
-                        continue;
-                    }
-                    parts.push(GeminiPartRequest {
-                        text: None,
-                        inline_data: Some(GeminiInlineData {
-                            mime_type: mime,
-                            data,
-                        }),
-                        function_call: None,
-                        function_response: None,
-                        thought_signature: None,
-                        compat_thought_signature: None,
-                    });
-                } else if !image_url.trim().is_empty() {
-                    // Fallback: preserve the URL as plain text hint when we cannot
-                    // parse a data URL. This keeps non-data URLs usable even if the
-                    // Gemini endpoint only understands inline data/file references.
-                    parts.push(GeminiPartRequest {
-                        text: Some(format!("Image reference: {image_url}")),
-                        inline_data: None,
-                        function_call: None,
-                        function_response: None,
-                        thought_signature: None,
-                        compat_thought_signature: None,
-                    });
-                }
-            }
+            parts.push(GeminiPartRequest {
+                text: Some(text.clone()),
+                inline_data: None,
+                function_call: None,
+                function_response: None,
+                thought_signature: None,
+                compat_thought_signature: None,
+            });
         }
     }
     if let Some(sig) = message_thought_signature
@@ -1211,6 +1157,70 @@ fn ensure_active_loop_has_thought_signatures(
     }
 
     new_contents
+}
+
+fn append_reference_images_to_contents(
+    contents: &mut Vec<GeminiContentRequest>,
+    reference_images: &[String],
+) {
+    if reference_images.is_empty() {
+        return;
+    }
+
+    // Enforce a soft cap on the number of inlineData image parts we send
+    // back to Gemini preview image models. Cursor's Nano Banana Pro docs
+    // recommend at most 14 reference images; once we exceed this budget we
+    // drop extras while keeping text and tool call content intact.
+    const MAX_INLINE_IMAGES: usize = 14;
+    let limit = reference_images.len().min(MAX_INLINE_IMAGES);
+
+    let user_index = contents.iter().rposition(|content| {
+        content
+            .role
+            .as_deref()
+            .is_some_and(|role| role.eq_ignore_ascii_case("user"))
+    });
+
+    let index = if let Some(i) = user_index {
+        i
+    } else {
+        contents.push(GeminiContentRequest {
+            role: Some("user".to_string()),
+            parts: Vec::new(),
+        });
+        contents.len().saturating_sub(1)
+    };
+
+    for image_url in reference_images.iter().take(limit) {
+        if let Some((mime, data)) = parse_data_url(image_url) {
+            if mime.is_empty() || data.trim().is_empty() {
+                continue;
+            }
+            contents[index].parts.push(GeminiPartRequest {
+                text: None,
+                inline_data: Some(GeminiInlineData {
+                    mime_type: mime,
+                    data,
+                }),
+                function_call: None,
+                function_response: None,
+                thought_signature: None,
+                compat_thought_signature: None,
+            });
+        } else if !image_url.trim().is_empty() {
+            // Fallback: preserve the URL as plain text hint when we cannot
+            // parse a data URL. This keeps non-data URLs usable even if the
+            // Gemini endpoint only understands inline data/file references.
+            contents[index].parts.push(GeminiPartRequest {
+                text: Some(format!("Image reference: {image_url}")),
+                inline_data: None,
+                function_call: None,
+                function_response: None,
+                thought_signature: None,
+                compat_thought_signature: None,
+            });
+        }
+    }
 }
 
 fn parse_data_url(url: &str) -> Option<(String, String)> {

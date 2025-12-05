@@ -1524,6 +1524,12 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
             Op::Compact => {
                 handlers::compact(&sess, sub.id.clone()).await;
             }
+            Op::SetReferenceImages { paths } => {
+                handlers::set_reference_images(&sess, paths).await;
+            }
+            Op::ClearReferenceImages => {
+                handlers::clear_reference_images(&sess).await;
+            }
             Op::RunUserShellCommand { command } => {
                 handlers::run_user_shell_command(
                     &sess,
@@ -1578,10 +1584,13 @@ mod handlers {
     use codex_protocol::protocol::ReviewRequest;
     use codex_protocol::protocol::TurnAbortReason;
 
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::ResponseInputItem;
     use codex_protocol::user_input::UserInput;
     use codex_rmcp_client::ElicitationAction;
     use codex_rmcp_client::ElicitationResponse;
     use mcp_types::RequestId;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use tracing::info;
     use tracing::warn;
@@ -1663,6 +1672,44 @@ mod handlers {
         )
         .await;
         *previous_context = Some(turn_context);
+    }
+
+    pub async fn set_reference_images(sess: &Arc<Session>, paths: Vec<PathBuf>) {
+        let cwd = {
+            let state = sess.state.lock().await;
+            state.session_configuration.cwd.clone()
+        };
+
+        let mut images: Vec<String> = Vec::new();
+
+        for path in paths {
+            let absolute = if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            };
+
+            let input = UserInput::LocalImage { path: absolute };
+            let item = ResponseInputItem::from(vec![input]);
+            if let ResponseInputItem::Message { content, .. } = item {
+                if let Some(ContentItem::InputImage { image_url }) = content
+                    .into_iter()
+                    .find(|entry| matches!(entry, ContentItem::InputImage { .. }))
+                {
+                    if !image_url.trim().is_empty() {
+                        images.push(image_url);
+                    }
+                }
+            }
+        }
+
+        let mut state = sess.state.lock().await;
+        state.set_reference_images(images);
+    }
+
+    pub async fn clear_reference_images(sess: &Arc<Session>) {
+        let mut state = sess.state.lock().await;
+        state.clear_reference_images();
     }
 
     pub async fn resolve_elicitation(
@@ -2158,8 +2205,18 @@ async fn run_turn(
             base_instructions = Some(new_instructions);
         }
     }
+    let persisted_reference_images = {
+        let state = sess.state.lock().await;
+        state.reference_images().to_vec()
+    };
+    let reference_images = if persisted_reference_images.is_empty() {
+        derive_reference_images_for_turn(&input)
+    } else {
+        persisted_reference_images
+    };
     let prompt = Prompt {
         input,
+        reference_images,
         tools: router.specs(),
         parallel_tool_calls,
         base_instructions_override: base_instructions,
@@ -2546,6 +2603,48 @@ why and rephrase your request.",
     }
 }
 
+fn derive_reference_images_for_turn(input: &[ResponseItem]) -> Vec<String> {
+    // Prefer explicit images attached to the last user message in this turn.
+    let last_user_index = input
+        .iter()
+        .rposition(|item| matches!(item, ResponseItem::Message { role, .. } if role == "user"));
+
+    if let Some(index) = last_user_index {
+        if let ResponseItem::Message { content, .. } = &input[index] {
+            let mut urls: Vec<String> = Vec::new();
+            for entry in content {
+                if let ContentItem::InputImage { image_url } = entry {
+                    if !image_url.trim().is_empty() {
+                        urls.push(image_url.clone());
+                    }
+                }
+            }
+            if !urls.is_empty() {
+                return urls;
+            }
+        }
+    }
+
+    // Otherwise, fall back to the last assistant message that carried an image.
+    for item in input.iter().rev() {
+        if let ResponseItem::Message { role, content, .. } = item {
+            if role != "assistant" {
+                continue;
+            }
+
+            for entry in content.iter().rev() {
+                if let ContentItem::InputImage { image_url } = entry {
+                    if !image_url.trim().is_empty() {
+                        return vec![image_url.clone()];
+                    }
+                }
+            }
+        }
+    }
+
+    Vec::new()
+}
+
 async fn handle_non_tool_response_item(item: &ResponseItem) -> Option<TurnItem> {
     debug!(?item, "Output item");
 
@@ -2625,6 +2724,101 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration as StdDuration;
+
+    #[test]
+    fn derive_reference_images_prefers_user_images() {
+        let user_image_1 = "data:image/png;base64,one".to_string();
+        let user_image_2 = "data:image/jpeg;base64,two".to_string();
+
+        let items = vec![
+            ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "hello".to_string(),
+                }],
+                thought_signature: None,
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![
+                    ContentItem::InputText {
+                        text: "describe image".to_string(),
+                    },
+                    ContentItem::InputImage {
+                        image_url: user_image_1.clone(),
+                    },
+                    ContentItem::InputImage {
+                        image_url: user_image_2.clone(),
+                    },
+                ],
+                thought_signature: None,
+            },
+        ];
+
+        let got = derive_reference_images_for_turn(&items);
+        assert_eq!(got, vec![user_image_1, user_image_2]);
+    }
+
+    #[test]
+    fn derive_reference_images_falls_back_to_last_assistant_image() {
+        let early = "data:image/png;base64,early".to_string();
+        let latest = "data:image/png;base64,latest".to_string();
+
+        let items = vec![
+            ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::InputImage { image_url: early }],
+                thought_signature: None,
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "just text".to_string(),
+                }],
+                thought_signature: None,
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::InputImage {
+                    image_url: latest.clone(),
+                }],
+                thought_signature: None,
+            },
+        ];
+
+        let got = derive_reference_images_for_turn(&items);
+        assert_eq!(got, vec![latest]);
+    }
+
+    #[test]
+    fn derive_reference_images_returns_empty_when_no_images() {
+        let items = vec![
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "hello".to_string(),
+                }],
+                thought_signature: None,
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "world".to_string(),
+                }],
+                thought_signature: None,
+            },
+        ];
+
+        let got = derive_reference_images_for_turn(&items);
+        assert_eq!(got, Vec::<String>::new());
+    }
 
     #[test]
     fn reconstruct_history_matches_live_compactions() {

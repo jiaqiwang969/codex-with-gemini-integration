@@ -43,6 +43,7 @@ async fn run_remote_compact_task_inner_impl(
     let mut history = sess.clone_history().await;
     let prompt = Prompt {
         input: history.get_history_for_prompt(),
+        reference_images: Vec::new(),
         tools: vec![],
         parallel_tool_calls: false,
         base_instructions_override: turn_context.base_instructions.clone(),

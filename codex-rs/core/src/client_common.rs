@@ -29,6 +29,12 @@ pub struct Prompt {
     /// Conversation context input items.
     pub input: Vec<ResponseItem>,
 
+    /// Reference images that should be attached to this turn as inlineData
+    /// parts when targeting image-capable models (e.g., Gemini 3 Pro image).
+    /// The order of entries is preserved when building the request so prompts
+    /// can refer to "first image", "second image", etc.
+    pub reference_images: Vec<String>,
+
     /// Tools available to the model, including additional tools sourced from
     /// external MCP servers.
     pub(crate) tools: Vec<ToolSpec>,

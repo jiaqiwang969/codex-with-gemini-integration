@@ -1,0 +1,11 @@
+\contentsline {section}{\numberline {1}RefSet：一组有序的参考图}{1}{section.1}%
+\contentsline {section}{\numberline {2}示例一：RefSet 为空——纯文本模式}{3}{section.2}%
+\contentsline {subsection}{\numberline {2.1}用户视角：历史有图，但这一轮只聊文本}{3}{subsection.2.1}%
+\contentsline {subsection}{\numberline {2.2}实现视角：当前轮的 \texttt {ref\_set} 为空}{4}{subsection.2.2}%
+\contentsline {section}{\numberline {3}示例二：RefSet 只有一张图——单图参考}{5}{section.3}%
+\contentsline {subsection}{\numberline {3.1}示例 2-A：基于上一轮生成的图继续改图}{5}{subsection.3.1}%
+\contentsline {subsection}{\numberline {3.2}示例 2-B：使用本地 \texttt {dog.png} 作为唯一参考图}{7}{subsection.3.2}%
+\contentsline {section}{\numberline {4}示例三：RefSet 含多张图——多图组合}{9}{section.4}%
+\contentsline {subsection}{\numberline {4.1}示例 3-A：用 A 当背景，用 B 当素材}{9}{subsection.4.1}%
+\contentsline {subsection}{\numberline {4.2}示例 3-B：多轮使用同一个 RefSet}{10}{subsection.4.2}%
+\contentsline {section}{\numberline {5}如何把示例嵌入现有 Codex 调用链路}{11}{section.5}%

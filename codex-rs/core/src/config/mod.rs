@@ -1239,11 +1239,15 @@ impl Config {
             model_providers.entry(key).or_insert(provider);
         }
 
-        let model_provider_id = model_provider
+        let user_explicit_model_provider = model_provider.is_some()
+            || config_profile.model_provider.is_some()
+            || cfg.model_provider.is_some();
+
+        let mut model_provider_id = model_provider
             .or(config_profile.model_provider)
             .or(cfg.model_provider)
             .unwrap_or_else(|| "openai".to_string());
-        let model_provider = model_providers
+        let mut model_provider = model_providers
             .get(&model_provider_id)
             .ok_or_else(|| {
                 std::io::Error::new(
@@ -1297,6 +1301,34 @@ impl Config {
             .or(config_profile.model)
             .or(cfg.model)
             .unwrap_or_else(default_model);
+
+        // When the user only specifies a model (for example a Gemini slug) but
+        // does not explicitly pick a provider, automatically switch between
+        // the built‑in `openai` and `gemini` providers so the default session
+        // uses a compatible backend without requiring an extra `/model` step
+        // in the TUI.
+        if !user_explicit_model_provider {
+            let is_gemini_model = model.starts_with("gemini-");
+            let current_provider_id = Some(model_provider_id.as_str());
+
+            if is_gemini_model {
+                if current_provider_id != Some("gemini") && model_providers.contains_key("gemini") {
+                    let new_id = "gemini".to_string();
+                    if let Some(provider) = model_providers.get(&new_id) {
+                        model_provider_id = new_id;
+                        model_provider = provider.clone();
+                    }
+                }
+            } else if current_provider_id == Some("gemini")
+                && model_providers.contains_key("openai")
+            {
+                let new_id = "openai".to_string();
+                if let Some(provider) = model_providers.get(&new_id) {
+                    model_provider_id = new_id;
+                    model_provider = provider.clone();
+                }
+            }
+        }
 
         let mut model_family =
             find_family_for_model(&model).unwrap_or_else(|| derive_default_model_family(&model));
