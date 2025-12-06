@@ -1263,9 +1263,23 @@ impl Config {
             model_providers.entry(key).or_insert(provider);
         }
 
+        // Treat a top-level `model_provider` of "openai" or "openai-proxy" as a
+        // soft default rather than a hard override so that we can still
+        // auto-switch to the `gemini` provider when users only change the
+        // model slug (for example by selecting a Gemini preset in the TUI).
+        //
+        // Explicit CLI overrides and profile-level providers remain strong
+        // signals that auto-switching should be disabled.
+        let is_default_openai_like_provider = model_provider.is_none()
+            && config_profile.model_provider.is_none()
+            && matches!(
+                cfg.model_provider.as_deref(),
+                Some("openai" | "openai-proxy")
+            );
+
         let user_explicit_model_provider = model_provider.is_some()
             || config_profile.model_provider.is_some()
-            || cfg.model_provider.is_some();
+            || (cfg.model_provider.is_some() && !is_default_openai_like_provider);
 
         let mut model_provider_id = model_provider
             .or(config_profile.model_provider)
@@ -1328,9 +1342,9 @@ impl Config {
 
         // When the user only specifies a model (for example a Gemini slug) but
         // does not explicitly pick a provider, automatically switch between
-        // the built‑in `openai` and `gemini` providers so the default session
-        // uses a compatible backend without requiring an extra `/model` step
-        // in the TUI.
+        // the built‑in OpenAI-style providers (`openai`, `openai-proxy`) and
+        // `gemini` so the default session uses a compatible backend without
+        // requiring an extra `/model` step in the TUI.
         if !user_explicit_model_provider {
             let is_gemini_model = model.starts_with("gemini-");
             let current_provider_id = Some(model_provider_id.as_str());
@@ -1343,12 +1357,19 @@ impl Config {
                         model_provider = provider.clone();
                     }
                 }
-            } else if current_provider_id == Some("gemini")
-                && model_providers.contains_key("openai")
-            {
-                let new_id = "openai".to_string();
-                if let Some(provider) = model_providers.get(&new_id) {
-                    model_provider_id = new_id;
+            } else if current_provider_id == Some("gemini") {
+                let preferred_openai_like_id = if model_providers.contains_key("openai-proxy") {
+                    Some("openai-proxy")
+                } else if model_providers.contains_key("openai") {
+                    Some("openai")
+                } else {
+                    None
+                };
+
+                if let Some(new_id) = preferred_openai_like_id
+                    && let Some(provider) = model_providers.get(new_id)
+                {
+                    model_provider_id = new_id.to_string();
                     model_provider = provider.clone();
                 }
             }
@@ -3605,6 +3626,92 @@ model_verbosity = "high"
         let provider_for_gpt =
             config.preferred_model_provider_id_for_model(Some("gemini"), "gpt-5.1-codex");
         assert_eq!(provider_for_gpt.as_deref(), Some("openai-proxy"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn load_config_switches_to_gemini_when_model_is_gemini_and_provider_is_openai_proxy()
+    -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+
+        // Simulate a config.toml where the user previously selected a Gemini
+        // model from the TUI, but the top-level `model_provider` is still the
+        // OpenAI proxy. On startup we should automatically switch the provider
+        // to `gemini` so the model and provider remain compatible.
+        let mut cfg = ConfigToml::default();
+        cfg.model = Some("gemini-3-pro-preview-thinking-codex".to_string());
+        cfg.model_provider = Some("openai-proxy".to_string());
+        cfg.model_providers.insert(
+            "openai-proxy".to_string(),
+            ModelProviderInfo {
+                name: "Codex OpenAI Proxy".to_string(),
+                base_url: Some("https://proxy.example.com/v1".to_string()),
+                env_key: None,
+                env_key_instructions: None,
+                experimental_bearer_token: None,
+                auth_json_key: None,
+                wire_api: crate::WireApi::Responses,
+                query_params: None,
+                http_headers: None,
+                env_http_headers: None,
+                request_max_retries: None,
+                stream_max_retries: None,
+                stream_idle_timeout_ms: None,
+                requires_openai_auth: true,
+            },
+        );
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.model, "gemini-3-pro-preview-thinking-codex");
+        assert_eq!(config.model_provider_id, "gemini");
+
+        Ok(())
+    }
+
+    #[test]
+    fn load_config_keeps_openai_proxy_for_gpt_models() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+
+        // When using a GPT-style model, a top-level `model_provider =
+        // \"openai-proxy\"` should remain in effect so that traffic continues
+        // to flow through the proxy.
+        let mut cfg = ConfigToml::default();
+        cfg.model = Some("gpt-5.1-codex".to_string());
+        cfg.model_provider = Some("openai-proxy".to_string());
+        cfg.model_providers.insert(
+            "openai-proxy".to_string(),
+            ModelProviderInfo {
+                name: "Codex OpenAI Proxy".to_string(),
+                base_url: Some("https://proxy.example.com/v1".to_string()),
+                env_key: None,
+                env_key_instructions: None,
+                experimental_bearer_token: None,
+                auth_json_key: None,
+                wire_api: crate::WireApi::Responses,
+                query_params: None,
+                http_headers: None,
+                env_http_headers: None,
+                request_max_retries: None,
+                stream_max_retries: None,
+                stream_idle_timeout_ms: None,
+                requires_openai_auth: true,
+            },
+        );
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.model, "gpt-5.1-codex");
+        assert_eq!(config.model_provider_id, "openai-proxy");
 
         Ok(())
     }
