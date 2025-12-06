@@ -324,15 +324,10 @@ contents = [
 希望以它为参考生成 Q 版风格的插画。在 TUI 中可以这样操作：
 
 \begin{quote}
-  \texttt{/ref-image ~/Pictures/dog.png}\\
-  \texttt{帮我把这只狗画成 Q 版风格，背景是蓝天草地。}
+  \texttt{/ref-image ~/Pictures/dog.png -- 帮我把这只狗画成 Q 版风格，背景是蓝天草地。}
 \end{quote}
 
 从用户视角看：\texttt{/ref-image} 这条命令指定了「这一轮只用这张图做参考」。
-
-\subsubsection*{实现视角：\texttt{/ref-image} 设置新的 RefSet}
-
-当 TUI 解析到 \texttt{/ref-image} 时，可以调用一个类似下面的处理函数：
 
 \begin{lstlisting}[language=Rust,caption={示意性的 \texttt{/ref-image} 处理逻辑}]
 fn handle_ref_image_command(
@@ -403,9 +398,9 @@ let contents = vec![message];
 
 希望让模型「把狗贴到背景里」。在 TUI 中可以输入：
 
+
 \begin{quote}
-  \texttt{/ref-image bg.png dog.png}\\
-  \texttt{請把第二張圖里的狗抠出來，放到第一張圖房間的中央，光影保持一致。}
+  \texttt{/ref-image bg.png dog.png -- 請把第二張圖里的狗抠出來，放到第一张圖房間的中央，光影保持一致。}
 \end{quote}
 
 用户约定「第一张 / 第二张」的说法与命令里的顺序一致。
@@ -529,4 +524,3 @@ let contents = vec![message];
 在此基础上，可以进一步结合实际代码库中的类型和模块划分，对照实现或调整细节。
 
 \end{document}
-

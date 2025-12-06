@@ -47,6 +47,18 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+# LaTeX build artifacts (keep only .tex sources under version control)
+*.aux
+*.out
+*.toc
+*.synctex.gz
+*.fdb_latexmk
+*.fls
+*.nav
+*.snm
+*.vrb
+codex-rs/docs/*.pdf
+
 # env
 .env*
 !.env.example
