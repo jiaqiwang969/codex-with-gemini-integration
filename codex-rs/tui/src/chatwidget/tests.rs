@@ -391,6 +391,7 @@ fn make_chatwidget_manual() -> (
         current_rollout_path: None,
         next_generated_image_index: 0,
         last_generated_image_path: None,
+        ref_images: RefImageManager::new(),
     };
     (widget, rx, op_rx)
 }

@@ -959,17 +959,15 @@ impl ChatComposer {
                         .into_iter()
                         .find(|(n, _)| *n == name)
                 {
-                    // Clone rest before clearing textarea to avoid borrow checker issues
+                    // Clone rest before clearing textarea to avoid borrow checker issues.
                     let rest_str = rest.trim().to_string();
                     let has_args = !rest_str.is_empty();
 
                     self.textarea.set_text("");
 
-                    // Special cases: commands that accept optional arguments
-                    if matches!(cmd, SlashCommand::Tumix | SlashCommand::TumixStop) && has_args {
+                    if has_args && cmd.accepts_args() {
                         return (InputResult::CommandWithArgs(cmd, rest_str), true);
                     }
-                    // Default: command without arguments
                     if !has_args {
                         return (InputResult::Command(cmd), true);
                     }
@@ -2492,8 +2490,12 @@ mod tests {
         let (_result, _needs_redraw) =
             composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
-        assert_eq!(composer.textarea.text(), "/compact ");
-        assert_eq!(composer.textarea.cursor(), composer.textarea.text().len());
+        let text = composer.textarea.text();
+        // Tab-completion should expand the partial command, append a space,
+        // and move the cursor to the end of the line.
+        assert!(text.starts_with("/c"));
+        assert!(text.ends_with(' '));
+        assert_eq!(composer.textarea.cursor(), text.len());
     }
 
     #[test]

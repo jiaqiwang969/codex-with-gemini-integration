@@ -24,7 +24,6 @@ pub enum SlashCommand {
     Diff,
     OpenImage,
     RefImage,
-    RefLastImage,
     ClearRef,
     Mention,
     Agent,
@@ -54,9 +53,6 @@ impl SlashCommand {
             SlashCommand::Diff => "show git diff (including untracked files)",
             SlashCommand::OpenImage => "open the most recently generated image",
             SlashCommand::RefImage => "set reference images for image models",
-            SlashCommand::RefLastImage => {
-                "use the last generated image as the only reference image"
-            }
             SlashCommand::ClearRef => "clear active reference images",
             SlashCommand::Mention => "mention a file",
             SlashCommand::Agent => "switch into a delegated agent session",
@@ -67,6 +63,18 @@ impl SlashCommand {
             SlashCommand::Logout => "log out of Codex",
             SlashCommand::Rollout => "print the rollout file path",
             SlashCommand::TestApproval => "test approval request",
+        }
+    }
+
+    /// Whether this command accepts free-form arguments after the name.
+    ///
+    /// Commands that return `true` receive the raw argument string in
+    /// `InputResult::CommandWithArgs` so their handlers can parse it in a
+    /// context-aware way.
+    pub fn accepts_args(self) -> bool {
+        match self {
+            SlashCommand::Tumix | SlashCommand::TumixStop | SlashCommand::RefImage => true,
+            _ => false,
         }
     }
 
@@ -91,7 +99,6 @@ impl SlashCommand {
             SlashCommand::Diff
             | SlashCommand::OpenImage
             | SlashCommand::RefImage
-            | SlashCommand::RefLastImage
             | SlashCommand::ClearRef
             | SlashCommand::Mention
             | SlashCommand::Agent

@@ -147,6 +147,8 @@ use codex_multi_agent::DetachedRunSummary;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use strum::IntoEnumIterator;
 
+use shlex::Shlex;
+
 const USER_SHELL_COMMAND_HELP_TITLE: &str = "Prefix a command with ! to run it locally";
 const USER_SHELL_COMMAND_HELP_HINT: &str = "Example: !ls";
 // Track information about an in-flight exec command.
@@ -357,11 +359,147 @@ pub(crate) struct ChatWidget {
     next_generated_image_index: u64,
     // Last generated image path for quick reopening via slash command.
     last_generated_image_path: Option<PathBuf>,
+    // UI-level view of the active reference image set for this session.
+    ref_images: RefImageManager,
 }
 
 struct UserMessage {
     text: String,
     image_paths: Vec<PathBuf>,
+}
+
+/// Manager for the reference image set used by `/ref-image`.
+///
+/// This tracks the UI's view of the active reference images as local paths.
+/// Core maintains its own data URL representation; the two are kept in sync
+/// via `Op::SetReferenceImages` / `Op::ClearReferenceImages`.
+struct RefImageManager {
+    active_paths: Vec<PathBuf>,
+}
+
+impl RefImageManager {
+    fn new() -> Self {
+        Self {
+            active_paths: Vec::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.active_paths.clear();
+    }
+
+    fn set_paths(&mut self, paths: Vec<PathBuf>) {
+        self.active_paths = paths;
+    }
+
+    fn active_paths(&self) -> &[PathBuf] {
+        &self.active_paths
+    }
+}
+
+struct RefImageContext<'a> {
+    cwd: &'a Path,
+    codex_home: &'a Path,
+    conversation_id: Option<&'a ConversationId>,
+}
+
+enum RefImageCommand {
+    ShowHelpAndMaybeStatus,
+    ShowStatusOnly,
+    Clear,
+    Set {
+        paths: Vec<PathBuf>,
+        prompt: Option<String>,
+    },
+}
+
+impl RefImageManager {
+    fn parse_command(&self, args: Option<String>, ctx: &RefImageContext<'_>) -> RefImageCommand {
+        let raw = args.unwrap_or_default();
+        let trimmed = raw.trim();
+
+        if trimmed.is_empty() {
+            return RefImageCommand::ShowHelpAndMaybeStatus;
+        }
+
+        if trimmed.eq_ignore_ascii_case("ls") {
+            return RefImageCommand::ShowStatusOnly;
+        }
+
+        if trimmed.eq_ignore_ascii_case("clear") {
+            return RefImageCommand::Clear;
+        }
+
+        let (paths_raw, prompt_raw) = if let Some((left, right)) = trimmed.split_once("--") {
+            (left.trim_end(), Some(right.trim_start().to_string()))
+        } else {
+            (trimmed, None)
+        };
+
+        let path_tokens: Vec<String> = Shlex::new(paths_raw).collect();
+        let path_tokens: Vec<String> = path_tokens.into_iter().filter(|s| !s.is_empty()).collect();
+        if path_tokens.is_empty() {
+            return RefImageCommand::ShowHelpAndMaybeStatus;
+        }
+
+        let mut resolved: Vec<PathBuf> = Vec::new();
+        for token in path_tokens {
+            resolved.push(Self::resolve_path(&token, ctx));
+        }
+
+        let prompt = prompt_raw.and_then(|p| {
+            let trimmed = p.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+
+        RefImageCommand::Set {
+            paths: resolved,
+            prompt,
+        }
+    }
+
+    fn resolve_path(raw: &str, ctx: &RefImageContext<'_>) -> PathBuf {
+        // Expand ~/ prefix against the user's home directory when possible.
+        let expanded = if raw.starts_with("~/") {
+            if let Some(home) = dirs::home_dir() {
+                home.join(&raw[2..])
+            } else {
+                PathBuf::from(raw)
+            }
+        } else {
+            PathBuf::from(raw)
+        };
+
+        if expanded.is_absolute() {
+            return expanded;
+        }
+
+        // If the path has multiple components, treat it as relative to the current
+        // working directory (e.g. subdir/image.png).
+        let mut components = expanded.components();
+        if components.next().is_some() && components.next().is_some() {
+            return ctx.cwd.join(expanded);
+        }
+
+        // Single-segment relative path (e.g. "000000.png"): prefer the session's
+        // images directory when available so users can omit the full ~/.codex path.
+        if let Some(conversation_id) = ctx.conversation_id {
+            let candidate = ctx
+                .codex_home
+                .join("images")
+                .join(conversation_id.to_string())
+                .join(&expanded);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+
+        ctx.cwd.join(expanded)
+    }
 }
 
 #[derive(Default)]
@@ -403,6 +541,87 @@ fn create_initial_user_message(text: String, image_paths: Vec<PathBuf>) -> Optio
 }
 
 impl ChatWidget {
+    pub(crate) fn handle_ref_image_command(&mut self, args: Option<String>) {
+        let ctx = RefImageContext {
+            cwd: &self.config.cwd,
+            codex_home: &self.config.codex_home,
+            conversation_id: self.conversation_id.as_ref(),
+        };
+
+        match self.ref_images.parse_command(args, &ctx) {
+            RefImageCommand::ShowHelpAndMaybeStatus => {
+                let message = "Usage: /ref-image <path1> <path2> ... [-- <prompt>]\n\
+                               • `/ref-image ls` — show current reference images\n\
+                               • `/ref-image clear` — clear the active reference images";
+                self.add_info_message(message.to_string(), None);
+
+                // If there is an active set, show it after the help text.
+                if !self.ref_images.active_paths().is_empty() {
+                    let display_paths: Vec<String> = self
+                        .ref_images
+                        .active_paths()
+                        .iter()
+                        .map(|p| display_path_for(p, &self.config.cwd))
+                        .collect();
+                    self.add_info_message(
+                        format!("Active reference images: {}", display_paths.join(", ")),
+                        None,
+                    );
+                }
+            }
+            RefImageCommand::ShowStatusOnly => {
+                if self.ref_images.active_paths().is_empty() {
+                    self.add_info_message(
+                        "No active reference images. The model will infer references from recent images."
+                            .to_string(),
+                        None,
+                    );
+                } else {
+                    let display_paths: Vec<String> = self
+                        .ref_images
+                        .active_paths()
+                        .iter()
+                        .map(|p| display_path_for(p, &self.config.cwd))
+                        .collect();
+                    self.add_info_message(
+                        format!("Active reference images: {}", display_paths.join(", ")),
+                        None,
+                    );
+                }
+            }
+            RefImageCommand::Clear => {
+                self.ref_images.clear();
+                self.app_event_tx
+                    .send(AppEvent::CodexOp(Op::ClearReferenceImages));
+                self.add_info_message("Reference images cleared.".to_string(), None);
+            }
+            RefImageCommand::Set { paths, prompt } => {
+                self.ref_images.set_paths(paths.clone());
+                self.app_event_tx
+                    .send(AppEvent::CodexOp(Op::SetReferenceImages { paths }));
+
+                let display_paths: Vec<String> = self
+                    .ref_images
+                    .active_paths()
+                    .iter()
+                    .map(|p| display_path_for(p, &self.config.cwd))
+                    .collect();
+                self.add_info_message(
+                    format!("Reference images set: {}", display_paths.join(", ")),
+                    None,
+                );
+
+                if let Some(prompt_text) = prompt {
+                    let user_message = UserMessage {
+                        text: prompt_text,
+                        image_paths: Vec::new(),
+                    };
+                    self.queue_user_message(user_message);
+                }
+            }
+        }
+    }
+
     fn flush_answer_stream_with_separator(&mut self) {
         if let Some(mut controller) = self.stream_controller.take()
             && let Some(cell) = controller.finalize()
@@ -1447,6 +1666,7 @@ impl ChatWidget {
             current_rollout_path: None,
             next_generated_image_index: 0,
             last_generated_image_path: None,
+            ref_images: RefImageManager::new(),
         };
 
         widget.prefetch_rate_limits();
@@ -1539,6 +1759,7 @@ impl ChatWidget {
             current_rollout_path: None,
             next_generated_image_index: 0,
             last_generated_image_path: None,
+            ref_images: RefImageManager::new(),
         };
 
         widget.prefetch_rate_limits();
@@ -1726,67 +1947,10 @@ impl ChatWidget {
                 self.open_last_generated_image();
             }
             SlashCommand::RefImage => {
-                let raw = args.unwrap_or_default();
-                let paths: Vec<String> = raw
-                    .split_whitespace()
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .collect();
-                if paths.is_empty() {
-                    self.add_info_message(
-                        "Usage: /ref-image <path1> <path2> ...".to_string(),
-                        None,
-                    );
-                    return;
-                }
-
-                let resolved: Vec<PathBuf> = paths
-                    .iter()
-                    .map(PathBuf::from)
-                    .map(|p| {
-                        if p.is_absolute() {
-                            p
-                        } else {
-                            self.config.cwd.join(p)
-                        }
-                    })
-                    .collect();
-
-                self.app_event_tx
-                    .send(AppEvent::CodexOp(Op::SetReferenceImages {
-                        paths: resolved.clone(),
-                    }));
-
-                let display_paths: Vec<String> = resolved
-                    .iter()
-                    .map(|p| display_path_for(p, &self.config.cwd))
-                    .collect();
-                self.add_info_message(
-                    format!("Reference images set: {}", display_paths.join(", ")),
-                    None,
-                );
-            }
-            SlashCommand::RefLastImage => {
-                let Some(path) = self.last_generated_image_path.clone() else {
-                    self.add_info_message(
-                        "No generated image is available to use as a reference yet.".to_string(),
-                        None,
-                    );
-                    return;
-                };
-
-                self.app_event_tx
-                    .send(AppEvent::CodexOp(Op::SetReferenceImages {
-                        paths: vec![path.clone()],
-                    }));
-
-                let display = display_path_for(&path, &self.config.cwd);
-                self.add_info_message(
-                    format!("Reference image set to last generated image: {display}"),
-                    None,
-                );
+                self.handle_ref_image_command(args);
             }
             SlashCommand::ClearRef => {
+                self.ref_images.clear();
                 self.app_event_tx
                     .send(AppEvent::CodexOp(Op::ClearReferenceImages));
                 self.add_info_message("Reference images cleared.".to_string(), None);
