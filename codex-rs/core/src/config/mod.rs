@@ -1258,9 +1258,13 @@ impl Config {
             || cfg.sandbox_mode.is_some();
 
         let mut model_providers = built_in_model_providers();
-        // Merge user-defined providers into the built-in list.
+        // Merge user-defined providers into the built-in list, allowing
+        // entries in config.toml to override built-ins when they share the
+        // same provider id (for example "openai" or "gemini"). This matches
+        // the documented behaviour in `model_provider_info.rs` where
+        // user-defined providers "override or extend" the defaults.
         for (key, provider) in cfg.model_providers.into_iter() {
-            model_providers.entry(key).or_insert(provider);
+            model_providers.insert(key, provider);
         }
 
         // Treat a top-level `model_provider` of "openai" or "openai-proxy" as a
