@@ -51,6 +51,7 @@ use codex_protocol::plan_tool::PlanItemArg;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::CodexErrorInfo;
+use codex_protocol::user_input::UserInput;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
@@ -1194,6 +1195,42 @@ fn undo_success_events_render_info_messages() {
         completed.contains("Undo completed successfully."),
         "expected default success message, got {completed:?}"
     );
+}
+
+#[test]
+fn ref_image_set_with_prompt_sends_set_reference_images_before_user_input() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual();
+
+    // Execute `/ref-image foo.png -- tweak the style`.
+    chat.handle_ref_image_command(Some("foo.png -- tweak the style".to_string()));
+
+    // First Op should set the reference images for the session.
+    let first = op_rx
+        .try_recv()
+        .expect("expected first op for /ref-image command");
+    match first {
+        Op::SetReferenceImages { paths } => {
+            assert_eq!(paths.len(), 1, "expected one reference image path");
+        }
+        other => panic!("expected SetReferenceImages op first, got {other:?}"),
+    }
+
+    // Second Op should be the user prompt for this turn.
+    let second = op_rx
+        .try_recv()
+        .expect("expected second op (UserInput) for /ref-image prompt");
+    match second {
+        Op::UserInput { items } => {
+            assert_eq!(items.len(), 1, "expected a single user input item");
+            match &items[0] {
+                UserInput::Text { text } => {
+                    assert_eq!(text, "tweak the style");
+                }
+                other => panic!("expected text-only UserInput, got {other:?}"),
+            }
+        }
+        other => panic!("expected UserInput op second, got {other:?}"),
+    }
 }
 
 #[test]

@@ -439,6 +439,22 @@ impl RefImageManager {
         let path_tokens: Vec<String> = Shlex::new(paths_raw).collect();
         let path_tokens: Vec<String> = path_tokens.into_iter().filter(|s| !s.is_empty()).collect();
         if path_tokens.is_empty() {
+            // If the user supplied only a prompt (for example `/ref-image -- tweak the style`)
+            // defer image selection to the caller so it can integrate any attached images.
+            if let Some(prompt_raw) = prompt_raw {
+                let prompt = {
+                    let trimmed = prompt_raw.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                };
+                return RefImageCommand::Set {
+                    paths: Vec::new(),
+                    prompt,
+                };
+            }
             return RefImageCommand::ShowHelpAndMaybeStatus;
         }
 
@@ -591,14 +607,30 @@ impl ChatWidget {
             }
             RefImageCommand::Clear => {
                 self.ref_images.clear();
-                self.app_event_tx
-                    .send(AppEvent::CodexOp(Op::ClearReferenceImages));
+                // Forward ClearReferenceImages directly so it is ordered
+                // consistently with any subsequent user input.
+                self.submit_op(Op::ClearReferenceImages);
                 self.add_info_message("Reference images cleared.".to_string(), None);
             }
             RefImageCommand::Set { paths, prompt } => {
-                self.ref_images.set_paths(paths.clone());
-                self.app_event_tx
-                    .send(AppEvent::CodexOp(Op::SetReferenceImages { paths }));
+                // If the user pasted or attached images in the composer and then
+                // invoked `/ref-image`, prefer those attached image paths over
+                // any literal placeholders that may appear in the command text.
+                // This keeps `/ref-image` aligned with the image attachment
+                // pipeline used elsewhere in the TUI.
+                let attached_paths = self.bottom_pane.take_recent_submission_images();
+                let final_paths = if attached_paths.is_empty() {
+                    paths
+                } else {
+                    attached_paths
+                };
+
+                self.ref_images.set_paths(final_paths.clone());
+                // Ensure the reference images are updated in core before
+                // sending any prompt that might rely on them. Using
+                // `submit_op` keeps the ordering consistent with the
+                // subsequent `Op::UserInput`.
+                self.submit_op(Op::SetReferenceImages { paths: final_paths });
 
                 let display_paths: Vec<String> = self
                     .ref_images

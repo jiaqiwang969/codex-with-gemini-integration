@@ -52,6 +52,16 @@ You can enable notifications by configuring a script that is run whenever the ag
 
 To run Codex non-interactively, run `codex exec PROMPT` (you can also pass the prompt via `stdin`) and Codex will work on your task until it decides that it is done and exits. Output is printed to the terminal directly. You can set the `RUST_LOG` environment variable to see more about what's going on.
 
+### Image reference commands in the TUI
+
+When using the fullscreen TUI (`codex tui`), you can control image reference sets for Gemini-style image models via the `/ref-image` command:
+
+- `/ref-image <path1> <path2> ...` sets the current reference image set for the session.
+- `/ref-image <path1> <path2> ... -- <prompt>` sets the reference images and immediately sends a text prompt for editing or generation.
+- `/ref-image ls` shows the currently active reference images; `/ref-image clear` (or `/clear-ref`) clears them.
+
+See `docs/gemini_3_pro_image_user_guide.tex` for a deeper walkthrough of image workflows.
+
 ### Experimenting with the Codex Sandbox
 
 To test to see what happens when a command is run under the sandbox provided by Codex, we provide the following subcommands in Codex CLI:
