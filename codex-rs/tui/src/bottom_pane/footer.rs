@@ -1,6 +1,9 @@
+#[cfg(target_os = "linux")]
+use crate::clipboard_paste::is_probably_wsl;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
 use crate::render::line_utils::prefix_lines;
+use crate::status::format_tokens_compact;
 use crate::ui_consts::FOOTER_INDENT_COLS;
 use crossterm::event::KeyCode;
 use ratatui::buffer::Buffer;
@@ -18,6 +21,7 @@ pub(crate) struct FooterProps {
     pub(crate) use_shift_enter_hint: bool,
     pub(crate) is_task_running: bool,
     pub(crate) context_window_percent: Option<i64>,
+    pub(crate) context_window_used_tokens: Option<i64>,
     pub(crate) delegate_label: Option<String>,
 }
 
@@ -82,38 +86,53 @@ fn footer_lines(props: &FooterProps) -> Vec<Line<'static>> {
             is_task_running: props.is_task_running,
         })],
         FooterMode::ShortcutSummary => {
-            let mut spans: Vec<Span<'static>> = Vec::new();
+            let mut line = context_window_line(
+                props.context_window_percent,
+                props.context_window_used_tokens,
+            );
             if let Some(label) = props.delegate_label.as_ref() {
+                let mut spans: Vec<Span<'static>> =
+                    Vec::with_capacity(line.spans.len().saturating_add(3));
                 spans.push(format!("In {label}").cyan());
                 spans.push(" · ".dim());
+                spans.extend(line.spans.into_iter());
+                line = Line::from(spans);
             }
-            let context_line = context_window_line(props.context_window_percent);
-            for span in context_line {
-                spans.push(span);
-            }
-            spans.push(" · ".dim());
-            spans.extend(vec![
+            line.push_span(" · ".dim());
+            line.extend(vec![
                 key_hint::plain(KeyCode::Char('?')).into(),
                 " for shortcuts".dim(),
             ]);
-            vec![Line::from(spans)]
+            vec![line]
         }
-        FooterMode::ShortcutOverlay => shortcut_overlay_lines(ShortcutsState {
-            use_shift_enter_hint: props.use_shift_enter_hint,
-            esc_backtrack_hint: props.esc_backtrack_hint,
-        }),
+        FooterMode::ShortcutOverlay => {
+            #[cfg(target_os = "linux")]
+            let is_wsl = is_probably_wsl();
+            #[cfg(not(target_os = "linux"))]
+            let is_wsl = false;
+
+            let state = ShortcutsState {
+                use_shift_enter_hint: props.use_shift_enter_hint,
+                esc_backtrack_hint: props.esc_backtrack_hint,
+                is_wsl,
+            };
+            shortcut_overlay_lines(state)
+        }
         FooterMode::EscHint => vec![esc_hint_line(props.esc_backtrack_hint)],
         FooterMode::ContextOnly => {
-            let mut spans: Vec<Span<'static>> = Vec::new();
+            let mut line = context_window_line(
+                props.context_window_percent,
+                props.context_window_used_tokens,
+            );
             if let Some(label) = props.delegate_label.as_ref() {
+                let mut spans: Vec<Span<'static>> =
+                    Vec::with_capacity(line.spans.len().saturating_add(3));
                 spans.push(format!("In {label}").cyan());
                 spans.push(" · ".dim());
+                spans.extend(line.spans.into_iter());
+                line = Line::from(spans);
             }
-            let context_line = context_window_line(props.context_window_percent);
-            for span in context_line {
-                spans.push(span);
-            }
-            vec![Line::from(spans)]
+            vec![line]
         }
     }
 }
@@ -127,6 +146,7 @@ struct CtrlCReminderState {
 struct ShortcutsState {
     use_shift_enter_hint: bool,
     esc_backtrack_hint: bool,
+    is_wsl: bool,
 }
 
 fn ctrl_c_reminder_line(state: CtrlCReminderState) -> Line<'static> {
@@ -241,9 +261,18 @@ fn build_columns(entries: Vec<Line<'static>>) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn context_window_line(percent: Option<i64>) -> Line<'static> {
-    let percent = percent.unwrap_or(100).clamp(0, 100);
-    Line::from(vec![Span::from(format!("{percent}% context left")).dim()])
+fn context_window_line(percent: Option<i64>, used_tokens: Option<i64>) -> Line<'static> {
+    if let Some(percent) = percent {
+        let percent = percent.clamp(0, 100);
+        return Line::from(vec![Span::from(format!("{percent}% context left")).dim()]);
+    }
+
+    if let Some(tokens) = used_tokens {
+        let used_fmt = format_tokens_compact(tokens);
+        return Line::from(vec![Span::from(format!("{used_fmt} used")).dim()]);
+    }
+
+    Line::from(vec![Span::from("100% context left").dim()])
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -274,6 +303,7 @@ enum DisplayCondition {
     Always,
     WhenShiftEnterHint,
     WhenNotShiftEnterHint,
+    WhenUnderWSL,
 }
 
 impl DisplayCondition {
@@ -282,6 +312,7 @@ impl DisplayCondition {
             DisplayCondition::Always => true,
             DisplayCondition::WhenShiftEnterHint => state.use_shift_enter_hint,
             DisplayCondition::WhenNotShiftEnterHint => !state.use_shift_enter_hint,
+            DisplayCondition::WhenUnderWSL => state.is_wsl,
         }
     }
 }
@@ -355,10 +386,18 @@ const SHORTCUTS: &[ShortcutDescriptor] = &[
     },
     ShortcutDescriptor {
         id: ShortcutId::PasteImage,
-        bindings: &[ShortcutBinding {
-            key: key_hint::ctrl(KeyCode::Char('v')),
-            condition: DisplayCondition::Always,
-        }],
+        // Show Ctrl+Alt+V when running under WSL (terminals often intercept plain
+        // Ctrl+V); otherwise fall back to Ctrl+V.
+        bindings: &[
+            ShortcutBinding {
+                key: key_hint::ctrl_alt(KeyCode::Char('v')),
+                condition: DisplayCondition::WhenUnderWSL,
+            },
+            ShortcutBinding {
+                key: key_hint::ctrl(KeyCode::Char('v')),
+                condition: DisplayCondition::Always,
+            },
+        ],
         prefix: "",
         label: " to paste images",
     },
@@ -420,6 +459,7 @@ mod tests {
                 use_shift_enter_hint: false,
                 is_task_running: false,
                 context_window_percent: None,
+                context_window_used_tokens: None,
                 delegate_label: None,
             },
         );
@@ -432,6 +472,7 @@ mod tests {
                 use_shift_enter_hint: true,
                 is_task_running: false,
                 context_window_percent: None,
+                context_window_used_tokens: None,
                 delegate_label: None,
             },
         );
@@ -444,6 +485,7 @@ mod tests {
                 use_shift_enter_hint: false,
                 is_task_running: false,
                 context_window_percent: None,
+                context_window_used_tokens: None,
                 delegate_label: None,
             },
         );
@@ -456,6 +498,7 @@ mod tests {
                 use_shift_enter_hint: false,
                 is_task_running: true,
                 context_window_percent: None,
+                context_window_used_tokens: None,
                 delegate_label: None,
             },
         );
@@ -468,6 +511,7 @@ mod tests {
                 use_shift_enter_hint: false,
                 is_task_running: false,
                 context_window_percent: None,
+                context_window_used_tokens: None,
                 delegate_label: None,
             },
         );
@@ -480,6 +524,7 @@ mod tests {
                 use_shift_enter_hint: false,
                 is_task_running: false,
                 context_window_percent: None,
+                context_window_used_tokens: None,
                 delegate_label: None,
             },
         );
@@ -492,6 +537,20 @@ mod tests {
                 use_shift_enter_hint: false,
                 is_task_running: true,
                 context_window_percent: Some(72),
+                context_window_used_tokens: None,
+                delegate_label: None,
+            },
+        );
+
+        snapshot_footer(
+            "footer_context_tokens_used",
+            FooterProps {
+                mode: FooterMode::ShortcutSummary,
+                esc_backtrack_hint: false,
+                use_shift_enter_hint: false,
+                is_task_running: false,
+                context_window_percent: None,
+                context_window_used_tokens: Some(123_456),
                 delegate_label: None,
             },
         );
@@ -504,6 +563,7 @@ mod tests {
                 use_shift_enter_hint: false,
                 is_task_running: false,
                 context_window_percent: Some(85),
+                context_window_used_tokens: None,
                 delegate_label: Some("#critic".to_string()),
             },
         );

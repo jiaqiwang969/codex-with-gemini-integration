@@ -287,7 +287,7 @@ impl PagerView {
         // Clamp cursor to valid range and ensure it's visible by adjusting scroll if needed.
         if wrapped_len == 0 {
             self.cursor_idx = 0;
-        } else {
+        } else if self.commit_mode || self.show_cursor_gutter {
             if self.cursor_idx >= wrapped_len {
                 self.cursor_idx = wrapped_len - 1;
             }
@@ -737,6 +737,16 @@ impl PagerView {
         Ok(())
     }
 
+    /// Returns the height of one page in content rows.
+    ///
+    /// Prefers the last rendered content height (excluding header/footer chrome);
+    /// if no render has occurred yet, falls back to the content area height
+    /// computed from the given viewport.
+    fn page_height(&self, viewport_area: Rect) -> usize {
+        self.last_content_height
+            .unwrap_or_else(|| self.content_area(viewport_area).height as usize)
+    }
+
     fn update_last_content_height(&mut self, height: u16) {
         self.last_content_height = Some(height as usize);
     }
@@ -746,6 +756,10 @@ impl PagerView {
         area.y = area.y.saturating_add(1);
         area.height = area.height.saturating_sub(2);
         area
+    }
+
+    fn content_area(&self, area: Rect) -> Rect {
+        self.scroll_area(area)
     }
 }
 
@@ -2167,6 +2181,100 @@ mod tests {
         term.draw(|f| overlay.render(f.area(), f.buffer_mut()))
             .expect("draw");
         assert_snapshot!(term.backend());
+    }
+
+    /// Render transcript overlay and return visible line numbers (`line-NN`) in order.
+    fn transcript_line_numbers(overlay: &mut TranscriptOverlay, area: Rect) -> Vec<usize> {
+        let mut buf = Buffer::empty(area);
+        overlay.render(area, &mut buf);
+
+        let top_h = area.height.saturating_sub(3);
+        let top = Rect::new(area.x, area.y, area.width, top_h);
+        let content_area = overlay.view.content_area(top);
+
+        let mut nums = Vec::new();
+        for y in content_area.y..content_area.bottom() {
+            let mut line = String::new();
+            for x in content_area.x..content_area.right() {
+                line.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
+            }
+            if let Some(n) = line
+                .split_whitespace()
+                .find_map(|w| w.strip_prefix("line-"))
+                .and_then(|s| s.parse().ok())
+            {
+                nums.push(n);
+            }
+        }
+        nums
+    }
+
+    #[test]
+    fn transcript_overlay_paging_is_continuous_and_round_trips() {
+        let mut overlay = TranscriptOverlay::new(
+            (0..50)
+                .map(|i| {
+                    Arc::new(TestCell {
+                        lines: vec![Line::from(format!("line-{i:02}"))],
+                    }) as Arc<dyn HistoryCell>
+                })
+                .collect(),
+        );
+        let area = Rect::new(0, 0, 40, 15);
+
+        // Prime layout so last_content_height is populated and paging uses the real content height.
+        let mut buf = Buffer::empty(area);
+        overlay.view.scroll_offset = 0;
+        overlay.render(area, &mut buf);
+        let page_height = overlay.view.page_height(area);
+
+        // Scenario 1: starting from the top, PageDown should show the next page of content.
+        overlay.view.scroll_offset = 0;
+        let page1 = transcript_line_numbers(&mut overlay, area);
+        let page1_len = page1.len();
+        let expected_page1: Vec<usize> = (0..page1_len).collect();
+        assert_eq!(
+            page1, expected_page1,
+            "first page should start at line-00 and show a full page of content"
+        );
+
+        overlay.view.scroll_offset = overlay.view.scroll_offset.saturating_add(page_height);
+        let page2 = transcript_line_numbers(&mut overlay, area);
+        assert_eq!(
+            page2.len(),
+            page1_len,
+            "second page should have the same number of visible lines as the first page"
+        );
+        let expected_page2_first = *page1.last().unwrap() + 1;
+        assert_eq!(
+            page2[0], expected_page2_first,
+            "second page after PageDown should immediately follow the first page"
+        );
+
+        // Scenario 2: from an interior offset (start=3), PageDown then PageUp should round-trip.
+        let interior_offset = 3usize;
+        overlay.view.scroll_offset = interior_offset;
+        let before = transcript_line_numbers(&mut overlay, area);
+        overlay.view.scroll_offset = overlay.view.scroll_offset.saturating_add(page_height);
+        let _ = transcript_line_numbers(&mut overlay, area);
+        overlay.view.scroll_offset = overlay.view.scroll_offset.saturating_sub(page_height);
+        let after = transcript_line_numbers(&mut overlay, area);
+        assert_eq!(
+            before, after,
+            "PageDown+PageUp from interior offset ({interior_offset}) should round-trip"
+        );
+
+        // Scenario 3: from the top of the second page, PageUp then PageDown should round-trip.
+        overlay.view.scroll_offset = page_height;
+        let before2 = transcript_line_numbers(&mut overlay, area);
+        overlay.view.scroll_offset = overlay.view.scroll_offset.saturating_sub(page_height);
+        let _ = transcript_line_numbers(&mut overlay, area);
+        overlay.view.scroll_offset = overlay.view.scroll_offset.saturating_add(page_height);
+        let after2 = transcript_line_numbers(&mut overlay, area);
+        assert_eq!(
+            before2, after2,
+            "PageUp+PageDown from the top of the second page should round-trip"
+        );
     }
 
     #[test]

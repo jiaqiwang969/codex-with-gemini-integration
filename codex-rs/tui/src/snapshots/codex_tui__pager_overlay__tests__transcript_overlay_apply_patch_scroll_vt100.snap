@@ -1,15 +1,16 @@
 ---
 source: tui/src/pager_overlay.rs
+assertion_line: 2110
 expression: snapshot
 ---
 / T R A N S C R I P T / / / / / / / / / / / / / / / / / / / / / / / / / / / / /
-✓ Patch applied
-src/foo.txt
+• Added foo.txt (+2 -0)
+    1 +hello
+    2 +world
 
-$ ls
-src
-README.md
-✓ • 420ms
-───────────────────────────────────────────────────────────────────────── 100% ─
+• Added foo.txt (+2 -0)
+    1 +hello
+    2 +world
+─────────────────────────────────────────────────────────────────────────── 0% ─
  ↑/↓ scroll   PgUp/PgDn page   Home/End jump
  q quit   Esc edit prev

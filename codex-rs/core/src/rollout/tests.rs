@@ -2,21 +2,14 @@
 
 use std::fs::File;
 use std::fs::{self};
+use std::io::BufRead;
 use std::io::Write;
 use std::path::Path;
-
-use tempfile::TempDir;
-use time::OffsetDateTime;
-use time::PrimitiveDateTime;
-use time::format_description::FormatItem;
-use time::macros::format_description;
-use uuid::Uuid;
 
 use crate::rollout::INTERACTIVE_SESSION_SOURCES;
 use crate::rollout::list::ConversationItem;
 use crate::rollout::list::ConversationsPage;
 use crate::rollout::list::Cursor;
-use crate::rollout::list::get_conversation;
 use crate::rollout::list::get_conversations;
 use anyhow::Result;
 use codex_protocol::ConversationId;
@@ -30,6 +23,13 @@ use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::UserMessageEvent;
+use tempfile::TempDir;
+use time::OffsetDateTime;
+use time::PrimitiveDateTime;
+use time::format_description::FormatItem;
+use time::format_description::well_known::Rfc3339;
+use time::macros::format_description;
+use uuid::Uuid;
 
 const NO_SOURCE_FILTER: &[SessionSource] = &[];
 const TEST_PROVIDER: &str = "test-provider";
@@ -125,6 +125,48 @@ fn write_session_file_with_provider(
         writeln!(file, "{rec}")?;
     }
     Ok((dt, uuid))
+}
+
+/// Read the trailing block of assistant responses from a rollout file, skipping any
+/// non-response records (e.g., compaction or shutdown events) at the end.
+fn read_response_tail(path: &Path) -> Vec<serde_json::Value> {
+    let file = File::open(path).expect("open rollout file");
+    let reader = std::io::BufReader::new(file);
+    let mut lines: Vec<RolloutLine> = Vec::new();
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(_) => continue,
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parsed: Result<RolloutLine, _> = serde_json::from_str(trimmed);
+        if let Ok(rollout_line) = parsed {
+            lines.push(rollout_line);
+        }
+    }
+
+    let mut tail: Vec<serde_json::Value> = Vec::new();
+    for line in lines.into_iter().rev() {
+        match line.item {
+            RolloutItem::ResponseItem(item) => {
+                if let Ok(val) = serde_json::to_value(item) {
+                    tail.push(val);
+                }
+            }
+            _ => {
+                if !tail.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+
+    tail.reverse();
+    tail
 }
 
 #[tokio::test]
@@ -226,28 +268,28 @@ async fn test_list_conversations_latest_first() {
         "model_provider": "test-provider",
     })];
 
+    let updated_times: Vec<Option<String>> =
+        page.items.iter().map(|i| i.updated_at.clone()).collect();
+
     let expected = ConversationsPage {
         items: vec![
             ConversationItem {
                 path: p1,
                 head: head_3,
-                tail: Vec::new(),
                 created_at: Some("2025-01-03T12-00-00".into()),
-                updated_at: Some("2025-01-03T12-00-00".into()),
+                updated_at: updated_times.first().cloned().flatten(),
             },
             ConversationItem {
                 path: p2,
                 head: head_2,
-                tail: Vec::new(),
                 created_at: Some("2025-01-02T12-00-00".into()),
-                updated_at: Some("2025-01-02T12-00-00".into()),
+                updated_at: updated_times.get(1).cloned().flatten(),
             },
             ConversationItem {
                 path: p3,
                 head: head_1,
-                tail: Vec::new(),
                 created_at: Some("2025-01-01T12-00-00".into()),
-                updated_at: Some("2025-01-01T12-00-00".into()),
+                updated_at: updated_times.get(2).cloned().flatten(),
             },
         ],
         next_cursor: None,
@@ -355,6 +397,8 @@ async fn test_pagination_cursor() {
         "source": "vscode",
         "model_provider": "test-provider",
     })];
+    let updated_page1: Vec<Option<String>> =
+        page1.items.iter().map(|i| i.updated_at.clone()).collect();
     let expected_cursor1: Cursor =
         serde_json::from_str(&format!("\"2025-03-04T09-00-00|{u4}\"")).unwrap();
     let expected_page1 = ConversationsPage {
@@ -362,16 +406,14 @@ async fn test_pagination_cursor() {
             ConversationItem {
                 path: p5,
                 head: head_5,
-                tail: Vec::new(),
                 created_at: Some("2025-03-05T09-00-00".into()),
-                updated_at: Some("2025-03-05T09-00-00".into()),
+                updated_at: updated_page1.first().cloned().flatten(),
             },
             ConversationItem {
                 path: p4,
                 head: head_4,
-                tail: Vec::new(),
                 created_at: Some("2025-03-04T09-00-00".into()),
-                updated_at: Some("2025-03-04T09-00-00".into()),
+                updated_at: updated_page1.get(1).cloned().flatten(),
             },
         ],
         next_cursor: Some(expected_cursor1.clone()),
@@ -422,6 +464,8 @@ async fn test_pagination_cursor() {
         "source": "vscode",
         "model_provider": "test-provider",
     })];
+    let updated_page2: Vec<Option<String>> =
+        page2.items.iter().map(|i| i.updated_at.clone()).collect();
     let expected_cursor2: Cursor =
         serde_json::from_str(&format!("\"2025-03-02T09-00-00|{u2}\"")).unwrap();
     let expected_page2 = ConversationsPage {
@@ -429,16 +473,14 @@ async fn test_pagination_cursor() {
             ConversationItem {
                 path: p3,
                 head: head_3,
-                tail: Vec::new(),
                 created_at: Some("2025-03-03T09-00-00".into()),
-                updated_at: Some("2025-03-03T09-00-00".into()),
+                updated_at: updated_page2.first().cloned().flatten(),
             },
             ConversationItem {
                 path: p2,
                 head: head_2,
-                tail: Vec::new(),
                 created_at: Some("2025-03-02T09-00-00".into()),
-                updated_at: Some("2025-03-02T09-00-00".into()),
+                updated_at: updated_page2.get(1).cloned().flatten(),
             },
         ],
         next_cursor: Some(expected_cursor2.clone()),
@@ -473,13 +515,14 @@ async fn test_pagination_cursor() {
         "source": "vscode",
         "model_provider": "test-provider",
     })];
+    let updated_page3: Vec<Option<String>> =
+        page3.items.iter().map(|i| i.updated_at.clone()).collect();
     let expected_page3 = ConversationsPage {
         items: vec![ConversationItem {
             path: p1,
             head: head_1,
-            tail: Vec::new(),
             created_at: Some("2025-03-01T09-00-00".into()),
-            updated_at: Some("2025-03-01T09-00-00".into()),
+            updated_at: updated_page3.first().cloned().flatten(),
         }],
         next_cursor: None,
         num_scanned_files: 5, // scanned 05, 04 (anchor), 03, 02 (anchor), 01
@@ -510,7 +553,7 @@ async fn test_get_conversation_contents() {
     .unwrap();
     let path = &page.items[0].path;
 
-    let content = get_conversation(path).await.unwrap();
+    let content = tokio::fs::read_to_string(path).await.unwrap();
 
     // Page equality (single item)
     let expected_path = home
@@ -533,9 +576,8 @@ async fn test_get_conversation_contents() {
         items: vec![ConversationItem {
             path: expected_path,
             head: expected_head,
-            tail: Vec::new(),
             created_at: Some(ts.into()),
-            updated_at: Some(ts.into()),
+            updated_at: page.items[0].updated_at.clone(),
         }],
         next_cursor: None,
         num_scanned_files: 1,
@@ -570,7 +612,7 @@ async fn test_get_conversation_contents() {
 }
 
 #[tokio::test]
-async fn test_tail_includes_last_response_items() -> Result<()> {
+async fn test_updated_at_uses_file_mtime() -> Result<()> {
     let temp = TempDir::new().unwrap();
     let home = temp.path();
 
@@ -637,28 +679,15 @@ async fn test_tail_includes_last_response_items() -> Result<()> {
     )
     .await?;
     let item = page.items.first().expect("conversation item");
-    let tail_len = item.tail.len();
-    assert_eq!(tail_len, 10usize.min(total_messages));
-
-    let expected: Vec<serde_json::Value> = (total_messages - tail_len..total_messages)
-        .map(|idx| {
-            serde_json::json!({
-                "type": "message",
-                "role": "assistant",
-                "content": [
-                    {
-                        "type": "output_text",
-                        "text": format!("reply-{idx}"),
-                    }
-                ],
-            })
-        })
-        .collect();
-
-    assert_eq!(item.tail, expected);
     assert_eq!(item.created_at.as_deref(), Some(ts));
-    let expected_updated = format!("{ts}-{last:02}", last = total_messages - 1);
-    assert_eq!(item.updated_at.as_deref(), Some(expected_updated.as_str()));
+    let updated = item
+        .updated_at
+        .as_deref()
+        .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
+        .expect("updated_at set from file mtime");
+    let now = OffsetDateTime::now_utc();
+    let age = now - updated;
+    assert!(age.whole_seconds().abs() < 30);
 
     Ok(())
 }
@@ -729,7 +758,8 @@ async fn test_tail_handles_short_sessions() -> Result<()> {
         TEST_PROVIDER,
     )
     .await?;
-    let tail = &page.items.first().expect("conversation item").tail;
+    let item = page.items.first().expect("conversation item");
+    let tail = read_response_tail(&item.path);
 
     assert_eq!(tail.len(), 3);
 
@@ -748,12 +778,15 @@ async fn test_tail_handles_short_sessions() -> Result<()> {
         })
         .collect();
 
-    assert_eq!(tail, &expected);
-    let expected_updated = format!("{ts}-{last:02}", last = 2);
-    assert_eq!(
-        page.items[0].updated_at.as_deref(),
-        Some(expected_updated.as_str())
-    );
+    assert_eq!(tail, expected);
+    let updated = item
+        .updated_at
+        .as_deref()
+        .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
+        .expect("updated_at set from file mtime");
+    let now = OffsetDateTime::now_utc();
+    let age = now - updated;
+    assert!(age.whole_seconds().abs() < 30);
 
     Ok(())
 }
@@ -839,7 +872,8 @@ async fn test_tail_skips_trailing_non_responses() -> Result<()> {
         TEST_PROVIDER,
     )
     .await?;
-    let tail = &page.items.first().expect("conversation item").tail;
+    let item = page.items.first().expect("conversation item");
+    let tail = read_response_tail(&item.path);
 
     let expected: Vec<serde_json::Value> = (0..4)
         .map(|idx| {
@@ -856,12 +890,15 @@ async fn test_tail_skips_trailing_non_responses() -> Result<()> {
         })
         .collect();
 
-    assert_eq!(tail, &expected);
-    let expected_updated = format!("{ts}-{last:02}", last = 3);
-    assert_eq!(
-        page.items[0].updated_at.as_deref(),
-        Some(expected_updated.as_str())
-    );
+    assert_eq!(tail, expected);
+    let updated = item
+        .updated_at
+        .as_deref()
+        .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
+        .expect("updated_at set from file mtime");
+    let now = OffsetDateTime::now_utc();
+    let age = now - updated;
+    assert!(age.whole_seconds().abs() < 30);
 
     Ok(())
 }
@@ -916,22 +953,22 @@ async fn test_stable_ordering_same_second_pagination() {
             "model_provider": "test-provider",
         })]
     };
+    let updated_page1: Vec<Option<String>> =
+        page1.items.iter().map(|i| i.updated_at.clone()).collect();
     let expected_cursor1: Cursor = serde_json::from_str(&format!("\"{ts}|{u2}\"")).unwrap();
     let expected_page1 = ConversationsPage {
         items: vec![
             ConversationItem {
                 path: p3,
                 head: head(u3),
-                tail: Vec::new(),
                 created_at: Some(ts.to_string()),
-                updated_at: Some(ts.to_string()),
+                updated_at: updated_page1.first().cloned().flatten(),
             },
             ConversationItem {
                 path: p2,
                 head: head(u2),
-                tail: Vec::new(),
                 created_at: Some(ts.to_string()),
-                updated_at: Some(ts.to_string()),
+                updated_at: updated_page1.get(1).cloned().flatten(),
             },
         ],
         next_cursor: Some(expected_cursor1.clone()),
@@ -956,13 +993,14 @@ async fn test_stable_ordering_same_second_pagination() {
         .join("07")
         .join("01")
         .join(format!("rollout-2025-07-01T00-00-00-{u1}.jsonl"));
+    let updated_page2: Vec<Option<String>> =
+        page2.items.iter().map(|i| i.updated_at.clone()).collect();
     let expected_page2 = ConversationsPage {
         items: vec![ConversationItem {
             path: p1,
             head: head(u1),
-            tail: Vec::new(),
             created_at: Some(ts.to_string()),
-            updated_at: Some(ts.to_string()),
+            updated_at: updated_page2.first().cloned().flatten(),
         }],
         next_cursor: None,
         num_scanned_files: 3, // scanned u3, u2 (anchor), u1

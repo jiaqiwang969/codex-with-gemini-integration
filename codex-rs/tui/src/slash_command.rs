@@ -14,8 +14,10 @@ pub enum SlashCommand {
     // more frequently used commands should be listed first.
     Model,
     Approvals,
+    Skills,
     Review,
     New,
+    Resume,
     Init,
     Tumix,
     TumixStop,
@@ -48,6 +50,7 @@ impl SlashCommand {
             SlashCommand::TumixStop => "stop running TUMIX agents (optionally specify a session)",
             SlashCommand::Compact => "summarize conversation to prevent hitting the context limit",
             SlashCommand::Review => "review my current changes and find issues",
+            SlashCommand::Resume => "resume a saved chat",
             SlashCommand::Undo => "ask Codex to undo a turn",
             SlashCommand::Quit | SlashCommand::Exit => "exit Codex",
             SlashCommand::Diff => "show git diff (including untracked files)",
@@ -56,6 +59,7 @@ impl SlashCommand {
             SlashCommand::ClearRef => "clear active reference images",
             SlashCommand::Mention => "mention a file",
             SlashCommand::Agent => "switch into a delegated agent session",
+            SlashCommand::Skills => "use skills to improve how Codex performs specific tasks",
             SlashCommand::Status => "show current session configuration and token usage",
             SlashCommand::Model => "choose what model and reasoning effort to use",
             SlashCommand::Approvals => "choose what Codex can do without approval",
@@ -88,6 +92,7 @@ impl SlashCommand {
     pub fn available_during_task(self) -> bool {
         match self {
             SlashCommand::New
+            | SlashCommand::Resume
             | SlashCommand::Init
             | SlashCommand::Tumix
             | SlashCommand::Compact
@@ -102,6 +107,7 @@ impl SlashCommand {
             | SlashCommand::ClearRef
             | SlashCommand::Mention
             | SlashCommand::Agent
+            | SlashCommand::Skills
             | SlashCommand::Status
             | SlashCommand::Mcp
             | SlashCommand::TumixStop
