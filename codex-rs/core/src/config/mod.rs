@@ -1393,9 +1393,7 @@ impl Config {
 
         let model_family = find_family_for_model(&model);
 
-        let model_context_window = cfg
-            .model_context_window
-            .or_else(|| model_family.context_window);
+        let model_context_window = cfg.model_context_window.or(model_family.context_window);
         let model_auto_compact_token_limit = cfg
             .model_auto_compact_token_limit
             .or_else(|| model_family.auto_compact_token_limit());
@@ -3308,7 +3306,7 @@ model_verbosity = "high"
         };
 
         let normalized_o3_profile_config = Config {
-            model_providers: fixture.model_provider_map.clone(),
+            model_providers: fixture.model_provider_map,
             ..o3_profile_config
         };
 
@@ -3489,7 +3487,7 @@ model_verbosity = "high"
         };
 
         let normalized_zdr_profile_config = Config {
-            model_providers: fixture.model_provider_map.clone(),
+            model_providers: fixture.model_provider_map,
             ..zdr_profile_config
         };
 
@@ -3573,7 +3571,7 @@ model_verbosity = "high"
         };
 
         let normalized_gpt5_profile_config = Config {
-            model_providers: fixture.model_provider_map.clone(),
+            model_providers: fixture.model_provider_map,
             ..gpt5_profile_config
         };
 

@@ -742,6 +742,7 @@ impl PagerView {
     /// Prefers the last rendered content height (excluding header/footer chrome);
     /// if no render has occurred yet, falls back to the content area height
     /// computed from the given viewport.
+    #[allow(dead_code)]
     fn page_height(&self, viewport_area: Rect) -> usize {
         self.last_content_height
             .unwrap_or_else(|| self.content_area(viewport_area).height as usize)
@@ -758,6 +759,7 @@ impl PagerView {
         area
     }
 
+    #[allow(dead_code)]
     fn content_area(&self, area: Rect) -> Rect {
         self.scroll_area(area)
     }

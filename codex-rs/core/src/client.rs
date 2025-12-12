@@ -250,30 +250,23 @@ impl ModelClient {
         // preview models accept the request without 400/429 errors.
         let contents = ensure_active_loop_has_thought_signatures(&contents);
 
-        let thinking_level = if api_model.contains("thinking") {
-            Some("high".to_string())
-        } else {
-            Some("low".to_string())
-        };
+        let thinking_config = Self::build_gemini_thinking_config(api_model);
 
         // Build generationConfig with thinkingConfig nested properly.
         // Gemini defaults to temperature=1.0; Codex uses a slightly
         // lower temperature (0.8) to encourage more stable, less
         // speculative reasoning while still allowing exploration.
-        // For Gemini 3 models, we allow a higher thinkingBudget (32768 tokens)
-        // even when `thinkingLevel` is "low" so both regular and thinking
-        // variants can sustain long, multi-step reasoning.
-        let is_thinking_model = api_model.contains("thinking");
+        // Gemini now enforces that only one of `thinkingLevel` or
+        // `thinkingBudget` may be set. We pick the level for thinking
+        // variants (to request high-quality thoughts) and budget for
+        // non-thinking text models (to keep longer tool loops), while
+        // omitting the field entirely for image models that reject it.
         let generation_config = Some(GeminiGenerationConfig {
             temperature: Some(0.8),
             top_k: Some(64),
             top_p: Some(0.95),
             max_output_tokens: None, // Let the model decide
-            thinking_config: Some(GeminiThinkingConfig {
-                thinking_level,
-                include_thoughts: if is_thinking_model { Some(true) } else { None },
-                thinking_budget: Some(32768),
-            }),
+            thinking_config,
         });
 
         // Default safety settings to allow code-related content
@@ -444,6 +437,28 @@ instead (for example: `codex -p codex`), or execute the command manually in your
         let byte_stream = response.bytes_stream();
 
         Ok(spawn_gemini_sse_stream(byte_stream, idle_timeout))
+    }
+
+    fn build_gemini_thinking_config(api_model: &str) -> Option<GeminiThinkingConfig> {
+        let is_thinking_model = api_model.contains("thinking");
+
+        if api_model.contains("image") {
+            return None;
+        }
+
+        if is_thinking_model {
+            return Some(GeminiThinkingConfig {
+                thinking_level: Some("high".to_string()),
+                include_thoughts: Some(true),
+                thinking_budget: None,
+            });
+        }
+
+        Some(GeminiThinkingConfig {
+            thinking_level: None,
+            include_thoughts: None,
+            thinking_budget: Some(32768),
+        })
     }
 
     /// Streams a turn via the OpenAI Responses API.
@@ -1359,7 +1374,7 @@ struct GeminiGenerationConfig {
     thinking_config: Option<GeminiThinkingConfig>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct GeminiThinkingConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1684,6 +1699,7 @@ impl SseTelemetry for ApiTelemetry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
     use serde_json::json;
 
     #[test]
@@ -1835,5 +1851,40 @@ mod tests {
             }
             other => panic!("expected FunctionCall, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_gemini_thinking_config_sets_high_level_for_thinking_models() {
+        let config = ModelClient::build_gemini_thinking_config("gemini-3-pro-preview-thinking");
+
+        assert_eq!(
+            config,
+            Some(GeminiThinkingConfig {
+                thinking_level: Some("high".to_string()),
+                include_thoughts: Some(true),
+                thinking_budget: None,
+            })
+        );
+    }
+
+    #[test]
+    fn build_gemini_thinking_config_uses_budget_for_text_models() {
+        let config = ModelClient::build_gemini_thinking_config("gemini-3-pro-preview");
+
+        assert_eq!(
+            config,
+            Some(GeminiThinkingConfig {
+                thinking_level: None,
+                include_thoughts: None,
+                thinking_budget: Some(32768),
+            })
+        );
+    }
+
+    #[test]
+    fn build_gemini_thinking_config_skips_image_models() {
+        let config = ModelClient::build_gemini_thinking_config("gemini-3-pro-image-preview");
+
+        assert_eq!(config, None);
     }
 }

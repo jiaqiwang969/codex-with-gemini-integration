@@ -78,23 +78,14 @@
 \end{itemize}
 
 在请求的 \verb|generationConfig| 中，我们用 \verb|thinkingConfig| 来区分
-低思考和高思考模型：
+低思考和高思考模型，同时遵循 Gemini “\verb|thinkingLevel| 与
+\verb|thinkingBudget| 只能二选一”的校验：
 
 \begin{itemize}
-  \item 非 thinking 模型：\verb|thinkingLevel = "low"|，不主动请求 thoughts；
-  \item thinking 模型：\verb|thinkingLevel = "high"|，且 \verb|includeThoughts = true|。
+  \item thinking 模型：\verb|thinkingLevel = "high"|，且 \verb|includeThoughts = true|，不再显式设置 \verb|thinkingBudget|；
+  \item 非 thinking 文本模型：仅设置 \verb|thinkingBudget = 32768|，不给 \verb|thinkingLevel|，让长链路工具调用有足够预算的同时避免冲突；
+  \item 图像模型（例如 \verb|gemini-3-pro-image-preview|）：直接省略 \verb|thinkingConfig|，避免图片模型在看到 level/budget 组合时返回 400。
 \end{itemize}
-
-为了保证“低思考”版本在工具循环中同样能坚持“寻根究底”，我们对两类模型
-\textbf{统一设置}了较大的思考预算：
-
-\begin{itemize}
-  \item \verb|thinkingBudget = 32768|（低思考、高思考版本完全一致）。
-\end{itemize}
-
-即使从官方文档角度看，Gemini 3 Pro 更推荐用 \verb|thinkingLevel| 控制思考量，
-但 Codex 仍显式设置一个较高的 \verb|thinkingBudget|，目的是在代理或旧实现
-仍检查此字段时，给出足够的预算，不让长链路工具调用过早被截断。
 
 \subsection{集成目标}
 
@@ -561,7 +552,7 @@ pub(crate) fn sidebar_status(&self) -> String {
   \item 引入 Gemini provider 与基本模型预设；
   \item 实现 \verb|stream_gemini|，打通 SSE 流式通路；
   \item 把 \verb|thinkingLevel| / \verb|thinkingConfig| 接到 generationConfig 上；
-  \item 统一设置较大的 \verb|thinkingBudget = 32768|，让 low/high 版本都能支撑长链路工具调用；
+  \item 调整 \verb|thinkingConfig| 构造：thinking 模型发送 \verb|thinkingLevel|，非 thinking 文本模型发送较大的 \verb|thinkingBudget|，图片模型省略该字段以满足 level/budget 互斥校验；
   \item 实现 thoughtSignature 的完整传递：解析、存储、回放，并在缺失时兜底；
   \item 增加针对 Gemini 的工具调用 loop 检测，阈值从 5 提升到 100；
   \item 修复 JSON Schema 不兼容 \verb|additionalProperties| 的问题；

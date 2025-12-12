@@ -1,4 +1,5 @@
 use crate::AuthManager;
+#[cfg(any(test, feature = "test-support"))]
 use crate::CodexAuth;
 use crate::codex::Codex;
 use crate::codex::CodexSpawnOk;

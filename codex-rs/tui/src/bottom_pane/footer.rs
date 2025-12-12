@@ -95,7 +95,7 @@ fn footer_lines(props: &FooterProps) -> Vec<Line<'static>> {
                     Vec::with_capacity(line.spans.len().saturating_add(3));
                 spans.push(format!("In {label}").cyan());
                 spans.push(" · ".dim());
-                spans.extend(line.spans.into_iter());
+                spans.extend(line.spans);
                 line = Line::from(spans);
             }
             line.push_span(" · ".dim());
@@ -129,7 +129,7 @@ fn footer_lines(props: &FooterProps) -> Vec<Line<'static>> {
                     Vec::with_capacity(line.spans.len().saturating_add(3));
                 spans.push(format!("In {label}").cyan());
                 spans.push(" · ".dim());
-                spans.extend(line.spans.into_iter());
+                spans.extend(line.spans);
                 line = Line::from(spans);
             }
             vec![line]
