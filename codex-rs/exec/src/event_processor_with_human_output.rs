@@ -155,7 +155,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             VERSION
         );
 
-        let mut entries = create_config_summary_entries(config);
+        let mut entries = create_config_summary_entries(config, &config.model);
         entries.push((
             "session id",
             session_configured_event.session_id.to_string(),
@@ -641,7 +641,7 @@ impl EventProcessorWithHumanOutput {
             return;
         }
 
-        let Some(conversation_id) = self.conversation_id.clone() else {
+        let Some(conversation_id) = self.conversation_id else {
             return;
         };
 
@@ -649,11 +649,11 @@ impl EventProcessorWithHumanOutput {
         let mut last_saved_path: Option<PathBuf> = None;
 
         for content_item in content {
-            if let ContentItem::InputImage { image_url } = content_item {
-                if let Some(path) = self.save_generated_image(&conversation_id, &image_url) {
-                    saved_any = true;
-                    last_saved_path = Some(path);
-                }
+            if let ContentItem::InputImage { image_url } = content_item
+                && let Some(path) = self.save_generated_image(&conversation_id, &image_url)
+            {
+                saved_any = true;
+                last_saved_path = Some(path);
             }
         }
 

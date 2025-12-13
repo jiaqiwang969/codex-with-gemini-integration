@@ -1,26 +1,23 @@
 ---
 source: tui/src/chatwidget/tests.rs
-assertion_line: 1792
 expression: popup
 ---
   Select Model and Effort
   Access legacy models by running codex -m <model_name> or in your config.toml
 
-› 1. gpt-5.1-codex-max                      Latest Codex-optimized flagship
-                                            for deep and fast reasoning.
-  2. gpt-5.1-codex                          Optimized for codex.
-  3. gpt-5.1-codex-mini                     Optimized for codex. Cheaper,
-                                            faster, but less capable.
-  4. gpt-5.1                                Broad world knowledge with strong
-                                            general reasoning.
-  5. gemini-3-pro-preview                   Google Gemini 3 Pro preview.
-  6. gemini-3-pro-preview-codex             Gemini 3 Pro preview with Codex-
-                                            optimized behaviour for code and
-                                            tools.
-  7. gemini-3-pro-preview-thinking          Google Gemini 3 Pro preview with
-                                            thinking capability.
-  8. gemini-3-pro-preview-thinking-codex    Gemini 3 Pro preview with thinking
-                                            capability and Codex-optimized
-                                            behaviour.
+› 1. gpt-5.1-codex-max (default)             Latest Codex-optimized flagship
+                                             for deep and fast reasoning.
+  2. gpt-5.1-codex                           Optimized for codex.
+  3. gpt-5.1-codex-mini                      Optimized for codex. Cheaper,
+                                             faster, but less capable.
+  4. gpt-5.2                                 Latest frontier model with
+                                             improvements across knowledge,
+                                             reasoning and coding
+  5. gpt-5.1                                 Broad world knowledge with strong
+                                             general reasoning.
+  6. gemini-3-pro-preview                    Google Gemini 3 Pro preview.
+  7. gemini-3-pro-preview-codex              Gemini 3 Pro preview with Codex-
+                                             optimized behaviour for code
+                                             and tools.
 
   Press enter to select reasoning effort, or esc to dismiss.

@@ -356,7 +356,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             // Start the cloned session with an optional prompt, mirroring the
             // behaviour of the default user‑turn path while honouring any
             // explicit prompt passed to the subcommand.
-            let prompt_arg = args.prompt.clone().or(root_prompt);
+            let prompt_arg = args.prompt.or(root_prompt);
             let prompt_text = resolve_prompt(prompt_arg);
             let mut items: Vec<UserInput> = imgs
                 .into_iter()

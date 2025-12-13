@@ -301,16 +301,11 @@ impl ModelClient {
         if std::env::var("CODEX_DEBUG_GEMINI_REQUEST").is_ok()
             && let Ok(json) = serde_json::to_string_pretty(&request)
         {
-            eprintln!("DEBUG GEMINI REQUEST:\n{json}");
+            debug!("DEBUG GEMINI REQUEST:\n{json}");
         }
 
         // Build request with Gemini-specific auth handling
         let client = build_reqwest_client();
-        let mut req_builder = client.post(&url);
-        // Always apply provider-level headers so env_http_headers like
-        // GEMINI_COOKIE are respected even when we inject the API key
-        // directly below.
-        req_builder = self.provider.apply_http_headers(req_builder);
 
         // Prefer GEMINI_API_KEY from the environment, then fall back to auth.json.
         // This matches the documented behaviour where a dedicated Gemini key
@@ -322,12 +317,20 @@ impl ModelClient {
             )
         });
 
-        if let Some(api_key) = gemini_api_key {
-            // Override any existing X-Goog-Api-Key header so we can prefer
-            // a dedicated Gemini key or the shared OPENAI_API_KEY from
-            // auth.json when present.
-            req_builder = req_builder.header("x-goog-api-key", api_key);
-        }
+        let make_request_builder = || {
+            let mut req_builder = client.post(&url);
+            // Always apply provider-level headers so env_http_headers like
+            // GEMINI_COOKIE are respected even when we inject the API key
+            // directly below.
+            req_builder = self.provider.apply_http_headers(req_builder);
+            if let Some(api_key) = gemini_api_key.as_deref() {
+                // Override any existing X-Goog-Api-Key header so we can prefer
+                // a dedicated Gemini key or the shared OPENAI_API_KEY from
+                // auth.json when present.
+                req_builder = req_builder.header("x-goog-api-key", api_key);
+            }
+            req_builder
+        };
 
         // Retry configuration: max 3 attempts with exponential backoff
         const MAX_ATTEMPTS: u64 = 3;
@@ -342,9 +345,7 @@ impl ModelClient {
 
             let result = self
                 .otel_event_manager
-                .log_request(attempt, || {
-                    req_builder.try_clone().unwrap().json(&request).send()
-                })
+                .log_request(attempt, || make_request_builder().json(&request).send())
                 .await;
 
             match result {
@@ -481,7 +482,11 @@ instead (for example: `codex -p codex`), or execute the command manually in your
         let reasoning = if model_family.supports_reasoning_summaries {
             Some(Reasoning {
                 effort: self.effort.or(model_family.default_reasoning_effort),
-                summary: Some(self.summary),
+                summary: if self.summary == ReasoningSummaryConfig::None {
+                    None
+                } else {
+                    Some(self.summary)
+                },
             })
         } else {
             None

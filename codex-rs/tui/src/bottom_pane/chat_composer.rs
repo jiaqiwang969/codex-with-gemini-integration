@@ -43,6 +43,7 @@ use crate::render::renderable::Renderable;
 use crate::slash_command::SlashCommand;
 use crate::slash_command::built_in_slash_commands;
 use crate::style::user_message_style;
+use codex_common::fuzzy_match::fuzzy_match;
 use codex_protocol::custom_prompts::CustomPrompt;
 use codex_protocol::custom_prompts::PROMPTS_CMD_PREFIX;
 
@@ -1619,6 +1620,27 @@ impl ChatComposer {
         } else {
             false
         };
+
+        if is_editing_slash_command_name
+            && let Some((name, _rest)) = parse_slash_name(first_line)
+            && !name.is_empty()
+        {
+            let builtin_match = built_in_slash_commands()
+                .into_iter()
+                .any(|(cmd_name, _)| fuzzy_match(cmd_name, name).is_some());
+
+            let prompt_prefix = format!("{PROMPTS_CMD_PREFIX}:");
+            let prompt_match = self.custom_prompts.iter().any(|prompt| {
+                fuzzy_match(&format!("{prompt_prefix}{}", prompt.name), name).is_some()
+            });
+
+            if !builtin_match && !prompt_match {
+                if matches!(self.active_popup, ActivePopup::Command(_)) {
+                    self.active_popup = ActivePopup::None;
+                }
+                return;
+            }
+        }
         // If the cursor is currently positioned within an `@token`, prefer the
         // file-search popup over the slash popup so users can insert a file path
         // as an argument to the command (e.g., "/review @docs/...").

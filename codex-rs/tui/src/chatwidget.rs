@@ -450,8 +450,7 @@ impl RefImageManager {
             (trimmed, None)
         };
 
-        let path_tokens: Vec<String> = Shlex::new(paths_raw).collect();
-        let path_tokens: Vec<String> = path_tokens.into_iter().filter(|s| !s.is_empty()).collect();
+        let path_tokens: Vec<String> = Shlex::new(paths_raw).filter(|s| !s.is_empty()).collect();
         if path_tokens.is_empty() {
             // If the user supplied only a prompt (for example `/ref-image -- tweak the style`)
             // defer image selection to the caller so it can integrate any attached images.
@@ -494,9 +493,9 @@ impl RefImageManager {
 
     fn resolve_path(raw: &str, ctx: &RefImageContext<'_>) -> PathBuf {
         // Expand ~/ prefix against the user's home directory when possible.
-        let expanded = if raw.starts_with("~/") {
+        let expanded = if let Some(stripped) = raw.strip_prefix("~/") {
             if let Some(home) = dirs::home_dir() {
-                home.join(&raw[2..])
+                home.join(stripped)
             } else {
                 PathBuf::from(raw)
             }
@@ -2893,9 +2892,10 @@ impl ChatWidget {
                     Some(preset.default_reasoning_effort),
                 );
                 SelectionItem {
-                    name: preset.display_name,
+                    name: preset.display_name.clone(),
                     description,
                     is_current: model == current_model,
+                    is_default: preset.is_default,
                     actions,
                     dismiss_on_select: true,
                     ..Default::default()
@@ -2972,9 +2972,10 @@ impl ChatWidget {
                 });
             })];
             items.push(SelectionItem {
-                name: preset.display_name.to_string(),
+                name: preset.display_name.clone(),
                 description,
                 is_current,
+                is_default: preset.is_default,
                 actions,
                 dismiss_on_select: single_supported_effort,
                 ..Default::default()

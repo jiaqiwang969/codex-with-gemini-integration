@@ -21,7 +21,7 @@ impl EventProcessorWithJsonOutput {
 
 impl EventProcessor for EventProcessorWithJsonOutput {
     fn print_config_summary(&mut self, config: &Config, prompt: &str, _: &SessionConfiguredEvent) {
-        let entries = create_config_summary_entries(config)
+        let entries = create_config_summary_entries(config, &config.model)
             .into_iter()
             .map(|(key, value)| (key.to_string(), value))
             .collect::<HashMap<String, String>>();

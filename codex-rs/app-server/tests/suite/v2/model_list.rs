@@ -6,10 +6,8 @@ use app_test_support::McpProcess;
 use app_test_support::to_response;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
-use codex_app_server_protocol::Model;
 use codex_app_server_protocol::ModelListParams;
 use codex_app_server_protocol::ModelListResponse;
-use codex_app_server_protocol::ReasoningEffortOption;
 use codex_app_server_protocol::RequestId;
 use codex_protocol::openai_models::ReasoningEffort;
 use pretty_assertions::assert_eq;
@@ -77,6 +75,12 @@ async fn list_models_returns_all_models_with_large_limit() -> Result<()> {
     assert_eq!(
         gpt_5_1.description,
         "Broad world knowledge with strong general reasoning."
+    );
+
+    let gpt_5_2 = find("gpt-5.2")?;
+    assert_eq!(
+        gpt_5_2.description,
+        "Latest frontier model with improvements across knowledge, reasoning and coding"
     );
 
     let gemini_3_pro_preview = find("gemini-3-pro-preview")?;

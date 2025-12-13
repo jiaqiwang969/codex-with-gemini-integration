@@ -1,9 +1,10 @@
 use assert_cmd::Command as AssertCommand;
-use assert_cmd::cargo::cargo_bin;
 use codex_core::RolloutRecorder;
 use codex_core::protocol::GitInfo;
 use core_test_support::fs_wait;
 use core_test_support::skip_if_no_network;
+use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -12,6 +13,41 @@ use wiremock::MockServer;
 use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
+
+fn codex_bin() -> PathBuf {
+    static BIN: OnceLock<PathBuf> = OnceLock::new();
+    BIN.get_or_init(|| {
+        if let Some(path) = std::env::var_os("CARGO_BIN_EXE_codex") {
+            return PathBuf::from(path);
+        }
+
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = manifest_dir
+            .parent()
+            .expect("CARGO_MANIFEST_DIR should have a parent")
+            .to_path_buf();
+        let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| workspace_root.join("target"));
+        let bin_name = if cfg!(windows) { "codex.exe" } else { "codex" };
+        let bin_path = target_dir.join("debug").join(bin_name);
+
+        if !bin_path.exists() {
+            let status = std::process::Command::new("cargo")
+                .current_dir(&workspace_root)
+                .args(["build", "-p", "codex-cli", "--bin", "codex"])
+                .status()
+                .expect("build codex CLI binary for tests");
+            assert!(
+                status.success(),
+                "failed to build codex CLI binary for tests"
+            );
+        }
+
+        bin_path
+    })
+    .clone()
+}
 
 /// Tests streaming chat completions through the CLI using a mock server.
 /// This test:
@@ -45,7 +81,7 @@ async fn chat_mode_stream_cli() {
         "model_providers.mock={{ name = \"mock\", base_url = \"{}/v1\", env_key = \"PATH\", wire_api = \"chat\" }}",
         server.uri()
     );
-    let bin = cargo_bin("codex");
+    let bin = codex_bin();
     let mut cmd = AssertCommand::new(bin);
     cmd.arg("exec")
         .arg("--skip-git-repo-check")
@@ -128,7 +164,7 @@ async fn exec_cli_applies_experimental_instructions_file() {
     );
 
     let home = TempDir::new().unwrap();
-    let bin = cargo_bin("codex");
+    let bin = codex_bin();
     let mut cmd = AssertCommand::new(bin);
     cmd.arg("exec")
         .arg("--skip-git-repo-check")
@@ -182,7 +218,7 @@ async fn responses_api_stream_cli() {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/cli_responses_fixture.sse");
 
     let home = TempDir::new().unwrap();
-    let bin = cargo_bin("codex");
+    let bin = codex_bin();
     let mut cmd = AssertCommand::new(bin);
     cmd.arg("exec")
         .arg("--skip-git-repo-check")
@@ -218,7 +254,7 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/cli_responses_fixture.sse");
 
     // 4. Run the codex CLI and invoke `exec`, which is what records a session.
-    let bin = cargo_bin("codex");
+    let bin = codex_bin();
     let mut cmd = AssertCommand::new(bin);
     cmd.arg("exec")
         .arg("--skip-git-repo-check")
@@ -339,7 +375,7 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
     // Second run: resume should update the existing file.
     let marker2 = format!("integration-resume-{}", Uuid::new_v4());
     let prompt2 = format!("echo {marker2}");
-    let bin2 = cargo_bin("codex");
+    let bin2 = codex_bin();
     let mut cmd2 = AssertCommand::new(bin2);
     cmd2.arg("exec")
         .arg("--skip-git-repo-check")

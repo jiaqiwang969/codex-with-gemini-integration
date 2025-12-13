@@ -89,7 +89,12 @@ async fn truncates_output_bytes() {
 
     let tmp = TempDir::new().expect("should be able to create temp dir");
     // each line is 1000 bytes
-    let cmd = vec!["bash", "-lc", "seq 15 | awk '{printf \"%-1000s\\n\", $0}'"];
+    // Avoid `-l` because user login scripts can be arbitrarily slow/non-hermetic.
+    let cmd = vec![
+        "/bin/bash",
+        "-c",
+        "seq 15 | awk '{printf \"%-1000s\\n\", $0}'",
+    ];
 
     let output = run_test_cmd(tmp, cmd).await.unwrap();
 

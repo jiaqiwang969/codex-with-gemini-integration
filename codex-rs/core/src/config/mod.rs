@@ -8,7 +8,6 @@ use crate::config::types::Notifications;
 use crate::config::types::OtelConfig;
 use crate::config::types::OtelConfigToml;
 use crate::config::types::OtelExporterKind;
-use crate::config::types::ReasoningSummaryFormat;
 use crate::config::types::SandboxWorkspaceWrite;
 use crate::config::types::ShellEnvironmentPolicy;
 use crate::config::types::ShellEnvironmentPolicyToml;
@@ -27,7 +26,6 @@ use crate::model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
 use crate::model_provider_info::ModelProviderInfo;
 use crate::model_provider_info::OLLAMA_OSS_PROVIDER_ID;
 use crate::model_provider_info::built_in_model_providers;
-use crate::openai_models::model_family::find_family_for_model;
 use crate::project_doc::DEFAULT_PROJECT_DOC_FILENAME;
 use crate::project_doc::LOCAL_PROJECT_DOC_FILENAME;
 use crate::protocol::AskForApproval;
@@ -41,6 +39,7 @@ use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::config_types::Verbosity;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::openai_models::ReasoningSummaryFormat;
 use codex_rmcp_client::OAuthCredentialsStoreMode;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
 use dirs::home_dir;
@@ -53,6 +52,8 @@ use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(test)]
+use tempfile::tempdir;
 
 use crate::config::profile::ConfigProfile;
 use toml::Value as TomlValue;
@@ -71,6 +72,17 @@ const OPENAI_DEFAULT_REVIEW_MODEL: &str = "gpt-5.1-codex-max";
 pub(crate) const PROJECT_DOC_MAX_BYTES: usize = 32 * 1024; // 32 KiB
 
 pub const CONFIG_TOML_FILE: &str = "config.toml";
+
+#[cfg(test)]
+pub(crate) fn test_config() -> Config {
+    let codex_home = tempdir().expect("create temp dir");
+    Config::load_from_base_config_with_overrides(
+        ConfigToml::default(),
+        ConfigOverrides::default(),
+        codex_home.path().to_path_buf(),
+    )
+    .expect("load default test config")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MultiAgentConfig {
@@ -1391,12 +1403,8 @@ impl Config {
             }
         }
 
-        let model_family = find_family_for_model(&model);
-
-        let model_context_window = cfg.model_context_window.or(model_family.context_window);
-        let model_auto_compact_token_limit = cfg
-            .model_auto_compact_token_limit
-            .or_else(|| model_family.auto_compact_token_limit());
+        let model_context_window = cfg.model_context_window;
+        let model_auto_compact_token_limit = cfg.model_auto_compact_token_limit;
 
         let compact_prompt = compact_prompt.or(cfg.compact_prompt).and_then(|value| {
             let trimmed = value.trim();
@@ -3245,12 +3253,11 @@ model_verbosity = "high"
             o3_profile_overrides,
             fixture.codex_home(),
         )?;
-        let o3_family = find_family_for_model("o3");
         let expected_o3_profile_config = Config {
             model: "o3".to_string(),
             review_model: OPENAI_DEFAULT_REVIEW_MODEL.to_string(),
-            model_context_window: o3_family.context_window,
-            model_auto_compact_token_limit: o3_family.auto_compact_token_limit(),
+            model_context_window: None,
+            model_auto_compact_token_limit: None,
             model_provider_id: "openai".to_string(),
             model_provider: fixture.openai_provider.clone(),
             approval_policy: AskForApproval::Never,
@@ -3328,12 +3335,11 @@ model_verbosity = "high"
             gpt3_profile_overrides,
             fixture.codex_home(),
         )?;
-        let gpt3_family = find_family_for_model("gpt-3.5-turbo");
         let expected_gpt3_profile_config = Config {
             model: "gpt-3.5-turbo".to_string(),
             review_model: OPENAI_DEFAULT_REVIEW_MODEL.to_string(),
-            model_context_window: gpt3_family.context_window,
-            model_auto_compact_token_limit: gpt3_family.auto_compact_token_limit(),
+            model_context_window: None,
+            model_auto_compact_token_limit: None,
             model_provider_id: "openai-chat-completions".to_string(),
             model_provider: fixture.openai_chat_completions_provider.clone(),
             approval_policy: AskForApproval::UnlessTrusted,
@@ -3426,12 +3432,11 @@ model_verbosity = "high"
             zdr_profile_overrides,
             fixture.codex_home(),
         )?;
-        let o3_family = find_family_for_model("o3");
         let expected_zdr_profile_config = Config {
             model: "o3".to_string(),
             review_model: OPENAI_DEFAULT_REVIEW_MODEL.to_string(),
-            model_context_window: o3_family.context_window,
-            model_auto_compact_token_limit: o3_family.auto_compact_token_limit(),
+            model_context_window: None,
+            model_auto_compact_token_limit: None,
             model_provider_id: "openai".to_string(),
             model_provider: fixture.openai_provider.clone(),
             approval_policy: AskForApproval::OnFailure,
@@ -3510,12 +3515,11 @@ model_verbosity = "high"
             gpt5_profile_overrides,
             fixture.codex_home(),
         )?;
-        let gpt5_family = find_family_for_model("gpt-5.1");
         let expected_gpt5_profile_config = Config {
             model: "gpt-5.1".to_string(),
             review_model: OPENAI_DEFAULT_REVIEW_MODEL.to_string(),
-            model_context_window: gpt5_family.context_window,
-            model_auto_compact_token_limit: gpt5_family.auto_compact_token_limit(),
+            model_context_window: None,
+            model_auto_compact_token_limit: None,
             model_provider_id: "openai".to_string(),
             model_provider: fixture.openai_provider.clone(),
             approval_policy: AskForApproval::OnFailure,

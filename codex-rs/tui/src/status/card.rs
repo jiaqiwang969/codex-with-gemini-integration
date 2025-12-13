@@ -108,7 +108,7 @@ impl StatusHistoryCell {
         plan_type: Option<PlanType>,
         now: DateTime<Local>,
     ) -> Self {
-        let config_entries = create_config_summary_entries(config);
+        let config_entries = create_config_summary_entries(config, &config.model);
         let (model_name, model_details) = compose_model_display(config, &config_entries);
         let approval = config_entries
             .iter()

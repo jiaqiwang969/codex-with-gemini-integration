@@ -498,7 +498,10 @@ fn strip_ansi_codes(text: &str) -> String {
     // - Cursor movement and other control sequences
     use once_cell::sync::Lazy;
     static ANSI_RE: Lazy<regex::Regex> =
-        Lazy::new(|| regex::Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").unwrap());
+        Lazy::new(|| match regex::Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]") {
+            Ok(re) => re,
+            Err(err) => panic!("invalid ANSI regex: {err}"),
+        });
     ANSI_RE.replace_all(text, "").to_string()
 }
 
