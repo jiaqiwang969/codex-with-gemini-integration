@@ -1,0 +1,259 @@
+\documentclass[UTF8,a4paper]{ctexart}
+\usepackage{geometry}
+\geometry{left=2.2cm,right=2.2cm,top=2.4cm,bottom=2.4cm}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{enumitem}
+\setlist{nosep}
+
+\title{Codex 自定义版本功能对标报告\\（基于官方 v0.72.0-alpha.2 的增量差异）}
+\author{基于目录：\texttt{codex} vs \texttt{codex-官方-0.72-alpha2}}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{报告目的与范围}
+本报告对比当前自定义 Codex 工程（\texttt{/Users/jqwang/136-codex-5.2-更新/codex}）与官方 v0.72.0-alpha.2（\texttt{/Users/jqwang/136-codex-5.2-更新/codex-官方-0.72-alpha2}）的差异，
+总结自定义版本在官方基线之上额外添加的功能与改动点。
+
+对比方式：
+\begin{itemize}
+  \item 文件级差异：统计 ``Only in custom'' 与 ``Files differ'' 的集合。
+  \item 关键字与入口追踪：从 CLI/TUI/核心协议/模型提供方/MCP 工具等入口定位功能。
+  \item 只聚焦功能与行为层差异；构建/CI 细节改动仅作附录提及。
+\end{itemize}
+
+\paragraph{维护目标（用于未来升级官方版本）}
+本报告的主要用途是：当官方版本升级时，可以快速定位 ``哪些是官方已有能力''、``哪些是自定义补丁''，从而在合并时减少冲突与误删。
+建议升级流程：
+\begin{itemize}
+  \item 先更新本报告中的 ``基线版本号'' 与官方对比目录；
+  \item 按本报告列出的 ``自定义模块/补丁'' 逐项核对：是否已被官方吸收、是否需要迁移到新 API、是否需要保留；
+  \item 对高风险差异（跨 provider、协议字段、历史记录格式、TUI 事件链路）优先做回归测试。
+\end{itemize}
+
+\section{总体差异概览}
+自定义版本在官方 v0.72.0-alpha.2 基础上新增/引入的主要模块如下（按功能聚类）。说明：官方 v0.72 系列已内置 GPT-5.2 等模型族与相关提示词，本节仅列出自定义增量功能。
+
+{\small
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.32\textwidth}>{\raggedright\arraybackslash}p{0.62\textwidth}}
+\textbf{新增模块} & \textbf{对应功能}\\ \hline
+\path{codex-rs/cxresume} & 独立的会话恢复/浏览工具（Node/TUI），并在 Codex TUI 内嵌会话选择器。\\
+\path{codex-rs/tumix} & TUMIX 多智能体并行执行框架（Round1 15 专家并行）。\\
+\path{codex-rs/multi-agent} & 通用多智能体配置/编排与 ``delegate\_agent'' 代理工具。\\
+\path{codex-rs/git-graph} & vendored \texttt{git-graph} 库与命令；TUI 侧提供可视化 Git 提交图。\\
+\path{codex-rs/external/appium-mcp} & Appium MCP 服务器（移动端自动化工具集）。\\
+\path{codex-rs/hunyuan-mcp-server} & 腾讯云混元 AI3D MCP 服务器（文/图生 3D）。\\
+\path{core/gemini_*_prompt.md} & Gemini / Germini 系列系统提示词。\\
+\path{tui/src/chatwidget.rs} & Germini 文生图：保存模型生成的图片、\texttt{/open-image} 打开最近生成图、\texttt{/ref-image} 管理参考图。\\
+\path{core/src/sandboxing/assessment.rs} & 模型驱动的 sandbox 风险评估。\\
+\path{tui/src/*session_*} & 会话别名、底部 session bar、内嵌 cxresume 选择器等 UI 增强。\\
+\end{longtable}
+}
+
+\section{自定义功能详解}
+
+\subsection{会话管理增强：resume、clone、别名与 cxresume}
+\paragraph{1) Session Clone（resume-clone）}
+官方基线（v0.72.0-alpha.2）仅支持 \texttt{codex exec resume} 继续原会话。自定义版本新增 ``会话克隆''：
+\begin{itemize}
+  \item CLI 新增子命令：\texttt{codex exec resume-clone <session\_id> [prompt]}。
+  \item Core 新增 \texttt{ConversationManager::clone\_conversation\_from\_rollout}：读取原 rollout 全历史，以 \texttt{Forked} 初始历史启动新会话，新会话拥有全新 session\_id，且不修改原文件。
+  \item 该能力成为 Tumix 等多智能体并行的基础（用于复制上下文）。 
+\end{itemize}
+
+\paragraph{2) cxresume（会话恢复/浏览器）}
+自定义版本引入独立工具 \texttt{cxresume}（Node.js + 分屏 TUI），用于浏览 \texttt{\~/.codex/sessions} 的历史会话并一键恢复：
+\begin{itemize}
+  \item 支持全量/按 cwd 过滤、搜索、预览、删除、复制 session id 等。
+  \item Codex TUI 内新增 \texttt{cxresume\_picker\_widget} 作为 overlay，支持在 GUI 内直接挑选历史会话。
+  \item App 侧增加预热/缓存逻辑，提升打开 picker 速度。
+\end{itemize}
+
+\paragraph{3) Session Alias（会话命名）与底部 Session Bar}
+\begin{itemize}
+  \item 新增 \texttt{SessionAliasManager}：在 \texttt{\~/.codex/session\_aliases.json} 维护 session\_id $\rightarrow$ 别名映射，支持设置/删除/持久化。
+  \item 新增 \texttt{SessionAliasInput}：新会话创建或重命名时弹出输入框，让用户命名会话。
+  \item 新增底部 \texttt{SessionBar}（类似 tmux）：展示当前 cwd 相关的历史会话标签（优先别名，其次首条用户消息短摘要），并支持快速左右切换/新建。
+\end{itemize}
+
+\subsection{通用多智能体系统与 Delegate 工具}
+自定义版本加入可配置的多智能体编排能力：
+\begin{itemize}
+  \item 新增 crate：\texttt{codex-multi-agent}，负责：
+    \begin{itemize}
+      \item 读取 \texttt{\~/.codex/agents/<agent\_id>/} 下的子智能体配置；
+      \item 维护允许调用的 agent 列表；
+      \item 编排子会话的启动/事件回传/会话切换（含 Detached 后台模式）。
+    \end{itemize}
+  \item Core 新增 ``delegate\_agent'' 工具与 \texttt{DelegateToolAdapter} 抽象：
+    \begin{itemize}
+      \item 支持单次委派或 batch 委派；
+      \item Invocation mode：\texttt{immediate}（阻塞返回摘要）与 \texttt{detached}（后台运行）。
+    \end{itemize}
+  \item TUI 新增 \texttt{/agent} slash command，用于切入某个 delegated 会话继续交互。
+\end{itemize}
+
+\subsection{TUMIX 多智能体并行执行框架}
+TUMIX 是自定义版本新增的 ``一键多专家并行'' 能力：
+\begin{itemize}
+  \item 新增 crate：\texttt{codex-tumix}，核心流程：
+    \begin{enumerate}
+      \item Meta-agent 生成 15 个专家 agent 配置；
+      \item 为每个专家创建独立 Git worktree；
+      \item 基于 \texttt{resume-clone} 克隆父会话上下文，15 个 agent 并行执行；
+      \item 每个 worktree 自动提交变更并记录 session\_id；
+      \item 结果写入 \texttt{.tumix/round1\_sessions.json}。
+    \end{enumerate}
+  \item CLI 新增：\texttt{codex tumix <parent\_session\_id>}。
+  \item TUI 新增：\texttt{/tumix} 与 \texttt{/tumix-stop} slash command；会话列表中显示 Tumix 运行状态徽标。
+\end{itemize}
+
+\subsection{Git Graph 可视化}
+自定义版本内嵌 \texttt{git-graph} 库与 TUI 展示：
+\begin{itemize}
+  \item 新增 vendored crate：\texttt{codex-rs/git-graph}（来源 \texttt{mlange-42/git-graph}）。
+  \item TUI 新增 Git Graph overlay（快捷键 \texttt{Ctrl+G}）：
+    \begin{itemize}
+      \item 优先使用库生成 ``圆角 Unicode'' 提交图（含彩色分支）；
+      \item 失败时回退到 \texttt{git log --graph} 并做 Unicode 转换；
+      \item overlay 支持滚动、刷新、全历史展示。
+    \end{itemize}
+\end{itemize}
+
+\subsection{Appium MCP（移动端自动化）}
+自定义版本 vendored 了 Appium MCP 服务器：
+\begin{itemize}
+  \item 新增目录 \texttt{codex-rs/external/appium-mcp}（TypeScript）。
+  \item 通过 MCP 向 Codex 暴露移动端自动化工具：设备选择、session 管理、元素查找/点击/输入、截图、滚动、生成测试脚本等。
+  \item 该模块可在用户的 MCP 配置中按需启用。
+\end{itemize}
+
+\subsection{Gemini / Germini 系列模型与图像模型}
+自定义版本大幅扩展了 Gemini 家族模型的支持：
+\begin{itemize}
+  \item 内置 provider ``gemini''：
+    \begin{itemize}
+      \item 默认指向 \texttt{https://api.ppchat.vip/v1beta}，可通过 \texttt{GEMINI\_BASE\_URL} 覆盖；
+      \item 认证优先使用环境变量 \texttt{GEMINI\_API\_KEY}（映射到 \texttt{X-Goog-Api-Key}），否则回退复用 \texttt{OPENAI\_API\_KEY}；
+      \item 支持可选 \texttt{GEMINI\_COOKIE}。
+    \end{itemize}
+  \item 新增 model presets（在模型选择器可见）：
+    \begin{itemize}
+      \item \texttt{gemini-3-pro-preview}：基础 Gemini 3 Pro。
+      \item \texttt{gemini-3-pro-preview-codex}：使用 Codex 风格 system prompt。
+      \item \texttt{gemini-3-pro-preview-thinking} / \texttt{-thinking-codex}：thinking 变体。
+      \item \texttt{gemini-3-pro-preview-thinking-germini}：Germini（Gemini CLI）风格系统提示词。
+      \item \texttt{gemini-3-pro-image-preview}：图像理解/生成模型。
+    \end{itemize}
+  \item Prompt 体系：新增 \texttt{gemini\_prompt.md}、\texttt{gemini\_codex\_prompt.md}、\texttt{gemini\_germini\_prompt.md}，分别对应基础/Codex 优化/Germini 工作流。
+  \item 自动 provider 切换：当用户在 TUI/CLI 选择 \texttt{gemini-*} 模型时自动切换到 ``gemini'' provider；反之从 Gemini 切回 GPT 模型时自动回到 ``openai/openai-proxy''。
+  \item 协议增强：
+    \begin{itemize}
+      \item 支持 Gemini 3 的 \texttt{thought\_signature} 透传与回填（避免工具调用校验失败）。
+      \item 对非 Gemini provider 自动剥离 \texttt{thought\_signature}，保持兼容。
+    \end{itemize}
+\end{itemize}
+
+\paragraph{Germini 文生图（Gemini 3 Pro Image）}
+除 ``Germini 风格系统提示词'' 外，自定义版本还补齐了文生图/图像迭代的 TUI 交互链路（详见 \texttt{codex-rs/docs/gemini\_3\_pro\_image\_user\_guide.tex}）。核心能力（凝练版）：
+\begin{itemize}
+  \item \textbf{模型输出落盘}：当 \texttt{gemini-3-pro-image-preview} 在 assistant message 中返回 \texttt{input\_image}（data URL），TUI 自动保存到 \texttt{\~/.codex/images/<conversation\_id>/000000.<ext>}，并提示 \texttt{/open-image} 打开最近生成的图片（实现点：\texttt{tui/src/chatwidget.rs}）。
+  \item \textbf{参考图 RefSet 管理}：\texttt{/ref-image <paths...> [-- prompt]} 把本地图片转换为 data URL 并持久化为 ``本会话参考图集合''；\texttt{/ref-image clear} 清空；\texttt{/ref-image ls} 查看（实现点：\texttt{tui/src/chatwidget.rs} + core 的 \texttt{Op::SetReferenceImages} 处理）。
+  \item \textbf{隐式继续改图}：若未显式设置参考图，core 会优先使用本轮用户附图；若本轮无图则可回退到历史中最近一张 assistant 图片作为参考图，从而支持 ``生成图 $\rightarrow$ 继续改图'' 的自然循环（实现点：\texttt{core/src/codex.rs} 的 reference\_images 推导逻辑）。
+\end{itemize}
+
+\paragraph{配置与 Provider 自由切换（Gemini/Germini $\leftrightarrow$ GPT）}
+该自定义版本对 ``模型（model）'' 与 ``提供方（provider / wire\_api）'' 的关系做了 ``可自由切换'' 的工程化处理，目的是在同一会话内让用户可以在 Gemini 家族与 GPT 家族间来回切换，而不需要手动修改大量配置。
+\begin{itemize}
+  \item \textbf{核心配置字段}：\texttt{model} 决定模型 slug；配置层用 \texttt{model\_provider}（内部解析为 \texttt{model\_provider\_id}）决定请求发往哪个 provider；provider 通过 \texttt{wire\_api} 选择协议（OpenAI Responses/Chat vs Gemini）。
+  \item \textbf{自动切换策略（保守）}：仅在 ``gemini'' 与 ``openai/openai-proxy'' 间自动切换；第三方 provider（如 openrouter）不会被自动切换，必须显式选择以避免意外路由。
+  \item \textbf{切换入口（TUI）}：模型选择器会发送 \texttt{Op::OverrideTurnContext\{model=...\}} 到 core，core 在 \texttt{SessionConfiguration::apply} 内结合 \texttt{Config::preferred\_model\_provider\_id\_for\_model} 判断是否需要同步切 provider。
+  \item \textbf{切换入口（CLI）}：建议用 profile 固定 provider，再通过 \texttt{-m <model>}（或配置文件）切换 model；也可切换 profile 达到 ``模型 + provider'' 组合切换。
+\end{itemize}
+
+\paragraph{配置示例（\texttt{\~/.codex/config.toml}）}
+下面示例展示 ``Gemini（含 Germini）'' 与 ``OpenAI 风格（GPT）'' 两个 provider 并存，并支持在 TUI 内直接切换模型时自动切换 provider（示例仅展示关键字段）：
+\begin{verbatim}
+[model_providers.gemini]
+name = "gemini"
+wire_api = "gemini"
+base_url = "https://api.ppchat.vip/v1beta"
+env_key = "GEMINI_API_KEY"
+
+[model_providers.openai-proxy]
+name = "openai-proxy"
+wire_api = "responses"
+base_url = "https://api.openai.com/v1"
+env_key = "OPENAI_API_KEY"
+
+[profiles.gemini]
+model = "gemini-3-pro-preview-thinking-germini"
+model_provider = "gemini"
+
+[profiles.gpt]
+model = "gpt-4.1"
+model_provider = "openai-proxy"
+\end{verbatim}
+
+\paragraph{兼容性修复：Gemini 图像会话切换到 GPT 触发 429/400}
+该问题是 ``跨 provider + 图像历史'' 的典型升级冲突点，官方更新时最容易被覆盖或改坏，建议在升级前优先核对该段逻辑是否仍存在。
+\begin{itemize}
+  \item \textbf{现象（用户可见）}：先用 \texttt{gemini-3-pro-image-preview} 进行图像对话，再切换到 GPT 模型后发送消息，出现：
+    \begin{itemize}
+      \item 429（proxy 或上游限流/体积限制），并最终报 ``exceeded retry limit''；
+      \item 随后暴露 400：\texttt{Invalid value: 'input\_text'. Supported values are 'output\_text' and 'refusal'.}（\texttt{param: input[i].content[j]}）。
+    \end{itemize}
+  \item \textbf{根因拆解}：
+    \begin{itemize}
+      \item Gemini 图像模型会把图片以 \texttt{data:image/...;base64,...} 形式写入历史（\texttt{input\_image}）。切换到 GPT provider 后，这段 ``超大图片历史'' 仍会进入下一次 OpenAI-style 请求，容易触发 proxy 的限流/体积策略（表现为 429）。
+      \item 初版 ``清理图片'' 逻辑把所有图片都替换成 \texttt{input\_text}；但 OpenAI Responses API 对 \texttt{role=assistant} 的 message 内容只接受 \texttt{output\_text/refusal}，因此出现 400 invalid\_value。
+    \end{itemize}
+  \item \textbf{修复策略（自定义补丁）}：
+    \begin{itemize}
+      \item \textbf{模型切换时清理}：当 model 从 \texttt{gemini-*} 切到非 \texttt{gemini-*} 时，统一将历史中的 \texttt{input\_image} 替换为占位文本，避免把大图带入 GPT 请求（核心点在 \texttt{core/src/codex.rs} 与 \texttt{core/src/context\_manager/history.rs}）。
+      \item \textbf{按角色替换（关键）}：\texttt{role=user} 的图片替换为 \texttt{input\_text}；\texttt{role=assistant} 的图片替换为 \texttt{output\_text}，以满足 Responses API 的 schema（对应 400 修复）。
+      \item \textbf{429 诊断与等待}：429 时解析并展示上游 \texttt{error.message}，并优先按 \texttt{Retry-After} 或 ``try again in Xs'' 等建议等待时长重试，避免在限流窗口内耗尽重试次数（\texttt{core/src/api\_bridge.rs}、\texttt{core/src/error.rs}、\texttt{core/src/codex.rs}、\texttt{core/src/util.rs}）。
+    \end{itemize}
+  \item \textbf{定位线索（便于未来合并）}：本补丁集中在 commit \texttt{69d25370}（message：\texttt{core: clear Gemini images on model switch}），相关单测覆盖位于 \texttt{core/src/codex.rs} 与 \texttt{core/src/context\_manager/history\_tests.rs}。
+\end{itemize}
+
+\subsection{腾讯云混元 AI3D MCP 集成}
+自定义版本新增 ``混元 AI3D'' 能力：
+\begin{itemize}
+  \item 新增 crate：\texttt{codex-hunyuan-mcp-server}。
+  \item 通过 MCP 暴露：
+    \begin{itemize}
+      \item 文生 3D、图生 3D、Sketch（文+图）模式；
+      \item 支持 Professional/Rapid/Standard 三种 API；
+      \item 自动提交任务、轮询状态并下载结果。
+    \end{itemize}
+  \item 输出文件默认落盘到 \texttt{/tmp/hunyuan-3d/} 按时间与 JobID 归档。
+\end{itemize}
+
+\subsection{Sandbox 风险评估与审批 UI}
+除官方已有 sandbox/审批外，自定义版本增加了 ``模型评估风险'' 的实验特性：
+\begin{itemize}
+  \item Feature flag：\texttt{experimental\_sandbox\_command\_assessment}。
+  \item 当 sandbox 阻止命令时，core 调用模型生成 \texttt{SandboxCommandAssessment}：
+    \begin{itemize}
+      \item 返回风险等级（low/medium/high）与摘要；
+      \item 评估 prompt 由 \texttt{core/templates/sandboxing/assessment\_prompt.md} 渲染。
+    \end{itemize}
+  \item 协议与 TUI：
+    \begin{itemize}
+      \item 审批事件携带 \texttt{risk} 字段；
+      \item Approval overlay 顶部显示风险摘要与等级。
+    \end{itemize}
+  \item exec 协议字段调整：将 \texttt{sandbox\_permissions} 替换为 \texttt{with\_escalated\_permissions}，便于与新的批准策略一致。
+\end{itemize}
+
+\section{结论}
+相较官方 v0.72.0-alpha.2，自定义版本形成了 ``多模型（Gemini/Germini）+ 多智能体（delegate/TUMIX）+ 会话工程化（clone/cxresume/别名）+ MCP 工具扩展（Appium/Hunyuan AI3D）+ 开发体验增强（Git Graph/风险评估）+ 图像工作流（Germini 文生图）'' 的完整扩展体系。
+
+这些增强使 Codex 从单一代码助手升级为可在复杂工程中进行并行分工、跨模态生成与强会话管理的终端/GUI 生产力平台。
+
+\end{document}
