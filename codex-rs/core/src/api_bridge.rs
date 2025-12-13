@@ -6,6 +6,7 @@ use codex_api::error::ApiError;
 use codex_api::rate_limits::parse_rate_limit;
 use http::HeaderMap;
 use serde::Deserialize;
+use std::time::Duration;
 
 use crate::auth::CodexAuth;
 use crate::error::CodexErr;
@@ -14,6 +15,8 @@ use crate::error::UnexpectedResponseError;
 use crate::error::UsageLimitReachedError;
 use crate::model_provider_info::ModelProviderInfo;
 use crate::token_data::PlanType;
+use crate::util::try_parse_error_message;
+use crate::util::try_parse_retry_after_from_rate_limit_message;
 
 pub(crate) fn map_api_error(err: ApiError) -> CodexErr {
     match err {
@@ -63,9 +66,14 @@ pub(crate) fn map_api_error(err: ApiError) -> CodexErr {
                         }
                     }
 
+                    let message = try_parse_error_message(&body_text);
+                    let retry_after = retry_after_from_headers(headers.as_ref())
+                        .or_else(|| try_parse_retry_after_from_rate_limit_message(&message));
                     CodexErr::RetryLimit(RetryLimitReachedError {
                         status,
                         request_id: extract_request_id(headers.as_ref()),
+                        message: Some(message),
+                        retry_after,
                     })
                 } else {
                     CodexErr::UnexpectedStatus(UnexpectedResponseError {
@@ -78,6 +86,8 @@ pub(crate) fn map_api_error(err: ApiError) -> CodexErr {
             TransportError::RetryLimit => CodexErr::RetryLimit(RetryLimitReachedError {
                 status: http::StatusCode::INTERNAL_SERVER_ERROR,
                 request_id: None,
+                message: None,
+                retry_after: None,
             }),
             TransportError::Timeout => CodexErr::Timeout,
             TransportError::Network(msg) | TransportError::Build(msg) => {
@@ -98,6 +108,84 @@ fn extract_request_id(headers: Option<&HeaderMap>) -> Option<String> {
                     .map(str::to_string)
             })
     })
+}
+
+fn retry_after_from_headers(headers: Option<&HeaderMap>) -> Option<Duration> {
+    let headers = headers?;
+    let retry_after = headers.get(http::header::RETRY_AFTER)?;
+    let raw = retry_after.to_str().ok()?;
+    let seconds: f64 = raw.trim().parse().ok()?;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return None;
+    }
+    Some(Duration::from_secs_f64(seconds))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_api::error::ApiError;
+    use http::HeaderValue;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn map_api_error_includes_rate_limit_message_and_retry_after_delay() {
+        let body = r#"{
+  "error": {
+    "message": "Rate limit reached for gpt-test. Please try again in 11.054s.",
+    "type": "rate_limit_exceeded",
+    "param": null,
+    "code": "rate_limit_exceeded"
+  }
+}"#;
+
+        let mapped = map_api_error(ApiError::Transport(TransportError::Http {
+            status: http::StatusCode::TOO_MANY_REQUESTS,
+            headers: None,
+            body: Some(body.to_string()),
+        }));
+
+        match mapped {
+            CodexErr::RetryLimit(err) => {
+                assert_eq!(err.status, http::StatusCode::TOO_MANY_REQUESTS);
+                assert_eq!(
+                    err.message,
+                    Some(
+                        "Rate limit reached for gpt-test. Please try again in 11.054s.".to_string()
+                    )
+                );
+                assert_eq!(err.retry_after, Some(Duration::from_millis(11_054)));
+            }
+            other => panic!("expected RetryLimit error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_api_error_prefers_retry_after_header_over_message() {
+        let body = r#"{
+  "error": {
+    "message": "Too many requests.",
+    "type": "rate_limit_exceeded"
+  }
+}"#;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::RETRY_AFTER, HeaderValue::from_static("12"));
+
+        let mapped = map_api_error(ApiError::Transport(TransportError::Http {
+            status: http::StatusCode::TOO_MANY_REQUESTS,
+            headers: Some(headers),
+            body: Some(body.to_string()),
+        }));
+
+        match mapped {
+            CodexErr::RetryLimit(err) => {
+                assert_eq!(err.status, http::StatusCode::TOO_MANY_REQUESTS);
+                assert_eq!(err.retry_after, Some(Duration::from_secs(12)));
+            }
+            other => panic!("expected RetryLimit error, got {other:?}"),
+        }
+    }
 }
 
 pub(crate) async fn auth_provider_from_auth(

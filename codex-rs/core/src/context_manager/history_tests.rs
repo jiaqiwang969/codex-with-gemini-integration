@@ -3,6 +3,7 @@ use crate::truncate;
 use crate::truncate::TruncationPolicy;
 use codex_git::GhostCommit;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::LocalShellExecAction;
@@ -158,6 +159,77 @@ fn get_history_for_prompt_drops_ghost_commits() {
     let mut history = create_history_with_items(items);
     let filtered = history.get_history_for_prompt();
     assert_eq!(filtered, vec![]);
+}
+
+#[test]
+fn replace_all_images_replaces_images_and_returns_count() {
+    let mut history = ContextManager::default();
+    let policy = TruncationPolicy::Tokens(10_000);
+    let items = vec![
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputImage {
+                image_url: "data:image/png;base64,abc".to_string(),
+            }],
+            thought_signature: None,
+        },
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::InputImage {
+                image_url: "data:image/png;base64,def".to_string(),
+            }],
+            thought_signature: None,
+        },
+        ResponseItem::FunctionCallOutput {
+            call_id: "call-1".to_string(),
+            output: FunctionCallOutputPayload {
+                content: "ok".to_string(),
+                content_items: Some(vec![FunctionCallOutputContentItem::InputImage {
+                    image_url: "data:image/png;base64,ghi".to_string(),
+                }]),
+                success: Some(true),
+            },
+        },
+    ];
+
+    history.record_items(items.iter(), policy);
+
+    let replaced = history.replace_all_images("image removed");
+    assert_eq!(replaced, 3);
+
+    assert_eq!(
+        history.contents(),
+        vec![
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "image removed".to_string(),
+                }],
+                thought_signature: None,
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "image removed".to_string(),
+                }],
+                thought_signature: None,
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: "call-1".to_string(),
+                output: FunctionCallOutputPayload {
+                    content: "ok".to_string(),
+                    content_items: Some(vec![FunctionCallOutputContentItem::InputText {
+                        text: "image removed".to_string(),
+                    }]),
+                    success: Some(true),
+                },
+            },
+        ]
+    );
 }
 
 #[test]
@@ -492,6 +564,7 @@ fn normalize_adds_missing_output_for_function_call() {
                 name: "do_it".to_string(),
                 arguments: "{}".to_string(),
                 call_id: "call-x".to_string(),
+                thought_signature: None,
             },
             ResponseItem::FunctionCallOutput {
                 call_id: "call-x".to_string(),

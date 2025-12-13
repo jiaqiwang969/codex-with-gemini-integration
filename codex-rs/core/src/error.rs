@@ -290,19 +290,38 @@ impl std::error::Error for UnexpectedResponseError {}
 pub struct RetryLimitReachedError {
     pub status: StatusCode,
     pub request_id: Option<String>,
+    pub message: Option<String>,
+    pub retry_after: Option<Duration>,
 }
 
 impl std::fmt::Display for RetryLimitReachedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "exceeded retry limit, last status: {}{}",
-            self.status,
-            self.request_id
-                .as_ref()
-                .map(|id| format!(", request id: {id}"))
-                .unwrap_or_default()
-        )
+        if self.status == StatusCode::TOO_MANY_REQUESTS {
+            let message = self
+                .message
+                .as_deref()
+                .filter(|msg| !msg.trim().is_empty())
+                .unwrap_or("Too Many Requests (429)");
+            write!(f, "{message}")?;
+            if let Some(delay) = self.retry_after {
+                write!(f, " (retry after {delay:?})")?;
+            }
+            if let Some(id) = &self.request_id {
+                write!(f, ", request id: {id}")?;
+            }
+            return Ok(());
+        }
+
+        write!(f, "exceeded retry limit, last status: {}", self.status)?;
+        if let Some(id) = &self.request_id {
+            write!(f, ", request id: {id}")?;
+        }
+        if let Some(message) = &self.message
+            && !message.trim().is_empty()
+        {
+            write!(f, ", message: {message}")?;
+        }
+        Ok(())
     }
 }
 

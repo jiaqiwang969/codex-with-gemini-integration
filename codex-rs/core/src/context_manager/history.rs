@@ -152,6 +152,47 @@ impl ContextManager {
         }
     }
 
+    /// Replace all images in history with a placeholder text.
+    ///
+    /// Returns the number of images replaced.
+    pub(crate) fn replace_all_images(&mut self, placeholder: &str) -> i64 {
+        let mut replaced_images = 0_i64;
+        for item in self.items.iter_mut() {
+            match item {
+                ResponseItem::Message { role, content, .. } => {
+                    for c in content.iter_mut() {
+                        if matches!(c, ContentItem::InputImage { .. }) {
+                            if role == "assistant" {
+                                *c = ContentItem::OutputText {
+                                    text: placeholder.to_string(),
+                                };
+                            } else {
+                                *c = ContentItem::InputText {
+                                    text: placeholder.to_string(),
+                                };
+                            }
+                            replaced_images += 1;
+                        }
+                    }
+                }
+                ResponseItem::FunctionCallOutput { output, .. } => {
+                    if let Some(content_items) = output.content_items.as_mut() {
+                        for c in content_items.iter_mut() {
+                            if matches!(c, FunctionCallOutputContentItem::InputImage { .. }) {
+                                *c = FunctionCallOutputContentItem::InputText {
+                                    text: placeholder.to_string(),
+                                };
+                                replaced_images += 1;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        replaced_images
+    }
+
     pub(crate) fn update_token_info(
         &mut self,
         usage: &TokenUsage,

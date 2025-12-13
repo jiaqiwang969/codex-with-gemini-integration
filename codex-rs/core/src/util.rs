@@ -39,6 +39,33 @@ pub(crate) fn try_parse_error_message(text: &str) -> String {
     text.to_string()
 }
 
+pub(crate) fn try_parse_retry_after_from_rate_limit_message(message: &str) -> Option<Duration> {
+    let lower = message.to_ascii_lowercase();
+    let marker = "try again in ";
+    let idx = lower.rfind(marker)?;
+    let start = idx.saturating_add(marker.len());
+    let tail = message.get(start..)?.trim_start();
+
+    let mut end = 0_usize;
+    for (i, ch) in tail.char_indices() {
+        if ch.is_ascii_digit() || ch == '.' {
+            end = i + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end == 0 {
+        return None;
+    }
+
+    let seconds = tail.get(..end)?.parse::<f64>().ok()?;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return None;
+    }
+
+    Some(Duration::from_secs_f64(seconds))
+}
+
 pub fn resolve_path(base: &Path, path: &PathBuf) -> PathBuf {
     if path.is_absolute() {
         path.clone()
@@ -50,6 +77,7 @@ pub fn resolve_path(base: &Path, path: &PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn test_try_parse_error_message() {
@@ -73,5 +101,14 @@ mod tests {
         let text = r#"{"message": "test"}"#;
         let message = try_parse_error_message(text);
         assert_eq!(message, r#"{"message": "test"}"#);
+    }
+
+    #[test]
+    fn try_parse_retry_after_from_rate_limit_message_extracts_seconds() {
+        let message = "Rate limit reached for gpt-test. Please try again in 11.054s.";
+        assert_eq!(
+            try_parse_retry_after_from_rate_limit_message(message),
+            Some(Duration::from_secs_f64(11.054))
+        );
     }
 }

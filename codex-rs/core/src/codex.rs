@@ -147,6 +147,7 @@ use codex_protocol::protocol::InitialHistory;
 use codex_protocol::user_input::UserInput;
 use codex_utils_readiness::Readiness;
 use codex_utils_readiness::ReadinessFlag;
+use reqwest::StatusCode;
 
 /// The high-level interface to the Codex system.
 /// It operates as a queue pair where you send submissions and receive events.
@@ -394,11 +395,30 @@ pub(crate) struct SessionConfiguration {
     session_source: SessionSource,
 }
 
+/// Result of applying session settings updates.
+pub(crate) struct ApplyResult {
+    /// The updated session configuration.
+    pub(crate) configuration: SessionConfiguration,
+    /// Whether to clear images from history (e.g., when switching from Gemini image model to GPT).
+    pub(crate) should_clear_history_images: bool,
+}
+
 impl SessionConfiguration {
-    pub(crate) fn apply(&self, updates: &SessionSettingsUpdate) -> Self {
+    pub(crate) fn apply(&self, updates: &SessionSettingsUpdate) -> ApplyResult {
         let mut next_configuration = self.clone();
-        if let Some(model) = updates.model.clone() {
-            next_configuration.model = model;
+        let mut should_clear_history_images = false;
+
+        if let Some(model) = updates.model.as_ref() {
+            let old_model = self.model.as_str();
+            next_configuration.model = model.clone();
+
+            // When switching away from Gemini models, clear any images stored in history so we
+            // don't carry large `data:` URLs into OpenAI-style requests (which can trigger 429s
+            // in upstream proxies).
+            if old_model.starts_with("gemini-") && !model.starts_with("gemini-") {
+                should_clear_history_images = true;
+            }
+
             // When the model changes, switch between built‑in OpenAI and Gemini
             // providers if the new slug clearly belongs to the other family.
             let current_provider_id = self
@@ -407,6 +427,16 @@ impl SessionConfiguration {
                 .iter()
                 .find(|(_, provider)| *provider == &self.provider)
                 .map(|(id, _)| id.as_str());
+
+            tracing::debug!(
+                model = %model,
+                old_model = %old_model,
+                current_provider_id = ?current_provider_id,
+                available_providers = ?self.original_config_do_not_use.model_providers.keys().collect::<Vec<_>>(),
+                should_clear_history_images = should_clear_history_images,
+                "SessionConfiguration::apply - checking provider switch"
+            );
+
             if let Some(provider_id) = self
                 .original_config_do_not_use
                 .preferred_model_provider_id_for_model(
@@ -418,7 +448,21 @@ impl SessionConfiguration {
                     .model_providers
                     .get(&provider_id)
             {
+                tracing::info!(
+                    from_provider = ?current_provider_id,
+                    to_provider = %provider_id,
+                    model = %model,
+                    wire_api = ?provider.wire_api,
+                    "SessionConfiguration::apply - switching provider"
+                );
+
                 next_configuration.provider = provider.clone();
+            } else {
+                tracing::debug!(
+                    model = %model,
+                    current_provider_id = ?current_provider_id,
+                    "SessionConfiguration::apply - no provider switch needed"
+                );
             }
         }
         if let Some(effort) = updates.reasoning_effort {
@@ -436,7 +480,10 @@ impl SessionConfiguration {
         if let Some(cwd) = updates.cwd.clone() {
             next_configuration.cwd = cwd;
         }
-        next_configuration
+        ApplyResult {
+            configuration: next_configuration,
+            should_clear_history_images,
+        }
     }
 }
 
@@ -826,7 +873,26 @@ impl Session {
     pub(crate) async fn update_settings(&self, updates: SessionSettingsUpdate) {
         let mut state = self.state.lock().await;
 
-        state.session_configuration = state.session_configuration.apply(&updates);
+        let old_model = state.session_configuration.model.clone();
+        let result = state.session_configuration.apply(&updates);
+        let new_model = result.configuration.model.clone();
+        state.session_configuration = result.configuration;
+
+        // If switching away from Gemini models, clear images from history to avoid
+        // sending large `data:` URLs to OpenAI-style providers (often surfaced as 429s).
+        if result.should_clear_history_images {
+            let replaced_images = state
+                .history
+                .replace_all_images("[image removed due to model switch]");
+            if replaced_images > 0 {
+                tracing::warn!(
+                    old_model = %old_model,
+                    new_model = %new_model,
+                    replaced_images = replaced_images,
+                    "update_settings: cleared images from history due to model switch"
+                );
+            }
+        }
     }
 
     pub(crate) async fn new_turn(&self, updates: SessionSettingsUpdate) -> Arc<TurnContext> {
@@ -841,10 +907,36 @@ impl Session {
     ) -> Arc<TurnContext> {
         let session_configuration = {
             let mut state = self.state.lock().await;
-            let session_configuration = state.session_configuration.clone().apply(&updates);
-            state.session_configuration = session_configuration.clone();
-            session_configuration
+            let old_model = state.session_configuration.model.clone();
+            let result = state.session_configuration.clone().apply(&updates);
+            let new_model = result.configuration.model.clone();
+            state.session_configuration = result.configuration.clone();
+
+            // If switching away from Gemini models, clear images from history to avoid
+            // sending large `data:` URLs to OpenAI-style providers (often surfaced as 429s).
+            if result.should_clear_history_images {
+                let replaced_images = state
+                    .history
+                    .replace_all_images("[image removed due to model switch]");
+                if replaced_images > 0 {
+                    tracing::warn!(
+                        old_model = %old_model,
+                        new_model = %new_model,
+                        replaced_images = replaced_images,
+                        "new_turn_with_sub_id: cleared images from history due to model switch"
+                    );
+                }
+            }
+
+            result.configuration
         };
+
+        tracing::debug!(
+            model = %session_configuration.model,
+            provider_name = %session_configuration.provider.name,
+            wire_api = ?session_configuration.provider.wire_api,
+            "new_turn_with_sub_id - creating turn context"
+        );
 
         let per_turn_config = Self::build_per_turn_config(&session_configuration);
         let model_family = self
@@ -2402,8 +2494,13 @@ async fn run_turn(
                 let max_retries = turn_context.client.get_provider().stream_max_retries();
                 if retries < max_retries {
                     retries += 1;
-                    let delay = match e {
-                        CodexErr::Stream(_, Some(delay)) => delay,
+                    let delay = match &e {
+                        CodexErr::Stream(_, Some(delay)) => *delay,
+                        CodexErr::RetryLimit(err)
+                            if err.status == StatusCode::TOO_MANY_REQUESTS =>
+                        {
+                            err.retry_after.unwrap_or_else(|| backoff(retries))
+                        }
                         _ => backoff(retries),
                     };
                     warn!(
@@ -3338,6 +3435,84 @@ mod tests {
             }
             other => panic!("expected user message, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn update_settings_clears_history_images_when_switching_away_from_gemini() {
+        let (session, turn_context) = make_session_and_context();
+
+        session
+            .update_settings(SessionSettingsUpdate {
+                model: Some("gemini-3-pro-image-preview".to_string()),
+                ..Default::default()
+            })
+            .await;
+
+        let image_message = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputImage {
+                image_url: "data:image/png;base64,abc".to_string(),
+            }],
+            thought_signature: None,
+        };
+        session
+            .record_conversation_items(&turn_context, std::slice::from_ref(&image_message))
+            .await;
+
+        session
+            .update_settings(SessionSettingsUpdate {
+                model: Some("gpt-4o".to_string()),
+                ..Default::default()
+            })
+            .await;
+
+        let mut history = session.clone_history().await;
+        assert_eq!(
+            history.get_history(),
+            vec![ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "[image removed due to model switch]".to_string(),
+                }],
+                thought_signature: None,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn update_settings_preserves_history_images_when_staying_on_gemini() {
+        let (session, turn_context) = make_session_and_context();
+
+        session
+            .update_settings(SessionSettingsUpdate {
+                model: Some("gemini-3-pro-image-preview".to_string()),
+                ..Default::default()
+            })
+            .await;
+
+        let image_message = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputImage {
+                image_url: "data:image/png;base64,abc".to_string(),
+            }],
+            thought_signature: None,
+        };
+        session
+            .record_conversation_items(&turn_context, std::slice::from_ref(&image_message))
+            .await;
+
+        session
+            .update_settings(SessionSettingsUpdate {
+                model: Some("gemini-3-pro-preview".to_string()),
+                ..Default::default()
+            })
+            .await;
+
+        let mut history = session.clone_history().await;
+        assert_eq!(history.get_history(), vec![image_message]);
     }
 
     #[derive(Clone, Copy)]
