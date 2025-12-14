@@ -2079,6 +2079,68 @@ impl App {
                                     tui.frame_requester().schedule_frame();
                                 }
                             }
+                            KeyCode::Char('c') => {
+                                if self.chat_widget.is_task_running() {
+                                    self.chat_widget.add_error_message(
+                                        "Cannot clone a session while a task is running."
+                                            .to_string(),
+                                    );
+                                    return;
+                                }
+
+                                let Some(session) = self.session_bar.selected_session() else {
+                                    self.chat_widget.add_error_message(
+                                        "No session selected to clone.".to_string(),
+                                    );
+                                    return;
+                                };
+
+                                let source_path = session.path.clone();
+                                let mut config = self.chat_widget.config_ref().clone();
+                                config.features.disable(Feature::RemoteModels);
+
+                                let cloned = match self
+                                    .server
+                                    .clone_conversation_from_rollout(config, source_path.clone())
+                                    .await
+                                {
+                                    Ok(cloned) => cloned,
+                                    Err(err) => {
+                                        self.chat_widget.add_error_message(format!(
+                                            "Failed to clone session from {}: {err}",
+                                            source_path.display()
+                                        ));
+                                        return;
+                                    }
+                                };
+
+                                let codex_core::NewConversation {
+                                    conversation_id,
+                                    conversation,
+                                    session_configured,
+                                } = cloned;
+                                let session_id = session_configured.session_id.to_string();
+                                self.server.remove_conversation(&conversation_id).await;
+                                drop(conversation);
+
+                                let app_tx = self.app_event_tx.clone();
+                                self.chat_widget.show_session_alias_input_for_rename(
+                                    session_id,
+                                    Box::new(move |sid, alias| {
+                                        app_tx.send(AppEvent::SaveSessionAlias {
+                                            session_id: sid,
+                                            alias,
+                                        });
+                                    }),
+                                );
+
+                                self.session_bar.refresh_sessions();
+
+                                // Transfer focus to ChatWidget so the naming dialog can receive input.
+                                self.panel_focus = PanelFocus::Chat;
+                                self.session_bar.set_focus(false);
+                                tui.frame_requester().schedule_frame();
+                            }
                             KeyCode::Char('x') => {
                                 // Delete selected history session rollout file (no confirmation)
                                 if !self.session_bar.selected_is_new()

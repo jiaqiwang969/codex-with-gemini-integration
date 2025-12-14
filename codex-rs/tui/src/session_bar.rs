@@ -442,6 +442,9 @@ impl SessionBar {
             help_spans.push(key_hint::plain(KeyCode::Char('r')).into());
             help_spans.push(Span::from(" rename  ").dim());
 
+            help_spans.push(key_hint::plain(KeyCode::Char('c')).into());
+            help_spans.push(Span::from(" clone  ").dim());
+
             help_spans.push(key_hint::plain(KeyCode::Char('x')).into());
             help_spans.push(Span::from(" delete  ").dim());
 
