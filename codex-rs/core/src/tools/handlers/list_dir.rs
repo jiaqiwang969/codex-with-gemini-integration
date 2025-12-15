@@ -51,7 +51,7 @@ impl ToolHandler for ListDirHandler {
     }
 
     async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
-        let ToolInvocation { payload, .. } = invocation;
+        let ToolInvocation { payload, turn, .. } = invocation;
 
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
@@ -93,12 +93,13 @@ impl ToolHandler for ListDirHandler {
             ));
         }
 
-        let path = PathBuf::from(&dir_path);
-        if !path.is_absolute() {
+        let dir_path = dir_path.trim();
+        if dir_path.is_empty() {
             return Err(FunctionCallError::RespondToModel(
-                "dir_path must be an absolute path".to_string(),
+                "dir_path must not be empty".to_string(),
             ));
         }
+        let path = turn.resolve_path(Some(dir_path.to_string()));
 
         let entries = list_dir_slice(&path, offset, limit, depth).await?;
         let mut output = Vec::with_capacity(entries.len() + 1);
@@ -273,7 +274,15 @@ impl From<&FileType> for DirEntryKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex::make_session_and_context;
+    use crate::tools::context::ToolInvocation;
+    use crate::tools::context::ToolOutput;
+    use crate::tools::context::ToolPayload;
+    use crate::turn_diff_tracker::TurnDiffTracker;
+    use pretty_assertions::assert_eq;
+    use std::sync::Arc;
     use tempfile::tempdir;
+    use tokio::sync::Mutex;
 
     #[tokio::test]
     async fn lists_directory_entries() {
@@ -331,6 +340,45 @@ mod tests {
         ];
 
         assert_eq!(entries, expected);
+    }
+
+    #[tokio::test]
+    async fn handler_accepts_relative_dir_paths() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        tokio::fs::write(temp.path().join("entry.txt"), b"content").await?;
+
+        let (session, mut turn_context) = make_session_and_context();
+        turn_context.cwd = temp.path().to_path_buf();
+
+        let invocation = ToolInvocation {
+            session: Arc::new(session),
+            turn: Arc::new(turn_context),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-1".to_string(),
+            tool_name: "list_dir".to_string(),
+            payload: ToolPayload::Function {
+                arguments: serde_json::to_string(&serde_json::json!({
+                    "dir_path": ".",
+                    "offset": 1,
+                    "limit": 10,
+                    "depth": 1
+                }))?,
+            },
+        };
+
+        let handler = ListDirHandler;
+        let output = handler.handle(invocation).await?;
+        match output {
+            ToolOutput::Function {
+                content, success, ..
+            } => {
+                assert_eq!(success, Some(true));
+                assert!(content.contains("Absolute path: "));
+                assert!(content.contains("entry.txt"));
+            }
+            _ => panic!("expected function output"),
+        }
+        Ok(())
     }
 
     #[tokio::test]

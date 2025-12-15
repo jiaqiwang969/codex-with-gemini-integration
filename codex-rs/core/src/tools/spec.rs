@@ -536,7 +536,10 @@ fn create_read_file_tool() -> ToolSpec {
     properties.insert(
         "file_path".to_string(),
         JsonSchema::String {
-            description: Some("Absolute path to the file".to_string()),
+            description: Some(
+                "Path to the file (absolute or relative to the session working directory)."
+                    .to_string(),
+            ),
         },
     );
     properties.insert(
@@ -634,7 +637,10 @@ fn create_list_dir_tool() -> ToolSpec {
     properties.insert(
         "dir_path".to_string(),
         JsonSchema::String {
-            description: Some("Absolute path to the directory to list.".to_string()),
+            description: Some(
+                "Path to the directory to list (absolute or relative to the session working directory)."
+                    .to_string(),
+            ),
         },
     );
     properties.insert(

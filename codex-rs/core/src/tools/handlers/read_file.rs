@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::path::PathBuf;
 
 use async_trait::async_trait;
 use codex_utils_string::take_bytes_at_char_boundary;
@@ -96,7 +95,7 @@ impl ToolHandler for ReadFileHandler {
     }
 
     async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
-        let ToolInvocation { payload, .. } = invocation;
+        let ToolInvocation { payload, turn, .. } = invocation;
 
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
@@ -133,12 +132,13 @@ impl ToolHandler for ReadFileHandler {
             ));
         }
 
-        let path = PathBuf::from(&file_path);
-        if !path.is_absolute() {
+        let file_path = file_path.trim();
+        if file_path.is_empty() {
             return Err(FunctionCallError::RespondToModel(
-                "file_path must be an absolute path".to_string(),
+                "file_path must not be empty".to_string(),
             ));
         }
+        let path = turn.resolve_path(Some(file_path.to_string()));
 
         let collected = match mode {
             ReadMode::Slice => slice::read(&path, offset, limit).await?,
@@ -496,8 +496,16 @@ mod tests {
     use super::indentation::read_block;
     use super::slice::read;
     use super::*;
+    use crate::codex::make_session_and_context;
+    use crate::tools::context::ToolInvocation;
+    use crate::tools::context::ToolOutput;
+    use crate::tools::context::ToolPayload;
+    use crate::turn_diff_tracker::TurnDiffTracker;
     use pretty_assertions::assert_eq;
+    use std::sync::Arc;
     use tempfile::NamedTempFile;
+    use tempfile::tempdir;
+    use tokio::sync::Mutex;
 
     #[tokio::test]
     async fn reads_requested_range() -> anyhow::Result<()> {
@@ -994,6 +1002,43 @@ private:
                 "L23:     }".to_string(),
             ]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handler_accepts_relative_file_paths() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        tokio::fs::write(temp.path().join("hello.txt"), "hello\n").await?;
+
+        let (session, mut turn_context) = make_session_and_context();
+        turn_context.cwd = temp.path().to_path_buf();
+
+        let invocation = ToolInvocation {
+            session: Arc::new(session),
+            turn: Arc::new(turn_context),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-1".to_string(),
+            tool_name: "read_file".to_string(),
+            payload: ToolPayload::Function {
+                arguments: serde_json::to_string(&serde_json::json!({
+                    "file_path": "hello.txt"
+                }))?,
+            },
+        };
+
+        let handler = ReadFileHandler;
+        let output = handler.handle(invocation).await?;
+
+        match output {
+            ToolOutput::Function {
+                content, success, ..
+            } => {
+                assert_eq!(success, Some(true));
+                assert_eq!(content, "L1: hello");
+            }
+            _ => panic!("expected function output"),
+        }
+
         Ok(())
     }
 }
