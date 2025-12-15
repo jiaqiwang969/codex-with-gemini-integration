@@ -137,7 +137,8 @@ fn collect_file_names(content: &str) -> HashSet<String> {
             if line.trim().is_empty() {
                 return None;
             }
-            Path::new(line)
+            let path = line.split_once(':').map(|(path, _)| path).unwrap_or(line);
+            Path::new(path)
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
         })

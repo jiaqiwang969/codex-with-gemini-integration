@@ -75,7 +75,7 @@ fn next_gemini_call_id() -> String {
     format!("gemini-function-call-{id}")
 }
 
-const GEMINI_READ_ONLY_TOOL_NAMES: [&str; 7] = [
+const GEMINI_READ_ONLY_TOOL_NAMES: [&str; 9] = [
     "grep_files",
     "list_dir",
     "read_file",
@@ -83,6 +83,8 @@ const GEMINI_READ_ONLY_TOOL_NAMES: [&str; 7] = [
     "list_mcp_resource_templates",
     "read_mcp_resource",
     "view_image",
+    "shell",
+    "shell_command",
 ];
 
 fn parse_bool_env(key: &str) -> Option<bool> {
@@ -137,12 +139,12 @@ fn should_force_gemini_read_tools_first_turn_with_override(
 
 fn gemini_read_only_allowed_function_names(tools: &[ToolSpec]) -> Vec<String> {
     let mut allowed = Vec::new();
-    for tool in tools {
-        let ToolSpec::Function(tool) = tool else {
-            continue;
-        };
-        if GEMINI_READ_ONLY_TOOL_NAMES.contains(&tool.name.as_str()) {
-            allowed.push(tool.name.clone());
+    for name in GEMINI_READ_ONLY_TOOL_NAMES {
+        if tools
+            .iter()
+            .any(|tool| matches!(tool, ToolSpec::Function(tool) if tool.name == name))
+        {
+            allowed.push(name.to_string());
         }
     }
     allowed
@@ -2133,8 +2135,8 @@ mod tests {
             config.allowed_function_names,
             Some(vec![
                 "grep_files".to_string(),
-                "read_file".to_string(),
-                "list_dir".to_string()
+                "list_dir".to_string(),
+                "read_file".to_string()
             ])
         );
     }

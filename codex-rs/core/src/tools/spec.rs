@@ -503,7 +503,18 @@ fn create_grep_files_tool() -> ToolSpec {
         "path".to_string(),
         JsonSchema::String {
             description: Some(
-                "Directory or file path to search. Defaults to the session's working directory."
+                "Directory or file path to search (absolute or relative to the session working \
+                 directory). Defaults to the session's working directory."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "mode".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Output mode: `first_match` (default) returns one representative \
+                 `path:line:snippet` match per file; `files` returns matching file paths only."
                     .to_string(),
             ),
         },
@@ -511,17 +522,15 @@ fn create_grep_files_tool() -> ToolSpec {
     properties.insert(
         "limit".to_string(),
         JsonSchema::Number {
-            description: Some(
-                "Maximum number of file paths to return (defaults to 100).".to_string(),
-            ),
+            description: Some("Maximum number of results to return (defaults to 100).".to_string()),
         },
     );
 
     ToolSpec::Function(ResponsesApiTool {
         name: "grep_files".to_string(),
-        description: "Finds files whose contents match the pattern and lists them by modification \
-                      time."
-            .to_string(),
+        description:
+            "Searches for a pattern and returns matching results ordered by file modification time."
+                .to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
@@ -537,7 +546,9 @@ fn create_read_file_tool() -> ToolSpec {
         "file_path".to_string(),
         JsonSchema::String {
             description: Some(
-                "Path to the file (absolute or relative to the session working directory)."
+                "Path to the file (absolute or relative to the session working directory). Also \
+                 accepts ripgrep-style `path:line` or `path:line:...` inputs; when `offset` is \
+                 left at its default, the handler will treat `line` as the starting line."
                     .to_string(),
             ),
         },

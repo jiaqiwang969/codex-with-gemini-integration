@@ -19,6 +19,53 @@ const TAB_WIDTH: usize = 4;
 // TODO(jif) add support for block comments
 const COMMENT_PREFIXES: &[&str] = &["#", "//", "--"];
 
+fn parse_grep_style_file_path(input: &str) -> Option<(String, usize)> {
+    let input = input.trim();
+    if input.is_empty() {
+        return None;
+    }
+
+    for (idx, ch) in input.char_indices() {
+        if ch != ':' {
+            continue;
+        }
+
+        let rest = &input[idx + 1..];
+        let mut digits_end = 0usize;
+        for (j, digit) in rest.char_indices() {
+            if digit.is_ascii_digit() {
+                digits_end = j + digit.len_utf8();
+            } else {
+                break;
+            }
+        }
+
+        if digits_end == 0 {
+            continue;
+        }
+
+        let digits = &rest[..digits_end];
+        let remainder = &rest[digits_end..];
+        if !remainder.is_empty() && !remainder.starts_with(':') {
+            continue;
+        }
+
+        let line = digits.parse::<usize>().ok()?;
+        if line == 0 {
+            continue;
+        }
+
+        let path = input[..idx].trim();
+        if path.is_empty() {
+            continue;
+        }
+
+        return Some((path.to_string(), line));
+    }
+
+    None
+}
+
 /// JSON arguments accepted by the `read_file` tool handler.
 #[derive(Deserialize)]
 struct ReadFileArgs {
@@ -114,7 +161,7 @@ impl ToolHandler for ReadFileHandler {
 
         let ReadFileArgs {
             file_path,
-            offset,
+            mut offset,
             limit,
             mode,
             indentation,
@@ -138,7 +185,19 @@ impl ToolHandler for ReadFileHandler {
                 "file_path must not be empty".to_string(),
             ));
         }
-        let path = turn.resolve_path(Some(file_path.to_string()));
+
+        let mut resolved_file_path = file_path.to_string();
+        if offset == defaults::offset()
+            && let Some((parsed_path, parsed_offset)) = parse_grep_style_file_path(file_path)
+        {
+            let candidate = turn.resolve_path(Some(parsed_path.clone()));
+            if tokio::fs::metadata(&candidate).await.is_ok() {
+                resolved_file_path = parsed_path;
+                offset = parsed_offset;
+            }
+        }
+
+        let path = turn.resolve_path(Some(resolved_file_path));
 
         let collected = match mode {
             ReadMode::Slice => slice::read(&path, offset, limit).await?,
@@ -1035,6 +1094,44 @@ private:
             } => {
                 assert_eq!(success, Some(true));
                 assert_eq!(content, "L1: hello");
+            }
+            _ => panic!("expected function output"),
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handler_accepts_grep_style_file_path_with_line_number() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        tokio::fs::write(temp.path().join("hello.txt"), "zero\none\ntwo\n").await?;
+
+        let (session, mut turn_context) = make_session_and_context();
+        turn_context.cwd = temp.path().to_path_buf();
+
+        let invocation = ToolInvocation {
+            session: Arc::new(session),
+            turn: Arc::new(turn_context),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-1".to_string(),
+            tool_name: "read_file".to_string(),
+            payload: ToolPayload::Function {
+                arguments: serde_json::to_string(&serde_json::json!({
+                    "file_path": "hello.txt:2:alpha",
+                    "limit": 1
+                }))?,
+            },
+        };
+
+        let handler = ReadFileHandler;
+        let output = handler.handle(invocation).await?;
+
+        match output {
+            ToolOutput::Function {
+                content, success, ..
+            } => {
+                assert_eq!(success, Some(true));
+                assert_eq!(content, "L2: one");
             }
             _ => panic!("expected function output"),
         }

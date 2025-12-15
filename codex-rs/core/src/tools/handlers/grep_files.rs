@@ -2,6 +2,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use codex_utils_string::take_bytes_at_char_boundary;
 use serde::Deserialize;
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -18,9 +19,23 @@ pub struct GrepFilesHandler;
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 2000;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_OUTPUT_LINE_LENGTH: usize = 500;
 
 fn default_limit() -> usize {
     DEFAULT_LIMIT
+}
+
+fn default_mode() -> GrepOutputMode {
+    GrepOutputMode::FirstMatch
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum GrepOutputMode {
+    /// Return only file paths that contain at least one match.
+    Files,
+    /// Return one representative match line per file (`path:line:snippet`).
+    FirstMatch,
 }
 
 #[derive(Deserialize)]
@@ -32,6 +47,8 @@ struct GrepFilesArgs {
     path: Option<String>,
     #[serde(default = "default_limit")]
     limit: usize,
+    #[serde(default = "default_mode")]
+    mode: GrepOutputMode,
 }
 
 #[async_trait]
@@ -84,8 +101,15 @@ impl ToolHandler for GrepFilesHandler {
             }
         });
 
-        let search_results =
-            run_rg_search(pattern, include.as_deref(), &search_path, limit, &turn.cwd).await?;
+        let search_results = run_rg_search(
+            pattern,
+            include.as_deref(),
+            &search_path,
+            limit,
+            &turn.cwd,
+            args.mode,
+        )
+        .await?;
 
         if search_results.is_empty() {
             Ok(ToolOutput::Function {
@@ -116,15 +140,31 @@ async fn run_rg_search(
     search_path: &Path,
     limit: usize,
     cwd: &Path,
+    mode: GrepOutputMode,
 ) -> Result<Vec<String>, FunctionCallError> {
     let mut command = Command::new("rg");
     command
         .current_dir(cwd)
-        .arg("--files-with-matches")
-        .arg("--sortr=modified")
+        .arg("--color")
+        .arg("never")
         .arg("--regexp")
         .arg(pattern)
         .arg("--no-messages");
+
+    match mode {
+        GrepOutputMode::Files => {
+            command.arg("--files-with-matches").arg("--sortr=modified");
+        }
+        GrepOutputMode::FirstMatch => {
+            command
+                .arg("--line-number")
+                .arg("--no-heading")
+                .arg("--with-filename")
+                .arg("--max-count")
+                .arg("1")
+                .arg("--sortr=modified");
+        }
+    }
 
     if let Some(glob) = include {
         command.arg("--glob").arg(glob);
@@ -165,7 +205,16 @@ fn parse_results(stdout: &[u8], limit: usize) -> Vec<String> {
             if text.is_empty() {
                 continue;
             }
-            results.push(text.to_string());
+            let trimmed = text.trim_end_matches('\r');
+            if trimmed.is_empty() {
+                continue;
+            }
+            let clipped = if trimmed.len() > MAX_OUTPUT_LINE_LENGTH {
+                take_bytes_at_char_boundary(trimmed, MAX_OUTPUT_LINE_LENGTH).to_string()
+            } else {
+                trimmed.to_string()
+            };
+            results.push(clipped);
             if results.len() == limit {
                 break;
             }
@@ -211,10 +260,30 @@ mod tests {
         std::fs::write(dir.join("match_two.txt"), "alpha delta").unwrap();
         std::fs::write(dir.join("other.txt"), "omega").unwrap();
 
-        let results = run_rg_search("alpha", None, dir, 10, dir).await?;
+        let results = run_rg_search("alpha", None, dir, 10, dir, GrepOutputMode::Files).await?;
         assert_eq!(results.len(), 2);
         assert!(results.iter().any(|path| path.ends_with("match_one.txt")));
         assert!(results.iter().any(|path| path.ends_with("match_two.txt")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_search_returns_first_matches() -> anyhow::Result<()> {
+        if !rg_available() {
+            return Ok(());
+        }
+        let temp = tempdir().expect("create temp dir");
+        let dir = temp.path();
+        std::fs::write(dir.join("match_one.txt"), "alpha beta gamma").unwrap();
+        std::fs::write(dir.join("match_two.txt"), "alpha delta").unwrap();
+        std::fs::write(dir.join("other.txt"), "omega").unwrap();
+
+        let results =
+            run_rg_search("alpha", None, dir, 10, dir, GrepOutputMode::FirstMatch).await?;
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|line| line.contains("alpha")));
+        assert!(results.iter().any(|line| line.contains("match_one.txt")));
+        assert!(results.iter().any(|line| line.contains("match_two.txt")));
         Ok(())
     }
 
@@ -228,7 +297,8 @@ mod tests {
         std::fs::write(dir.join("match_one.rs"), "alpha beta gamma").unwrap();
         std::fs::write(dir.join("match_two.txt"), "alpha delta").unwrap();
 
-        let results = run_rg_search("alpha", Some("*.rs"), dir, 10, dir).await?;
+        let results =
+            run_rg_search("alpha", Some("*.rs"), dir, 10, dir, GrepOutputMode::Files).await?;
         assert_eq!(results.len(), 1);
         assert!(results.iter().all(|path| path.ends_with("match_one.rs")));
         Ok(())
@@ -245,7 +315,7 @@ mod tests {
         std::fs::write(dir.join("two.txt"), "alpha two").unwrap();
         std::fs::write(dir.join("three.txt"), "alpha three").unwrap();
 
-        let results = run_rg_search("alpha", None, dir, 2, dir).await?;
+        let results = run_rg_search("alpha", None, dir, 2, dir, GrepOutputMode::Files).await?;
         assert_eq!(results.len(), 2);
         Ok(())
     }
@@ -259,7 +329,7 @@ mod tests {
         let dir = temp.path();
         std::fs::write(dir.join("one.txt"), "omega").unwrap();
 
-        let results = run_rg_search("alpha", None, dir, 5, dir).await?;
+        let results = run_rg_search("alpha", None, dir, 5, dir, GrepOutputMode::Files).await?;
         assert!(results.is_empty());
         Ok(())
     }
