@@ -75,6 +75,151 @@ fn next_gemini_call_id() -> String {
     format!("gemini-function-call-{id}")
 }
 
+const GEMINI_READ_ONLY_TOOL_NAMES: [&str; 7] = [
+    "grep_files",
+    "list_dir",
+    "read_file",
+    "list_mcp_resources",
+    "list_mcp_resource_templates",
+    "read_mcp_resource",
+    "view_image",
+];
+
+fn parse_bool_env(key: &str) -> Option<bool> {
+    std::env::var(key).ok().and_then(|value| {
+        let value = value.trim().to_ascii_lowercase();
+        match value.as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        }
+    })
+}
+
+fn last_user_message_text(input: &[ResponseItem]) -> Option<String> {
+    let Some(ResponseItem::Message { role, content, .. }) = input.last() else {
+        return None;
+    };
+    if role != "user" {
+        return None;
+    }
+
+    let mut out = String::new();
+    for item in content {
+        let ContentItem::InputText { text } = item else {
+            continue;
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(text);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn looks_like_repo_analysis_request(text: &str) -> bool {
+    let lower = text.to_lowercase();
+
+    let has_repo_marker = lower.contains("repo")
+        || lower.contains("repository")
+        || lower.contains("codebase")
+        || lower.contains("project")
+        || lower.contains("workspace")
+        || lower.contains("code")
+        || text.contains("项目")
+        || text.contains("仓库")
+        || text.contains("工程")
+        || text.contains("代码库")
+        || text.contains("代码")
+        || text.contains('/')
+        || lower.contains(".rs")
+        || lower.contains(".ts")
+        || lower.contains(".tsx")
+        || lower.contains(".py")
+        || lower.contains(".go");
+
+    let has_analysis_marker = lower.contains("analy")
+        || lower.contains("review")
+        || lower.contains("read")
+        || lower.contains("understand")
+        || lower.contains("investigat")
+        || lower.contains("trace")
+        || lower.contains("walk through")
+        || lower.contains("deep dive")
+        || text.contains("分析")
+        || text.contains("阅读")
+        || text.contains("梳理")
+        || text.contains("理解")
+        || text.contains("排查")
+        || text.contains("定位")
+        || text.contains("看看");
+
+    has_repo_marker && has_analysis_marker
+}
+
+fn should_force_gemini_read_tools_first_turn_with_override(
+    input: &[ResponseItem],
+    force_override: Option<bool>,
+) -> bool {
+    let Some(text) = last_user_message_text(input) else {
+        return false;
+    };
+
+    match force_override {
+        Some(true) => true,
+        Some(false) => false,
+        None => looks_like_repo_analysis_request(&text),
+    }
+}
+
+fn gemini_read_only_allowed_function_names(tools: &[ToolSpec]) -> Vec<String> {
+    let mut allowed = Vec::new();
+    for tool in tools {
+        let ToolSpec::Function(tool) = tool else {
+            continue;
+        };
+        if GEMINI_READ_ONLY_TOOL_NAMES.contains(&tool.name.as_str()) {
+            allowed.push(tool.name.clone());
+        }
+    }
+    allowed
+}
+
+fn build_gemini_tool_config_with_override(
+    tools: &[ToolSpec],
+    input: &[ResponseItem],
+    force_override: Option<bool>,
+) -> GeminiFunctionCallingConfig {
+    let mut function_calling_config = GeminiFunctionCallingConfig {
+        mode: GeminiFunctionCallingMode::Auto,
+        allowed_function_names: None,
+    };
+
+    if should_force_gemini_read_tools_first_turn_with_override(input, force_override) {
+        let allowed_function_names = gemini_read_only_allowed_function_names(tools);
+        if !allowed_function_names.is_empty() {
+            function_calling_config.mode = GeminiFunctionCallingMode::Any;
+            function_calling_config.allowed_function_names = Some(allowed_function_names);
+        }
+    }
+
+    function_calling_config
+}
+
+fn build_gemini_tool_config(
+    tools: &[ToolSpec],
+    input: &[ResponseItem],
+) -> GeminiFunctionCallingConfig {
+    build_gemini_tool_config_with_override(
+        tools,
+        input,
+        parse_bool_env("CODEX_GEMINI_FORCE_READ_TOOLS_FIRST_TURN"),
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelClient {
     config: Arc<Config>,
@@ -234,8 +379,8 @@ impl ModelClient {
 
         let model_family = self.get_model_family();
         let instructions = prompt.get_full_instructions(&model_family).into_owned();
-        let contents =
-            build_gemini_contents(&prompt.get_formatted_input(), &prompt.reference_images);
+        let formatted_input = prompt.get_formatted_input();
+        let contents = build_gemini_contents(&formatted_input, &prompt.reference_images);
         if contents.is_empty() {
             return Err(CodexErr::UnsupportedOperation(
                 "Gemini requests require at least one message".to_string(),
@@ -256,10 +401,7 @@ impl ModelClient {
 
         let tools = build_gemini_tools(&prompt.tools);
         let tool_config = tools.as_ref().map(|_| GeminiToolConfig {
-            function_calling_config: GeminiFunctionCallingConfig {
-                mode: GeminiFunctionCallingMode::Auto,
-                allowed_function_names: None,
-            },
+            function_calling_config: build_gemini_tool_config(&prompt.tools, &formatted_input),
         });
 
         // Ensure the active loop has thought signatures on function calls so
@@ -1410,9 +1552,10 @@ struct GeminiFunctionCallingConfig {
     allowed_function_names: Option<Vec<String>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum GeminiFunctionCallingMode {
+    #[allow(dead_code)]
     None,
     Auto,
     Any,
@@ -1761,6 +1904,7 @@ mod tests {
     use codex_protocol::models::FunctionCallOutputPayload;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     #[test]
     fn test_ensure_active_loop_fixes_all_turns() {
@@ -1989,6 +2133,102 @@ mod tests {
             contents[4].parts[0].compat_thought_signature.as_deref(),
             Some("sig-2")
         );
+    }
+
+    fn make_function_tool(name: &str) -> ToolSpec {
+        ToolSpec::Function(ResponsesApiTool {
+            name: name.to_string(),
+            description: String::new(),
+            strict: false,
+            parameters: crate::tools::spec::JsonSchema::Object {
+                properties: BTreeMap::new(),
+                required: None,
+                additional_properties: Some(false.into()),
+            },
+        })
+    }
+
+    #[test]
+    fn gemini_read_tools_first_turn_uses_any_mode_for_repo_analysis_requests() {
+        let tools = vec![
+            make_function_tool("apply_patch"),
+            make_function_tool("grep_files"),
+            make_function_tool("read_file"),
+            make_function_tool("list_dir"),
+        ];
+
+        let input = vec![ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "帮我分析这个项目，并阅读相关代码".to_string(),
+            }],
+            thought_signature: None,
+        }];
+
+        let config = build_gemini_tool_config_with_override(&tools, &input, None);
+
+        assert_eq!(config.mode, GeminiFunctionCallingMode::Any);
+        assert_eq!(
+            config.allowed_function_names,
+            Some(vec![
+                "grep_files".to_string(),
+                "read_file".to_string(),
+                "list_dir".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn gemini_read_tools_first_turn_falls_back_to_auto_when_not_first_turn() {
+        let tools = vec![make_function_tool("grep_files")];
+        let input = vec![
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "帮我分析这个项目".to_string(),
+                }],
+                thought_signature: None,
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: "call-1".to_string(),
+                output: FunctionCallOutputPayload {
+                    content: "done".to_string(),
+                    success: Some(true),
+                    ..Default::default()
+                },
+            },
+        ];
+
+        let config = build_gemini_tool_config_with_override(&tools, &input, Some(true));
+
+        assert_eq!(config.mode, GeminiFunctionCallingMode::Auto);
+        assert_eq!(config.allowed_function_names, None);
+    }
+
+    #[test]
+    fn gemini_read_tools_first_turn_respects_force_override() {
+        let tools = vec![make_function_tool("grep_files")];
+        let input = vec![ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "hello".to_string(),
+            }],
+            thought_signature: None,
+        }];
+
+        let config = build_gemini_tool_config_with_override(&tools, &input, Some(true));
+        assert_eq!(config.mode, GeminiFunctionCallingMode::Any);
+        assert_eq!(
+            config.allowed_function_names,
+            Some(vec!["grep_files".to_string()])
+        );
+
+        let config = build_gemini_tool_config_with_override(&tools, &input, Some(false));
+        assert_eq!(config.mode, GeminiFunctionCallingMode::Auto);
+        assert_eq!(config.allowed_function_names, None);
     }
 
     #[test]

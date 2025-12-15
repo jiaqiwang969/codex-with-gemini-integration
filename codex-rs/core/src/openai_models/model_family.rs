@@ -253,6 +253,11 @@ pub(in crate::openai_models) fn find_family_for_model(slug: &str) -> ModelFamily
             slug, "gemini",
             needs_special_apply_patch_instructions: true,
             base_instructions: GEMINI_GERMINI_INSTRUCTIONS.to_string(),
+            experimental_supported_tools: vec![
+                "grep_files".to_string(),
+                "list_dir".to_string(),
+                "read_file".to_string(),
+            ],
             supports_parallel_tool_calls: true,
             shell_type: ConfigShellToolType::ShellCommand,
             context_window: Some(CONTEXT_WINDOW_1M),
@@ -262,6 +267,11 @@ pub(in crate::openai_models) fn find_family_for_model(slug: &str) -> ModelFamily
             slug, "gemini",
             needs_special_apply_patch_instructions: true,
             base_instructions: GEMINI_CODEX_INSTRUCTIONS.to_string(),
+            experimental_supported_tools: vec![
+                "grep_files".to_string(),
+                "list_dir".to_string(),
+                "read_file".to_string(),
+            ],
             supports_parallel_tool_calls: true,
             shell_type: ConfigShellToolType::ShellCommand,
             context_window: Some(CONTEXT_WINDOW_1M),
@@ -271,6 +281,11 @@ pub(in crate::openai_models) fn find_family_for_model(slug: &str) -> ModelFamily
             slug, "gemini",
             needs_special_apply_patch_instructions: true,
             base_instructions: GEMINI_INSTRUCTIONS.to_string(),
+            experimental_supported_tools: vec![
+                "grep_files".to_string(),
+                "list_dir".to_string(),
+                "read_file".to_string(),
+            ],
             context_window: Some(CONTEXT_WINDOW_1M),
         )
     } else if slug.starts_with("test-gpt-5") {
