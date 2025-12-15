@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
@@ -847,8 +848,8 @@ async fn process_gemini_sse<S>(
                                 part.thought_signature.or(last_thought_signature.clone());
                             if let Some(last) = function_calls.last_mut()
                                 && last.0 == name
+                                && last.1 == args
                             {
-                                last.1 = args;
                                 last.2 = thought_signature;
                             } else {
                                 function_calls.push((
@@ -1009,10 +1010,10 @@ fn build_gemini_contents(
     reference_images: &[String],
 ) -> Vec<GeminiContentRequest> {
     let mut contents = Vec::new();
-    // Track the last function call so we can pair it with the response and
-    // propagate the Gemini 3 thought_signature back on the function response.
-    let mut last_function_call_name: Option<String> = None;
-    let mut last_function_call_thought_signature: Option<String> = None;
+    // Record function calls emitted by the model so we can pair subsequent
+    // FunctionCallOutput items with the correct function name and
+    // thought_signature, even when multiple tool calls happen in the same turn.
+    let mut function_calls_by_id: HashMap<String, (String, Option<String>)> = HashMap::new();
 
     for item in items {
         match item {
@@ -1036,11 +1037,12 @@ fn build_gemini_contents(
             ResponseItem::FunctionCall {
                 name,
                 arguments,
+                call_id,
                 thought_signature,
                 ..
             } => {
-                last_function_call_name = Some(name.clone());
-                last_function_call_thought_signature = thought_signature.clone();
+                function_calls_by_id
+                    .insert(call_id.clone(), (name.clone(), thought_signature.clone()));
                 let args: serde_json::Value = serde_json::from_str(arguments)
                     .unwrap_or(serde_json::Value::Object(Default::default()));
                 let part_thought_signature = thought_signature.clone();
@@ -1061,11 +1063,11 @@ fn build_gemini_contents(
                 });
             }
             // Handle FunctionCallOutput - send back to model with role "function"
-            ResponseItem::FunctionCallOutput { output, .. } => {
-                let function_name = last_function_call_name
-                    .take()
-                    .unwrap_or_else(|| "unknown_function".to_string());
-                let thought_signature = last_function_call_thought_signature.take();
+            ResponseItem::FunctionCallOutput { call_id, output } => {
+                let (function_name, thought_signature) = function_calls_by_id
+                    .get(call_id)
+                    .map(|(name, sig)| (name.clone(), sig.clone()))
+                    .unwrap_or_else(|| ("unknown_function".to_string(), None));
 
                 // Build the response object with the output content
                 let response_value = serde_json::json!({
@@ -1756,6 +1758,7 @@ impl SseTelemetry for ApiTelemetry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_protocol::models::FunctionCallOutputPayload;
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
@@ -1908,6 +1911,84 @@ mod tests {
             }
             other => panic!("expected FunctionCall, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_gemini_contents_pairs_function_call_outputs_by_call_id() {
+        let items = vec![
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "hi".to_string(),
+                }],
+                thought_signature: None,
+            },
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "shell_command".to_string(),
+                arguments: serde_json::to_string(&json!({ "command": "ls" })).unwrap(),
+                call_id: "call-1".to_string(),
+                thought_signature: Some("sig-1".to_string()),
+            },
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "read_file".to_string(),
+                arguments: serde_json::to_string(&json!({ "path": "README.md" })).unwrap(),
+                call_id: "call-2".to_string(),
+                thought_signature: Some("sig-2".to_string()),
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: "call-1".to_string(),
+                output: FunctionCallOutputPayload {
+                    content: "out-1".to_string(),
+                    success: Some(true),
+                    ..Default::default()
+                },
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: "call-2".to_string(),
+                output: FunctionCallOutputPayload {
+                    content: "out-2".to_string(),
+                    success: Some(false),
+                    ..Default::default()
+                },
+            },
+        ];
+
+        let contents = build_gemini_contents(&items, &[]);
+
+        assert_eq!(contents.len(), 5);
+
+        assert_eq!(contents[3].role.as_deref(), Some("function"));
+        let response = contents[3].parts[0]
+            .function_response
+            .as_ref()
+            .expect("expected function response");
+        assert_eq!(response.name, "shell_command");
+        assert_eq!(
+            contents[3].parts[0].thought_signature.as_deref(),
+            Some("sig-1")
+        );
+        assert_eq!(
+            contents[3].parts[0].compat_thought_signature.as_deref(),
+            Some("sig-1")
+        );
+
+        assert_eq!(contents[4].role.as_deref(), Some("function"));
+        let response = contents[4].parts[0]
+            .function_response
+            .as_ref()
+            .expect("expected function response");
+        assert_eq!(response.name, "read_file");
+        assert_eq!(
+            contents[4].parts[0].thought_signature.as_deref(),
+            Some("sig-2")
+        );
+        assert_eq!(
+            contents[4].parts[0].compat_thought_signature.as_deref(),
+            Some("sig-2")
+        );
     }
 
     #[test]
