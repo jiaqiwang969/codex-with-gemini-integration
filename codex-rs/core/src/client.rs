@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicI64;
+use std::sync::atomic::Ordering;
 
 use crate::api_bridge::auth_provider_from_auth;
 use crate::api_bridge::map_api_error;
@@ -64,6 +66,13 @@ use crate::openai_models::model_family::ModelFamily;
 use crate::protocol::TokenUsage;
 use crate::tools::spec::create_tools_json_for_chat_completions_api;
 use crate::tools::spec::create_tools_json_for_responses_api;
+
+static GEMINI_CALL_ID_COUNTER: AtomicI64 = AtomicI64::new(0);
+
+fn next_gemini_call_id() -> String {
+    let id = GEMINI_CALL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("gemini-function-call-{id}")
+}
 
 #[derive(Debug, Clone)]
 pub struct ModelClient {
@@ -245,6 +254,12 @@ impl ModelClient {
         });
 
         let tools = build_gemini_tools(&prompt.tools);
+        let tool_config = tools.as_ref().map(|_| GeminiToolConfig {
+            function_calling_config: GeminiFunctionCallingConfig {
+                mode: GeminiFunctionCallingMode::Auto,
+                allowed_function_names: None,
+            },
+        });
 
         // Ensure the active loop has thought signatures on function calls so
         // preview models accept the request without 400/429 errors.
@@ -293,6 +308,7 @@ impl ModelClient {
             system_instruction,
             contents,
             tools,
+            tool_config,
             generation_config,
             safety_settings,
         };
@@ -714,7 +730,7 @@ async fn process_gemini_sse<S>(
     // State for accumulating response
     let mut accumulated_text = String::new();
     let mut assistant_item_sent = false;
-    let mut function_call: Option<(String, String, Option<String>)> = None; // (name, args, thought_signature)
+    let mut function_calls: Vec<(String, String, Option<String>, String)> = Vec::new(); // (name, args, thought_signature, call_id)
     let mut last_response_id = "gemini-stream".to_string();
     let mut last_token_usage: Option<TokenUsage> = None;
     let mut last_thought_signature: Option<String> = None;
@@ -821,16 +837,27 @@ async fn process_gemini_sse<S>(
 
                         // Handle function call
                         if let Some(call) = part.function_call {
+                            let name = call.name;
                             let args = if call.args.is_null() {
                                 "{}".to_string()
                             } else {
                                 call.args.to_string()
                             };
-                            function_call = Some((
-                                call.name,
-                                args,
-                                part.thought_signature.or(last_thought_signature.clone()),
-                            ));
+                            let thought_signature =
+                                part.thought_signature.or(last_thought_signature.clone());
+                            if let Some(last) = function_calls.last_mut()
+                                && last.0 == name
+                            {
+                                last.1 = args;
+                                last.2 = thought_signature;
+                            } else {
+                                function_calls.push((
+                                    name,
+                                    args,
+                                    thought_signature,
+                                    next_gemini_call_id(),
+                                ));
+                            }
                         }
                     }
                 }
@@ -839,17 +866,7 @@ async fn process_gemini_sse<S>(
     }
 
     // Emit final items
-    if let Some((name, arguments, thought_signature)) = function_call {
-        // If there was a function call, emit it
-        let item = ResponseItem::FunctionCall {
-            id: None,
-            name,
-            arguments,
-            call_id: "gemini-function-call".to_string(),
-            thought_signature,
-        };
-        let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
-    } else if assistant_item_sent || last_inline_image.is_some() {
+    if assistant_item_sent || last_inline_image.is_some() {
         // Emit the complete message, which may include text, an image, or both.
         let mut content = Vec::new();
         if !accumulated_text.is_empty() {
@@ -870,10 +887,21 @@ async fn process_gemini_sse<S>(
                 id: None,
                 role: "assistant".to_string(),
                 content,
-                thought_signature: last_thought_signature,
+                thought_signature: last_thought_signature.clone(),
             };
             let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
         }
+    }
+
+    for (name, arguments, thought_signature, call_id) in function_calls {
+        let item = ResponseItem::FunctionCall {
+            id: None,
+            name,
+            arguments,
+            call_id,
+            thought_signature,
+        };
+        let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
     }
 
     // Send completed event
@@ -1359,9 +1387,33 @@ struct GeminiRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<GeminiTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    tool_config: Option<GeminiToolConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     generation_config: Option<GeminiGenerationConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     safety_settings: Option<Vec<GeminiSafetySetting>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiToolConfig {
+    function_calling_config: GeminiFunctionCallingConfig,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiFunctionCallingConfig {
+    mode: GeminiFunctionCallingMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allowed_function_names: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum GeminiFunctionCallingMode {
+    None,
+    Auto,
+    Any,
 }
 
 #[derive(Debug, Serialize)]
