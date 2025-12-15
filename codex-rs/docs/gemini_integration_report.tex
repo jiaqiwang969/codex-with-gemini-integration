@@ -179,6 +179,15 @@ Gemini 的默认 provider 在 \verb|built_in_model_providers()| 中定义，大�
   既包括 system 指令，也包括历史消息（用户消息、模型回复、工具调用和工具结果）。
   \item 使用 \verb|build_gemini_tools(...)| 把 Codex 的工具定义映射为
   Gemini 的 \verb|functionDeclarations|。
+  \item （可选）配置 \verb|toolConfig| 控制函数调用行为：
+  \begin{itemize}
+    \item 默认 \verb|mode = "auto"|，由模型自行决定是否调用工具；
+    \item 对“分析/读仓库”类任务的首轮请求，可设置 \verb|mode = "any"| 并提供
+    \verb|allowedFunctionNames|（例如 \verb|read_file|/\verb|grep_files|/\verb|list_dir|），
+    强制模型先读取上下文，避免过早直接回答；当下一轮已经有 functionResponse 后再回到 \verb|auto|；
+    \item 可通过环境变量 \verb|CODEX_GEMINI_FORCE_READ_TOOLS_FIRST_TURN| 强制开启/关闭该策略：
+    \verb|1| 强制开启，\verb|0| 强制关闭。
+  \end{itemize}
   \item 生成 \verb|generationConfig|，配置温度、思考等级和思考预算等：
   \begin{itemize}
     \item \verb|temperature = 0.8|（比官方默认 1.0 略低，鼓励更稳定但仍有探索的推理）；
@@ -555,6 +564,7 @@ pub(crate) fn sidebar_status(&self) -> String {
   \item 调整 \verb|thinkingConfig| 构造：thinking 模型发送 \verb|thinkingLevel|，非 thinking 文本模型发送较大的 \verb|thinkingBudget|，图片模型省略该字段以满足 level/budget 互斥校验；
   \item 实现 thoughtSignature 的完整传递：解析、存储、回放，并在缺失时兜底；
   \item 增加针对 Gemini 的工具调用 loop 检测，阈值从 5 提升到 100；
+  \item 为“分析/读仓库”类任务增加首轮 \verb|toolConfig| 策略（\verb|any| + \verb|allowedFunctionNames|），并为 Gemini 家族默认开放 \verb|read_file|/\verb|grep_files|/\verb|list_dir|；
   \item 修复 JSON Schema 不兼容 \verb|additionalProperties| 的问题；
   \item 在 TUI 中修正 context left 与 “运行中 / 就绪” 状态，使之与 Gemini 的真实行为一致。
 \end{enumerate}
