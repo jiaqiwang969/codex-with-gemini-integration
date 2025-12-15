@@ -120,58 +120,18 @@ fn last_user_message_text(input: &[ResponseItem]) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-fn looks_like_repo_analysis_request(text: &str) -> bool {
-    let lower = text.to_lowercase();
-
-    let has_repo_marker = lower.contains("repo")
-        || lower.contains("repository")
-        || lower.contains("codebase")
-        || lower.contains("project")
-        || lower.contains("workspace")
-        || lower.contains("code")
-        || text.contains("项目")
-        || text.contains("仓库")
-        || text.contains("工程")
-        || text.contains("代码库")
-        || text.contains("代码")
-        || text.contains('/')
-        || lower.contains(".rs")
-        || lower.contains(".ts")
-        || lower.contains(".tsx")
-        || lower.contains(".py")
-        || lower.contains(".go");
-
-    let has_analysis_marker = lower.contains("analy")
-        || lower.contains("review")
-        || lower.contains("read")
-        || lower.contains("understand")
-        || lower.contains("investigat")
-        || lower.contains("trace")
-        || lower.contains("walk through")
-        || lower.contains("deep dive")
-        || text.contains("分析")
-        || text.contains("阅读")
-        || text.contains("梳理")
-        || text.contains("理解")
-        || text.contains("排查")
-        || text.contains("定位")
-        || text.contains("看看");
-
-    has_repo_marker && has_analysis_marker
-}
-
 fn should_force_gemini_read_tools_first_turn_with_override(
     input: &[ResponseItem],
     force_override: Option<bool>,
 ) -> bool {
-    let Some(text) = last_user_message_text(input) else {
+    if last_user_message_text(input).is_none() {
         return false;
     };
 
     match force_override {
         Some(true) => true,
         Some(false) => false,
-        None => looks_like_repo_analysis_request(&text),
+        None => true,
     }
 }
 

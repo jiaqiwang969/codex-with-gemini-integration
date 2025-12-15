@@ -182,11 +182,11 @@ Gemini 的默认 provider 在 \verb|built_in_model_providers()| 中定义，大�
   \item （可选）配置 \verb|toolConfig| 控制函数调用行为：
   \begin{itemize}
     \item 默认 \verb|mode = "auto"|，由模型自行决定是否调用工具；
-    \item 对“分析/读仓库”类任务的首轮请求，可设置 \verb|mode = "any"| 并提供
+    \item （默认启用）对“分析/读仓库”类任务的首轮请求，可设置 \verb|mode = "any"| 并提供
     \verb|allowedFunctionNames|（例如 \verb|read_file|/\verb|grep_files|/\verb|list_dir|），
     强制模型先读取上下文，避免过早直接回答；当下一轮已经有 functionResponse 后再回到 \verb|auto|；
-    \item 可通过环境变量 \verb|CODEX_GEMINI_FORCE_READ_TOOLS_FIRST_TURN| 强制开启/关闭该策略：
-    \verb|1| 强制开启，\verb|0| 强制关闭。
+    \item 可通过环境变量 \verb|CODEX_GEMINI_FORCE_READ_TOOLS_FIRST_TURN| 强制关闭该策略：
+    \verb|0| 强制关闭（默认开启；\verb|1| 也表示开启）。
   \end{itemize}
   \item 生成 \verb|generationConfig|，配置温度、思考等级和思考预算等：
   \begin{itemize}
