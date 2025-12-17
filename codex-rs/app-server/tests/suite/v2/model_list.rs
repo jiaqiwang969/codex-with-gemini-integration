@@ -4,10 +4,13 @@ use anyhow::Result;
 use anyhow::anyhow;
 use app_test_support::McpProcess;
 use app_test_support::to_response;
+use app_test_support::write_models_cache;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::Model;
 use codex_app_server_protocol::ModelListParams;
 use codex_app_server_protocol::ModelListResponse;
+use codex_app_server_protocol::ReasoningEffortOption;
 use codex_app_server_protocol::RequestId;
 use codex_protocol::openai_models::ReasoningEffort;
 use pretty_assertions::assert_eq;
@@ -20,6 +23,7 @@ const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
 #[tokio::test]
 async fn list_models_returns_all_models_with_large_limit() -> Result<()> {
     let codex_home = TempDir::new()?;
+    write_models_cache(codex_home.path())?;
     let mut mcp = McpProcess::new(codex_home.path()).await?;
 
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
@@ -42,59 +46,139 @@ async fn list_models_returns_all_models_with_large_limit() -> Result<()> {
         next_cursor,
     } = to_response::<ModelListResponse>(response)?;
 
-    // The model list may grow over time; ensure key presets are present with
-    // the expected metadata instead of asserting exact equality.
-    let find = |id: &str| {
-        items
-            .iter()
-            .find(|m| m.id == id)
-            .cloned()
-            .ok_or_else(|| anyhow!("expected model `{id}` in list"))
-    };
+    let expected_models = vec![
+        Model {
+            id: "gpt-5.1-codex-max".to_string(),
+            model: "gpt-5.1-codex-max".to_string(),
+            display_name: "gpt-5.1-codex-max".to_string(),
+            description: "Latest Codex-optimized flagship for deep and fast reasoning.".to_string(),
+            supported_reasoning_efforts: vec![
+                ReasoningEffortOption {
+                    reasoning_effort: ReasoningEffort::Low,
+                    description: "Fast responses with lighter reasoning".to_string(),
+                },
+                ReasoningEffortOption {
+                    reasoning_effort: ReasoningEffort::Medium,
+                    description: "Balances speed and reasoning depth for everyday tasks"
+                        .to_string(),
+                },
+                ReasoningEffortOption {
+                    reasoning_effort: ReasoningEffort::High,
+                    description: "Greater reasoning depth for complex problems".to_string(),
+                },
+                ReasoningEffortOption {
+                    reasoning_effort: ReasoningEffort::XHigh,
+                    description: "Extra high reasoning depth for complex problems".to_string(),
+                },
+            ],
+            default_reasoning_effort: ReasoningEffort::Medium,
+            is_default: true,
+        },
+        Model {
+            id: "gpt-5.1-codex".to_string(),
+            model: "gpt-5.1-codex".to_string(),
+            display_name: "gpt-5.1-codex".to_string(),
+            description: "Optimized for codex.".to_string(),
+            supported_reasoning_efforts: vec![
+                ReasoningEffortOption {
+                    reasoning_effort: ReasoningEffort::Low,
+                    description: "Fastest responses with limited reasoning".to_string(),
+                },
+                ReasoningEffortOption {
+                    reasoning_effort: ReasoningEffort::Medium,
+                    description: "Dynamically adjusts reasoning based on the task".to_string(),
+                },
+                ReasoningEffortOption {
+                    reasoning_effort: ReasoningEffort::High,
+                    description: "Maximizes reasoning depth for complex or ambiguous problems"
+                        .to_string(),
+                },
+            ],
+            default_reasoning_effort: ReasoningEffort::Medium,
+            is_default: false,
+        },
+        Model {
+            id: "gpt-5.1-codex-mini".to_string(),
+            model: "gpt-5.1-codex-mini".to_string(),
+            display_name: "gpt-5.1-codex-mini".to_string(),
+            description: "Optimized for codex. Cheaper, faster, but less capable.".to_string(),
+            supported_reasoning_efforts: vec![
+                ReasoningEffortOption {
+                    reasoning_effort: ReasoningEffort::Medium,
+                    description: "Dynamically adjusts reasoning based on the task".to_string(),
+                },
+                ReasoningEffortOption {
+                    reasoning_effort: ReasoningEffort::High,
+                    description: "Maximizes reasoning depth for complex or ambiguous problems"
+                        .to_string(),
+                },
+            ],
+            default_reasoning_effort: ReasoningEffort::Medium,
+            is_default: false,
+        },
+        Model {
+            id: "gpt-5.2".to_string(),
+            model: "gpt-5.2".to_string(),
+            display_name: "gpt-5.2".to_string(),
+            description:
+                "Latest frontier model with improvements across knowledge, reasoning and coding"
+                    .to_string(),
+            supported_reasoning_efforts: vec![
+                ReasoningEffortOption {
+                    reasoning_effort: ReasoningEffort::Low,
+                    description: "Balances speed with some reasoning; useful for straightforward \
+                                   queries and short explanations"
+                        .to_string(),
+                },
+                ReasoningEffortOption {
+                    reasoning_effort: ReasoningEffort::Medium,
+                    description: "Provides a solid balance of reasoning depth and latency for \
+                         general-purpose tasks"
+                        .to_string(),
+                },
+                ReasoningEffortOption {
+                    reasoning_effort: ReasoningEffort::High,
+                    description: "Greater reasoning depth for complex or ambiguous problems"
+                        .to_string(),
+                },
+                ReasoningEffortOption {
+                    reasoning_effort: ReasoningEffort::XHigh,
+                    description: "Extra high reasoning for complex problems".to_string(),
+                },
+            ],
+            default_reasoning_effort: ReasoningEffort::Medium,
+            is_default: false,
+        },
+        Model {
+            id: "gpt-5.1".to_string(),
+            model: "gpt-5.1".to_string(),
+            display_name: "gpt-5.1".to_string(),
+            description: "Broad world knowledge with strong general reasoning.".to_string(),
+            supported_reasoning_efforts: vec![
+                ReasoningEffortOption {
+                    reasoning_effort: ReasoningEffort::Low,
+                    description: "Balances speed with some reasoning; useful for straightforward \
+                                   queries and short explanations"
+                        .to_string(),
+                },
+                ReasoningEffortOption {
+                    reasoning_effort: ReasoningEffort::Medium,
+                    description: "Provides a solid balance of reasoning depth and latency for \
+                         general-purpose tasks"
+                        .to_string(),
+                },
+                ReasoningEffortOption {
+                    reasoning_effort: ReasoningEffort::High,
+                    description: "Maximizes reasoning depth for complex or ambiguous problems"
+                        .to_string(),
+                },
+            ],
+            default_reasoning_effort: ReasoningEffort::Medium,
+            is_default: false,
+        },
+    ];
 
-    let gpt_5_1_codex_max = find("gpt-5.1-codex-max")?;
-    assert_eq!(
-        gpt_5_1_codex_max.description,
-        "Latest Codex-optimized flagship for deep and fast reasoning."
-    );
-    assert_eq!(
-        gpt_5_1_codex_max.default_reasoning_effort,
-        ReasoningEffort::Medium
-    );
-
-    let gpt_5_1_codex = find("gpt-5.1-codex")?;
-    assert_eq!(gpt_5_1_codex.description, "Optimized for codex.");
-
-    let gpt_5_1_codex_mini = find("gpt-5.1-codex-mini")?;
-    assert_eq!(
-        gpt_5_1_codex_mini.description,
-        "Optimized for codex. Cheaper, faster, but less capable."
-    );
-
-    let gpt_5_1 = find("gpt-5.1")?;
-    assert_eq!(
-        gpt_5_1.description,
-        "Broad world knowledge with strong general reasoning."
-    );
-
-    let gpt_5_2 = find("gpt-5.2")?;
-    assert_eq!(
-        gpt_5_2.description,
-        "Latest frontier model with improvements across knowledge, reasoning and coding"
-    );
-
-    let gemini_3_pro_preview = find("gemini-3-pro-preview")?;
-    assert_eq!(
-        gemini_3_pro_preview.description,
-        "Google Gemini 3 Pro preview."
-    );
-
-    let gemini_3_pro_image_preview = find("gemini-3-pro-image-preview")?;
-    assert_eq!(
-        gemini_3_pro_image_preview.description,
-        "Gemini 3 Pro image preview for text, image understanding, and image generation."
-    );
-
+    assert_eq!(items, expected_models);
     assert!(next_cursor.is_none());
     Ok(())
 }
@@ -102,6 +186,7 @@ async fn list_models_returns_all_models_with_large_limit() -> Result<()> {
 #[tokio::test]
 async fn list_models_pagination_works() -> Result<()> {
     let codex_home = TempDir::new()?;
+    write_models_cache(codex_home.path())?;
     let mut mcp = McpProcess::new(codex_home.path()).await?;
 
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
@@ -124,61 +209,104 @@ async fn list_models_pagination_works() -> Result<()> {
         next_cursor: first_cursor,
     } = to_response::<ModelListResponse>(first_response)?;
 
-    // Collect the full list with a large limit to compare against.
-    let request_all = mcp
+    assert_eq!(first_items.len(), 1);
+    assert_eq!(first_items[0].id, "gpt-5.1-codex-max");
+    let next_cursor = first_cursor.ok_or_else(|| anyhow!("cursor for second page"))?;
+
+    let second_request = mcp
         .send_list_models_request(ModelListParams {
-            limit: Some(100),
-            cursor: None,
+            limit: Some(1),
+            cursor: Some(next_cursor.clone()),
         })
         .await?;
 
-    let all_response: JSONRPCResponse = timeout(
+    let second_response: JSONRPCResponse = timeout(
         DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_all)),
+        mcp.read_stream_until_response_message(RequestId::Integer(second_request)),
     )
     .await??;
 
     let ModelListResponse {
-        data: all_items,
-        next_cursor: all_cursor,
-    } = to_response::<ModelListResponse>(all_response)?;
-    assert!(all_cursor.is_none());
+        data: second_items,
+        next_cursor: second_cursor,
+    } = to_response::<ModelListResponse>(second_response)?;
 
-    let all_ids: Vec<String> = all_items.into_iter().map(|m| m.id).collect();
+    assert_eq!(second_items.len(), 1);
+    assert_eq!(second_items[0].id, "gpt-5.1-codex");
+    let third_cursor = second_cursor.ok_or_else(|| anyhow!("cursor for third page"))?;
 
-    // Now walk the paginated endpoint and ensure we see the same sequence of ids.
-    assert_eq!(first_items.len(), 1);
-    let mut paged_ids = vec![first_items[0].id.clone()];
-    let mut cursor = first_cursor;
+    let third_request = mcp
+        .send_list_models_request(ModelListParams {
+            limit: Some(1),
+            cursor: Some(third_cursor.clone()),
+        })
+        .await?;
 
-    while let Some(c) = cursor {
-        let request = mcp
-            .send_list_models_request(ModelListParams {
-                limit: Some(1),
-                cursor: Some(c.clone()),
-            })
-            .await?;
+    let third_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(third_request)),
+    )
+    .await??;
 
-        let response: JSONRPCResponse = timeout(
-            DEFAULT_TIMEOUT,
-            mcp.read_stream_until_response_message(RequestId::Integer(request)),
-        )
-        .await??;
+    let ModelListResponse {
+        data: third_items,
+        next_cursor: third_cursor,
+    } = to_response::<ModelListResponse>(third_response)?;
 
-        let ModelListResponse { data, next_cursor } = to_response::<ModelListResponse>(response)?;
+    assert_eq!(third_items.len(), 1);
+    assert_eq!(third_items[0].id, "gpt-5.1-codex-mini");
+    let fourth_cursor = third_cursor.ok_or_else(|| anyhow!("cursor for fourth page"))?;
 
-        assert_eq!(data.len(), 1);
-        paged_ids.push(data[0].id.clone());
-        cursor = next_cursor;
-    }
+    let fourth_request = mcp
+        .send_list_models_request(ModelListParams {
+            limit: Some(1),
+            cursor: Some(fourth_cursor.clone()),
+        })
+        .await?;
 
-    assert_eq!(paged_ids, all_ids);
+    let fourth_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(fourth_request)),
+    )
+    .await??;
+
+    let ModelListResponse {
+        data: fourth_items,
+        next_cursor: fourth_cursor,
+    } = to_response::<ModelListResponse>(fourth_response)?;
+
+    assert_eq!(fourth_items.len(), 1);
+    assert_eq!(fourth_items[0].id, "gpt-5.2");
+    let fifth_cursor = fourth_cursor.ok_or_else(|| anyhow!("cursor for fifth page"))?;
+
+    let fifth_request = mcp
+        .send_list_models_request(ModelListParams {
+            limit: Some(1),
+            cursor: Some(fifth_cursor.clone()),
+        })
+        .await?;
+
+    let fifth_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(fifth_request)),
+    )
+    .await??;
+
+    let ModelListResponse {
+        data: fifth_items,
+        next_cursor: fifth_cursor,
+    } = to_response::<ModelListResponse>(fifth_response)?;
+
+    assert_eq!(fifth_items.len(), 1);
+    assert_eq!(fifth_items[0].id, "gpt-5.1");
+    assert!(fifth_cursor.is_none());
     Ok(())
 }
 
 #[tokio::test]
 async fn list_models_rejects_invalid_cursor() -> Result<()> {
     let codex_home = TempDir::new()?;
+    write_models_cache(codex_home.path())?;
     let mut mcp = McpProcess::new(codex_home.path()).await?;
 
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;

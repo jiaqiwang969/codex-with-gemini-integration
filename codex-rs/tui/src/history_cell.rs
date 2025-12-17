@@ -622,6 +622,7 @@ impl HistoryCell for SessionInfoCell {
 
 pub(crate) fn new_session_info(
     config: &Config,
+    requested_model: &str,
     event: SessionConfiguredEvent,
     is_first_event: bool,
 ) -> SessionInfoCell {
@@ -680,10 +681,10 @@ pub(crate) fn new_session_info(
         {
             parts.push(Box::new(tooltips));
         }
-        if config.model != model {
+        if requested_model != model {
             let lines = vec![
                 "model changed:".magenta().bold().into(),
-                format!("requested: {}", config.model).into(),
+                format!("requested: {requested_model}").into(),
                 format!("used: {model}").into(),
             ];
             parts.push(Box::new(PlainHistoryCell { lines }));
@@ -1713,8 +1714,8 @@ mod tests {
         assert_eq!(
             rendered,
             vec![
-                "✔ You approved codex".to_string(),
-                "  to run echo something".to_string(),
+                "✔ You approved codex to".to_string(),
+                "  run echo something".to_string(),
                 "  really long to ensure".to_string(),
                 "  wrapping happens this".to_string(),
                 "  time".to_string(),
@@ -2371,10 +2372,7 @@ mod tests {
     }
     #[test]
     fn reasoning_summary_block() {
-        let config = test_config();
-        let reasoning_format =
-            ModelsManager::construct_model_family_offline(&config.model, &config)
-                .reasoning_summary_format;
+        let reasoning_format = ReasoningSummaryFormat::Experimental;
         let cell = new_reasoning_summary_block(
             "**High level reasoning**\n\nDetailed reasoning goes here.".to_string(),
             reasoning_format,
@@ -2389,10 +2387,7 @@ mod tests {
 
     #[test]
     fn reasoning_summary_block_returns_reasoning_cell_when_feature_disabled() {
-        let config = test_config();
-        let reasoning_format =
-            ModelsManager::construct_model_family_offline(&config.model, &config)
-                .reasoning_summary_format;
+        let reasoning_format = ReasoningSummaryFormat::Experimental;
         let cell = new_reasoning_summary_block(
             "Detailed reasoning goes here.".to_string(),
             reasoning_format,
@@ -2405,10 +2400,11 @@ mod tests {
     #[test]
     fn reasoning_summary_block_respects_config_overrides() {
         let mut config = test_config();
-        config.model = "gpt-3.5-turbo".to_string();
+        config.model = Some("gpt-3.5-turbo".to_string());
         config.model_supports_reasoning_summaries = Some(true);
         config.model_reasoning_summary_format = Some(ReasoningSummaryFormat::Experimental);
-        let model_family = ModelsManager::construct_model_family_offline(&config.model, &config);
+        let model_family =
+            ModelsManager::construct_model_family_offline(&config.model.clone().unwrap(), &config);
         assert_eq!(
             model_family.reasoning_summary_format,
             ReasoningSummaryFormat::Experimental
@@ -2425,10 +2421,7 @@ mod tests {
 
     #[test]
     fn reasoning_summary_block_falls_back_when_header_is_missing() {
-        let config = test_config();
-        let reasoning_format =
-            ModelsManager::construct_model_family_offline(&config.model, &config)
-                .reasoning_summary_format;
+        let reasoning_format = ReasoningSummaryFormat::Experimental;
         let cell = new_reasoning_summary_block(
             "**High level reasoning without closing".to_string(),
             reasoning_format,
@@ -2440,10 +2433,7 @@ mod tests {
 
     #[test]
     fn reasoning_summary_block_falls_back_when_summary_is_missing() {
-        let config = test_config();
-        let reasoning_format =
-            ModelsManager::construct_model_family_offline(&config.model, &config)
-                .reasoning_summary_format;
+        let reasoning_format = ReasoningSummaryFormat::Experimental;
         let cell = new_reasoning_summary_block(
             "**High level reasoning without closing**".to_string(),
             reasoning_format.clone(),
@@ -2463,10 +2453,7 @@ mod tests {
 
     #[test]
     fn reasoning_summary_block_splits_header_and_summary_when_present() {
-        let config = test_config();
-        let reasoning_format =
-            ModelsManager::construct_model_family_offline(&config.model, &config)
-                .reasoning_summary_format;
+        let reasoning_format = ReasoningSummaryFormat::Experimental;
         let cell = new_reasoning_summary_block(
             "**High level plan**\n\nWe should fix the bug next.".to_string(),
             reasoning_format,

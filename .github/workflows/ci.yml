@@ -14,26 +14,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v5
-        with:
-          node-version: 22
-
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
           run_install: false
 
-      - name: Get pnpm store directory
-        id: pnpm-store
-        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
-
-      - name: Cache pnpm store
-        uses: actions/cache@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
         with:
-          path: ${{ steps.pnpm-store.outputs.path }}
-          key: pnpm-store-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
-          restore-keys: pnpm-store-${{ runner.os }}-
+          node-version: 22
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -45,7 +34,6 @@ jobs:
         id: stage_npm_package
         env:
           GH_TOKEN: ${{ github.token }}
-        if: ${{ github.repository == 'openai/codex' }}
         run: |
           set -euo pipefail
           CODEX_VERSION=0.40.0
@@ -58,8 +46,7 @@ jobs:
           echo "pack_output=$PACK_OUTPUT" >> "$GITHUB_OUTPUT"
 
       - name: Upload staged npm package artifact
-        if: ${{ github.repository == 'openai/codex' }}
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: codex-npm-staging
           path: ${{ steps.stage_npm_package.outputs.pack_output }}

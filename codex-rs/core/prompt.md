@@ -297,15 +297,7 @@ For casual greetings, acknowledgements, or other one-off conversational messages
 When using the shell, you must adhere to the following guidelines:
 
 - When searching for text or files, prefer using `rg` or `rg --files` respectively because `rg` is much faster than alternatives like `grep`. (If the `rg` command is not found, then use alternatives.)
-- Read files in chunks with a max chunk size of 250 lines. Do not use python scripts to attempt to output larger chunks of a file. Command line output will be truncated after 10 kilobytes or 256 lines of output, regardless of the command used.
-- When the user provides a PDF that needs to be read, searched, or summarized, prefer converting it to Markdown using a `markitdown` tool or CLI first (when available) and then work against the Markdown content.
-
-## Diagrams and PlantUML
-
-- When you need to document flows, architectures, or protocols, prefer creating or updating `.puml` files under the `docs/` directory (for example `docs/tdc_stop_timing.puml`) instead of embedding full diagrams directly in your answers.
-- Use appropriate PlantUML diagram types (for example sequence, component, activity, or class diagrams) that match the scenario you are explaining.
-- To generate graphics from a `.puml` file, run commands like `plantuml -tsvg docs/name.puml` and then `convert docs/name.svg docs/name.pdf` (or `magick convert ...`) to produce SVG/PDF artifacts.
-- When committing diagram changes, include the `.puml` source (and usually the generated `.svg`/`.pdf` files) and, in answers, reference the relevant paths (for example `docs/name.puml` or `docs/name.svg`) instead of pasting raw SVG/PDF contents.
+- Do not use python scripts to attempt to output larger chunks of a file.
 
 ## `update_plan`
 

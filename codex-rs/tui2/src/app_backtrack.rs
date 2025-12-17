@@ -350,12 +350,11 @@ impl App {
             auth_manager: self.auth_manager.clone(),
             models_manager: self.server.get_models_manager(),
             feedback: self.feedback.clone(),
-            skills: self.skills.clone(),
             is_first_run: false,
         };
         self.chat_widget =
             crate::chatwidget::ChatWidget::new_from_existing(init, conv, session_configured);
-        self.current_model = model_family.slug;
+        self.current_model = model_family.get_model_slug().to_string();
         // Trim transcript up to the selected user message and re-render it.
         self.trim_transcript_for_backtrack(nth_user_message);
         self.render_transcript_once(tui);

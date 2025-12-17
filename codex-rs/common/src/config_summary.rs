@@ -4,13 +4,10 @@ use codex_core::config::Config;
 use crate::sandbox_summary::summarize_sandbox_policy;
 
 /// Build a list of key/value pairs summarizing the effective configuration.
-pub fn create_config_summary_entries(
-    config: &Config,
-    model_name: &str,
-) -> Vec<(&'static str, String)> {
+pub fn create_config_summary_entries(config: &Config, model: &str) -> Vec<(&'static str, String)> {
     let mut entries = vec![
         ("workdir", config.cwd.display().to_string()),
-        ("model", model_name.to_string()),
+        ("model", model.to_string()),
         ("provider", config.model_provider_id.clone()),
         ("approval", config.approval_policy.to_string()),
         ("sandbox", summarize_sandbox_policy(&config.sandbox_policy)),

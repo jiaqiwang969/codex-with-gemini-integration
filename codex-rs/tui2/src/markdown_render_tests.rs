@@ -814,7 +814,7 @@ HTML block:
 <div style="border:1px solid #ccc;padding:2px">inline block</div>
 Escapes: \_underscores\_, backslash \\, ticks ``code with `backtick` inside``.
 Emoji shortcodes: :sparkles: :tada: (if supported).
-Hard break test (line ends with two spaces)
+Hard break test (line ends with two spaces)  
 Next line should be close to previous.
 Footnote reference here[^1] and another[^longnote].
 Horizontal rule with asterisks:

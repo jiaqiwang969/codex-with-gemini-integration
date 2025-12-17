@@ -73,7 +73,6 @@ const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
 pub enum InputResult {
     Submitted(String),
     Command(SlashCommand),
-    CommandWithArgs(SlashCommand, String),
     None,
 }
 
@@ -121,7 +120,6 @@ pub(crate) struct ChatComposer {
     context_window_used_tokens: Option<i64>,
     skills: Option<Vec<SkillMetadata>>,
     dismissed_skill_popup_token: Option<String>,
-    delegate_label: Option<String>,
 }
 
 /// Popup state – at most one can be visible at any time.
@@ -170,7 +168,6 @@ impl ChatComposer {
             context_window_used_tokens: None,
             skills: None,
             dismissed_skill_popup_token: None,
-            delegate_label: None,
         };
         // Apply configuration via the setter to keep side-effects centralized.
         this.set_disable_paste_burst(disable_paste_burst);
@@ -185,7 +182,7 @@ impl ChatComposer {
         let footer_props = self.footer_props();
         let footer_hint_height = self
             .custom_footer_height()
-            .unwrap_or_else(|| footer_height(&footer_props));
+            .unwrap_or_else(|| footer_height(footer_props));
         let footer_spacing = Self::footer_spacing(footer_hint_height);
         let footer_total_height = footer_hint_height + footer_spacing;
         let popup_constraint = match &self.active_popup {
@@ -265,6 +262,7 @@ impl ChatComposer {
         // so we can directly try to read the image dimensions.
         match image::image_dimensions(&path_buf) {
             Ok((w, h)) => {
+                tracing::info!("OK: {pasted}");
                 let format_label = pasted_image_format(&path_buf).label();
                 self.attach_image(path_buf, w, h, format_label);
                 true
@@ -804,6 +802,10 @@ impl ChatComposer {
         self.skills.as_ref().is_some_and(|s| !s.is_empty())
     }
 
+    pub fn skills(&self) -> Option<&Vec<SkillMetadata>> {
+        self.skills.as_ref()
+    }
+
     /// Extract a token prefixed with `prefix` under the cursor, if any.
     ///
     /// The returned string **does not** include the prefix.
@@ -1082,22 +1084,13 @@ impl ChatComposer {
                 // literal text.
                 let first_line = self.textarea.text().lines().next().unwrap_or("");
                 if let Some((name, rest)) = parse_slash_name(first_line)
+                    && rest.is_empty()
                     && let Some((_n, cmd)) = built_in_slash_commands()
                         .into_iter()
                         .find(|(n, _)| *n == name)
                 {
-                    // Clone rest before clearing textarea to avoid borrow checker issues.
-                    let rest_str = rest.trim().to_string();
-                    let has_args = !rest_str.is_empty();
-
                     self.textarea.set_text("");
-
-                    if has_args && cmd.accepts_args() {
-                        return (InputResult::CommandWithArgs(cmd, rest_str), true);
-                    }
-                    if !has_args {
-                        return (InputResult::Command(cmd), true);
-                    }
+                    return (InputResult::Command(cmd), true);
                 }
                 // If we're in a paste-like burst capture, treat Enter as part of the burst
                 // and accumulate it rather than submitting or inserting immediately.
@@ -1518,7 +1511,8 @@ impl ChatComposer {
 
         let toggles = matches!(key_event.code, KeyCode::Char('?'))
             && !has_ctrl_or_alt(key_event.modifiers)
-            && self.is_empty();
+            && self.is_empty()
+            && !self.is_in_paste_burst();
 
         if !toggles {
             return false;
@@ -1538,7 +1532,6 @@ impl ChatComposer {
             is_task_running: self.is_task_running,
             context_window_percent: self.context_window_percent,
             context_window_used_tokens: self.context_window_used_tokens,
-            delegate_label: self.delegate_label.clone(),
         }
     }
 
@@ -1592,6 +1585,56 @@ impl ChatComposer {
         }
     }
 
+    /// If the cursor is currently within a slash command on the first line,
+    /// extract the command name and the rest of the line after it.
+    /// Returns None if the cursor is outside a slash command.
+    fn slash_command_under_cursor(first_line: &str, cursor: usize) -> Option<(&str, &str)> {
+        if !first_line.starts_with('/') {
+            return None;
+        }
+
+        let name_start = 1usize;
+        let name_end = first_line[name_start..]
+            .find(char::is_whitespace)
+            .map(|idx| name_start + idx)
+            .unwrap_or_else(|| first_line.len());
+
+        if cursor > name_end {
+            return None;
+        }
+
+        let name = &first_line[name_start..name_end];
+        let rest_start = first_line[name_end..]
+            .find(|c: char| !c.is_whitespace())
+            .map(|idx| name_end + idx)
+            .unwrap_or(name_end);
+        let rest = &first_line[rest_start..];
+
+        Some((name, rest))
+    }
+
+    /// Heuristic for whether the typed slash command looks like a valid
+    /// prefix for any known command (built-in or custom prompt).
+    /// Empty names only count when there is no extra content after the '/'.
+    fn looks_like_slash_prefix(&self, name: &str, rest_after_name: &str) -> bool {
+        if name.is_empty() {
+            return rest_after_name.is_empty();
+        }
+
+        let builtin_match = built_in_slash_commands()
+            .into_iter()
+            .any(|(cmd_name, _)| fuzzy_match(cmd_name, name).is_some());
+
+        if builtin_match {
+            return true;
+        }
+
+        let prompt_prefix = format!("{PROMPTS_CMD_PREFIX}:");
+        self.custom_prompts
+            .iter()
+            .any(|p| fuzzy_match(&format!("{prompt_prefix}{}", p.name), name).is_some())
+    }
+
     /// Synchronize `self.command_popup` with the current text in the
     /// textarea. This must be called after every modification that can change
     /// the text so the popup is shown/updated/hidden as appropriate.
@@ -1609,38 +1652,10 @@ impl ChatComposer {
         let cursor = self.textarea.cursor();
         let caret_on_first_line = cursor <= first_line_end;
 
-        let is_editing_slash_command_name = if first_line.starts_with('/') && caret_on_first_line {
-            // Compute the end of the initial '/name' token (name may be empty yet).
-            let token_end = first_line
-                .char_indices()
-                .find(|(_, c)| c.is_whitespace())
-                .map(|(i, _)| i)
-                .unwrap_or(first_line.len());
-            cursor <= token_end
-        } else {
-            false
-        };
+        let is_editing_slash_command_name = caret_on_first_line
+            && Self::slash_command_under_cursor(first_line, cursor)
+                .is_some_and(|(name, rest)| self.looks_like_slash_prefix(name, rest));
 
-        if is_editing_slash_command_name
-            && let Some((name, _rest)) = parse_slash_name(first_line)
-            && !name.is_empty()
-        {
-            let builtin_match = built_in_slash_commands()
-                .into_iter()
-                .any(|(cmd_name, _)| fuzzy_match(cmd_name, name).is_some());
-
-            let prompt_prefix = format!("{PROMPTS_CMD_PREFIX}:");
-            let prompt_match = self.custom_prompts.iter().any(|prompt| {
-                fuzzy_match(&format!("{prompt_prefix}{}", prompt.name), name).is_some()
-            });
-
-            if !builtin_match && !prompt_match {
-                if matches!(self.active_popup, ActivePopup::Command(_)) {
-                    self.active_popup = ActivePopup::None;
-                }
-                return;
-            }
-        }
         // If the cursor is currently positioned within an `@token`, prefer the
         // file-search popup over the slash popup so users can insert a file path
         // as an argument to the command (e.g., "/review @docs/...").
@@ -1756,14 +1771,6 @@ impl ChatComposer {
         self.context_window_used_tokens = used_tokens;
     }
 
-    pub(crate) fn set_delegate_label(&mut self, label: Option<String>) -> bool {
-        if self.delegate_label == label {
-            return false;
-        }
-        self.delegate_label = label;
-        true
-    }
-
     pub(crate) fn set_esc_backtrack_hint(&mut self, show: bool) {
         self.esc_backtrack_hint = show;
         if show {
@@ -1785,7 +1792,7 @@ impl Renderable for ChatComposer {
         let footer_props = self.footer_props();
         let footer_hint_height = self
             .custom_footer_height()
-            .unwrap_or_else(|| footer_height(&footer_props));
+            .unwrap_or_else(|| footer_height(footer_props));
         let footer_spacing = Self::footer_spacing(footer_hint_height);
         let footer_total_height = footer_hint_height + footer_spacing;
         const COLS_WITH_MARGIN: u16 = LIVE_PREFIX_COLS + 1;
@@ -1816,7 +1823,7 @@ impl Renderable for ChatComposer {
                 let footer_props = self.footer_props();
                 let custom_height = self.custom_footer_height();
                 let footer_hint_height =
-                    custom_height.unwrap_or_else(|| footer_height(&footer_props));
+                    custom_height.unwrap_or_else(|| footer_height(footer_props));
                 let footer_spacing = Self::footer_spacing(footer_hint_height);
                 let hint_rect = if footer_spacing > 0 && footer_hint_height > 0 {
                     let [_, hint_rect] = Layout::vertical([
@@ -1847,7 +1854,7 @@ impl Renderable for ChatComposer {
                         Line::from(spans).render_ref(custom_rect, buf);
                     }
                 } else {
-                    render_footer(hint_rect, buf, &footer_props);
+                    render_footer(hint_rect, buf, footer_props);
                 }
             }
         }
@@ -2011,7 +2018,7 @@ mod tests {
         );
         setup(&mut composer);
         let footer_props = composer.footer_props();
-        let footer_lines = footer_height(&footer_props);
+        let footer_lines = footer_height(footer_props);
         let footer_spacing = ChatComposer::footer_spacing(footer_lines);
         let height = footer_lines + footer_spacing + 8;
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -2163,6 +2170,35 @@ mod tests {
         assert_eq!(composer.textarea.text(), "h?");
         assert_eq!(composer.footer_mode, FooterMode::ShortcutSummary);
         assert_eq!(composer.footer_mode(), FooterMode::ContextOnly);
+    }
+
+    #[test]
+    fn question_mark_does_not_toggle_during_paste_burst() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        for ch in ['h', 'i', '?', 't', 'h', 'e', 'r', 'e'] {
+            let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert!(composer.is_in_paste_burst());
+        assert_eq!(composer.textarea.text(), "");
+
+        std::thread::sleep(ChatComposer::recommended_paste_flush_delay());
+        let _ = composer.flush_paste_burst_if_due();
+
+        assert_eq!(composer.textarea.text(), "hi?there");
+        assert_ne!(composer.footer_mode, FooterMode::ShortcutOverlay);
     }
 
     #[test]
@@ -2699,11 +2735,8 @@ mod tests {
             InputResult::Command(cmd) => {
                 assert_eq!(cmd.command(), "init");
             }
-            InputResult::CommandWithArgs(_, args) => {
-                panic!("expected command without args, but composer received args: {args}");
-            }
             InputResult::Submitted(text) => {
-                panic!("expected command dispatch, but composer submitted literal text: {text}");
+                panic!("expected command dispatch, but composer submitted literal text: {text}")
             }
             InputResult::None => panic!("expected Command result for '/init'"),
         }
@@ -2747,12 +2780,8 @@ mod tests {
         let (_result, _needs_redraw) =
             composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
-        let text = composer.textarea.text();
-        // Tab-completion should expand the partial command, append a space,
-        // and move the cursor to the end of the line.
-        assert!(text.starts_with("/c"));
-        assert!(text.ends_with(' '));
-        assert_eq!(composer.textarea.cursor(), text.len());
+        assert_eq!(composer.textarea.text(), "/compact ");
+        assert_eq!(composer.textarea.cursor(), composer.textarea.text().len());
     }
 
     #[test]
@@ -2779,13 +2808,8 @@ mod tests {
             composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match result {
             InputResult::Command(cmd) => assert_eq!(cmd.command(), "diff"),
-            InputResult::CommandWithArgs(_, args) => {
-                panic!("expected command without args after Tab completion, got args: {args}");
-            }
             InputResult::Submitted(text) => {
-                panic!(
-                    "expected command dispatch after Tab completion, got literal submit: {text}"
-                );
+                panic!("expected command dispatch after Tab completion, got literal submit: {text}")
             }
             InputResult::None => panic!("expected Command result for '/diff'"),
         }
@@ -2817,11 +2841,8 @@ mod tests {
             InputResult::Command(cmd) => {
                 assert_eq!(cmd.command(), "mention");
             }
-            InputResult::CommandWithArgs(_, args) => {
-                panic!("expected command without args, but composer received args: {args}");
-            }
             InputResult::Submitted(text) => {
-                panic!("expected command dispatch, but composer submitted literal text: {text}");
+                panic!("expected command dispatch, but composer submitted literal text: {text}")
             }
             InputResult::None => panic!("expected Command result for '/mention'"),
         }
@@ -3929,5 +3950,83 @@ mod tests {
 
         assert_eq!(composer.textarea.text(), "z".repeat(count));
         assert!(composer.pending_pastes.is_empty());
+    }
+
+    #[test]
+    fn slash_popup_not_activated_for_slash_space_text_history_like_input() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        // Simulate history-like content: "/ test"
+        composer.set_text_content("/ test".to_string());
+
+        // After set_text_content -> sync_popups is called; popup should NOT be Command.
+        assert!(
+            matches!(composer.active_popup, ActivePopup::None),
+            "expected no slash popup for '/ test'"
+        );
+
+        // Up should be handled by history navigation path, not slash popup handler.
+        let (result, _redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(result, InputResult::None);
+    }
+
+    #[test]
+    fn slash_popup_activated_for_bare_slash_and_valid_prefixes() {
+        // use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        // Case 1: bare "/"
+        composer.set_text_content("/".to_string());
+        assert!(
+            matches!(composer.active_popup, ActivePopup::Command(_)),
+            "bare '/' should activate slash popup"
+        );
+
+        // Case 2: valid prefix "/re" (matches /review, /resume, etc.)
+        composer.set_text_content("/re".to_string());
+        assert!(
+            matches!(composer.active_popup, ActivePopup::Command(_)),
+            "'/re' should activate slash popup via prefix match"
+        );
+
+        // Case 3: fuzzy match "/ac" (subsequence of /compact and /feedback)
+        composer.set_text_content("/ac".to_string());
+        assert!(
+            matches!(composer.active_popup, ActivePopup::Command(_)),
+            "'/ac' should activate slash popup via fuzzy match"
+        );
+
+        // Case 4: invalid prefix "/zzz" – still allowed to open popup if it
+        // matches no built-in command; our current logic will not open popup.
+        // Verify that explicitly.
+        composer.set_text_content("/zzz".to_string());
+        assert!(
+            matches!(composer.active_popup, ActivePopup::None),
+            "'/zzz' should not activate slash popup because it is not a prefix of any built-in command"
+        );
     }
 }

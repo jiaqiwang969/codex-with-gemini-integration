@@ -5,8 +5,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_app_server_protocol::AuthMode;
 use codex_backend_client::Client as BackendClient;
 use codex_core::config::Config;
@@ -35,6 +33,7 @@ use codex_core::protocol::ExecCommandEndEvent;
 use codex_core::protocol::ExecCommandSource;
 use codex_core::protocol::ExitedReviewModeEvent;
 use codex_core::protocol::ListCustomPromptsResponseEvent;
+use codex_core::protocol::ListSkillsResponseEvent;
 use codex_core::protocol::McpListToolsResponseEvent;
 use codex_core::protocol::McpStartupCompleteEvent;
 use codex_core::protocol::McpStartupStatus;
@@ -44,11 +43,12 @@ use codex_core::protocol::McpToolCallEndEvent;
 use codex_core::protocol::Op;
 use codex_core::protocol::PatchApplyBeginEvent;
 use codex_core::protocol::RateLimitSnapshot;
-use codex_core::protocol::RawResponseItemEvent;
 use codex_core::protocol::ReviewRequest;
 use codex_core::protocol::ReviewTarget;
+use codex_core::protocol::SkillsListEntry;
 use codex_core::protocol::StreamErrorEvent;
 use codex_core::protocol::TaskCompleteEvent;
+use codex_core::protocol::TerminalInteractionEvent;
 use codex_core::protocol::TokenUsage;
 use codex_core::protocol::TokenUsageInfo;
 use codex_core::protocol::TurnAbortReason;
@@ -64,8 +64,6 @@ use codex_core::skills::model::SkillMetadata;
 use codex_protocol::ConversationId;
 use codex_protocol::account::PlanType;
 use codex_protocol::approvals::ElicitationRequestEvent;
-use codex_protocol::models::ContentItem;
-use codex_protocol::models::ResponseItem;
 use codex_protocol::parse_command::ParsedCommand;
 use codex_protocol::user_input::UserInput;
 use crossterm::event::KeyCode;
@@ -126,14 +124,9 @@ use self::agent::spawn_agent_from_existing;
 mod session_header;
 use self::session_header::SessionHeader;
 use crate::streaming::controller::StreamController;
-use std::fmt::Write;
 use std::path::Path;
-use std::time::SystemTime;
-use uuid::Uuid;
 
-use chrono::DateTime;
 use chrono::Local;
-use chrono::Utc;
 use codex_common::approval_presets::ApprovalPreset;
 use codex_common::approval_presets::builtin_approval_presets;
 use codex_core::AuthManager;
@@ -142,17 +135,10 @@ use codex_core::ConversationManager;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::SandboxPolicy;
 use codex_file_search::FileMatch;
-use codex_multi_agent::AgentId;
-use codex_multi_agent::DelegateSessionMode;
-use codex_multi_agent::DelegateSessionSummary;
-use codex_multi_agent::DetachedRunStatusSummary;
-use codex_multi_agent::DetachedRunSummary;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use strum::IntoEnumIterator;
-
-use shlex::Shlex;
 
 const USER_SHELL_COMMAND_HELP_TITLE: &str = "Prefix a command with ! to run it locally";
 const USER_SHELL_COMMAND_HELP_HINT: &str = "Example: !ls";
@@ -279,22 +265,10 @@ pub(crate) struct ChatWidgetInit {
     pub(crate) auth_manager: Arc<AuthManager>,
     pub(crate) models_manager: Arc<ModelsManager>,
     pub(crate) feedback: codex_feedback::CodexFeedback,
-    pub(crate) skills: Option<Vec<SkillMetadata>>,
     pub(crate) is_first_run: bool,
     pub(crate) model_family: ModelFamily,
 }
 
-#[derive(Clone, Debug)]
-pub struct DelegateDisplayLabel {
-    pub depth: usize,
-    pub base_label: String,
-}
-
-#[derive(Clone)]
-pub struct DelegatePickerSession {
-    pub summary: DelegateSessionSummary,
-    pub run_id: Option<String>,
-}
 #[derive(Default)]
 enum RateLimitSwitchPromptState {
     #[default]
@@ -355,192 +329,16 @@ pub(crate) struct ChatWidget {
     // Whether to add a final message separator after the last message
     needs_final_message_separator: bool,
 
-    delegate_run: Option<String>,
-    delegate_runs_with_stream: HashSet<String>,
-    delegate_status_owner: Option<String>,
-    delegate_previous_status_header: Option<String>,
-    delegate_context: Option<DelegateSessionSummary>,
-    delegate_user_frames: Vec<codex_protocol::user_input::UserInput>,
-    delegate_agent_frames: Vec<String>,
-    pending_delegate_context: Vec<String>,
-
     last_rendered_width: std::cell::Cell<Option<usize>>,
     // Feedback sink for /feedback
     feedback: codex_feedback::CodexFeedback,
     // Current session rollout path (if known)
     current_rollout_path: Option<PathBuf>,
-    // Monotonic counter for generated images in this session.
-    next_generated_image_index: u64,
-    // Last generated image path for quick reopening via slash command.
-    last_generated_image_path: Option<PathBuf>,
-    // UI-level view of the active reference image set for this session.
-    ref_images: RefImageManager,
 }
 
 struct UserMessage {
     text: String,
     image_paths: Vec<PathBuf>,
-}
-
-/// Manager for the reference image set used by `/ref-image`.
-///
-/// This tracks the UI's view of the active reference images as local paths.
-/// Core maintains its own data URL representation; the two are kept in sync
-/// via `Op::SetReferenceImages` / `Op::ClearReferenceImages`.
-struct RefImageManager {
-    active_paths: Vec<PathBuf>,
-}
-
-impl RefImageManager {
-    fn new() -> Self {
-        Self {
-            active_paths: Vec::new(),
-        }
-    }
-
-    fn clear(&mut self) {
-        self.active_paths.clear();
-    }
-
-    fn set_paths(&mut self, paths: Vec<PathBuf>) {
-        self.active_paths = paths;
-    }
-
-    fn active_paths(&self) -> &[PathBuf] {
-        &self.active_paths
-    }
-}
-
-struct RefImageContext<'a> {
-    cwd: &'a Path,
-    codex_home: &'a Path,
-    conversation_id: Option<&'a ConversationId>,
-}
-
-enum RefImageCommand {
-    ShowHelpAndMaybeStatus,
-    ShowStatusOnly,
-    Clear,
-    Set {
-        paths: Vec<PathBuf>,
-        prompt: Option<String>,
-    },
-}
-
-impl RefImageManager {
-    fn parse_command(&self, args: Option<String>, ctx: &RefImageContext<'_>) -> RefImageCommand {
-        let raw = args.unwrap_or_default();
-        let trimmed = raw.trim();
-
-        if trimmed.is_empty() {
-            return RefImageCommand::ShowHelpAndMaybeStatus;
-        }
-
-        if trimmed.eq_ignore_ascii_case("ls") {
-            return RefImageCommand::ShowStatusOnly;
-        }
-
-        if trimmed.eq_ignore_ascii_case("clear") {
-            return RefImageCommand::Clear;
-        }
-
-        let (paths_raw, prompt_raw) = if let Some((left, right)) = trimmed.split_once("--") {
-            (left.trim_end(), Some(right.trim_start().to_string()))
-        } else {
-            (trimmed, None)
-        };
-
-        let path_tokens: Vec<String> = Shlex::new(paths_raw).filter(|s| !s.is_empty()).collect();
-        if path_tokens.is_empty() {
-            // If the user supplied only a prompt (for example `/ref-image -- tweak the style`)
-            // defer image selection to the caller so it can integrate any attached images.
-            if let Some(prompt_raw) = prompt_raw {
-                let prompt = {
-                    let trimmed = prompt_raw.trim();
-                    if trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(trimmed.to_string())
-                    }
-                };
-                return RefImageCommand::Set {
-                    paths: Vec::new(),
-                    prompt,
-                };
-            }
-            return RefImageCommand::ShowHelpAndMaybeStatus;
-        }
-
-        let mut resolved: Vec<PathBuf> = Vec::new();
-        for token in path_tokens {
-            resolved.push(Self::resolve_path(&token, ctx));
-        }
-
-        let prompt = prompt_raw.and_then(|p| {
-            let trimmed = p.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        });
-
-        RefImageCommand::Set {
-            paths: resolved,
-            prompt,
-        }
-    }
-
-    fn resolve_path(raw: &str, ctx: &RefImageContext<'_>) -> PathBuf {
-        // Expand ~/ prefix against the user's home directory when possible.
-        let expanded = if let Some(stripped) = raw.strip_prefix("~/") {
-            if let Some(home) = dirs::home_dir() {
-                home.join(stripped)
-            } else {
-                PathBuf::from(raw)
-            }
-        } else {
-            PathBuf::from(raw)
-        };
-
-        if expanded.is_absolute() {
-            return expanded;
-        }
-
-        // If the path has multiple components, treat it as relative to the current
-        // working directory (e.g. subdir/image.png).
-        let mut components = expanded.components();
-        if components.next().is_some() && components.next().is_some() {
-            return ctx.cwd.join(expanded);
-        }
-
-        // Single-segment relative path (e.g. "000000.png"): prefer the session's
-        // images directory when available so users can omit the full ~/.codex path.
-        if let Some(conversation_id) = ctx.conversation_id {
-            let candidate = ctx
-                .codex_home
-                .join("images")
-                .join(conversation_id.to_string())
-                .join(&expanded);
-            if candidate.exists() {
-                return candidate;
-            }
-        }
-
-        ctx.cwd.join(expanded)
-    }
-}
-
-#[derive(Default)]
-pub(crate) struct DelegateCapture {
-    pub user_inputs: Vec<codex_protocol::user_input::UserInput>,
-    pub agent_outputs: Vec<String>,
-}
-
-impl DelegateCapture {
-    fn is_empty(&self) -> bool {
-        self.user_inputs.is_empty() && self.agent_outputs.is_empty()
-    }
 }
 
 impl From<String> for UserMessage {
@@ -570,103 +368,6 @@ fn create_initial_user_message(text: String, image_paths: Vec<PathBuf>) -> Optio
 }
 
 impl ChatWidget {
-    pub(crate) fn handle_ref_image_command(&mut self, args: Option<String>) {
-        let ctx = RefImageContext {
-            cwd: &self.config.cwd,
-            codex_home: &self.config.codex_home,
-            conversation_id: self.conversation_id.as_ref(),
-        };
-
-        match self.ref_images.parse_command(args, &ctx) {
-            RefImageCommand::ShowHelpAndMaybeStatus => {
-                let message = "Usage: /ref-image <path1> <path2> ... [-- <prompt>]\n\
-                               • `/ref-image ls` — show current reference images\n\
-                               • `/ref-image clear` — clear the active reference images";
-                self.add_info_message(message.to_string(), None);
-
-                // If there is an active set, show it after the help text.
-                if !self.ref_images.active_paths().is_empty() {
-                    let display_paths: Vec<String> = self
-                        .ref_images
-                        .active_paths()
-                        .iter()
-                        .map(|p| display_path_for(p, &self.config.cwd))
-                        .collect();
-                    self.add_info_message(
-                        format!("Active reference images: {}", display_paths.join(", ")),
-                        None,
-                    );
-                }
-            }
-            RefImageCommand::ShowStatusOnly => {
-                if self.ref_images.active_paths().is_empty() {
-                    self.add_info_message(
-                        "No active reference images. The model will infer references from recent images."
-                            .to_string(),
-                        None,
-                    );
-                } else {
-                    let display_paths: Vec<String> = self
-                        .ref_images
-                        .active_paths()
-                        .iter()
-                        .map(|p| display_path_for(p, &self.config.cwd))
-                        .collect();
-                    self.add_info_message(
-                        format!("Active reference images: {}", display_paths.join(", ")),
-                        None,
-                    );
-                }
-            }
-            RefImageCommand::Clear => {
-                self.ref_images.clear();
-                // Forward ClearReferenceImages directly so it is ordered
-                // consistently with any subsequent user input.
-                self.submit_op(Op::ClearReferenceImages);
-                self.add_info_message("Reference images cleared.".to_string(), None);
-            }
-            RefImageCommand::Set { paths, prompt } => {
-                // If the user pasted or attached images in the composer and then
-                // invoked `/ref-image`, prefer those attached image paths over
-                // any literal placeholders that may appear in the command text.
-                // This keeps `/ref-image` aligned with the image attachment
-                // pipeline used elsewhere in the TUI.
-                let attached_paths = self.bottom_pane.take_recent_submission_images();
-                let final_paths = if attached_paths.is_empty() {
-                    paths
-                } else {
-                    attached_paths
-                };
-
-                self.ref_images.set_paths(final_paths.clone());
-                // Ensure the reference images are updated in core before
-                // sending any prompt that might rely on them. Using
-                // `submit_op` keeps the ordering consistent with the
-                // subsequent `Op::UserInput`.
-                self.submit_op(Op::SetReferenceImages { paths: final_paths });
-
-                let display_paths: Vec<String> = self
-                    .ref_images
-                    .active_paths()
-                    .iter()
-                    .map(|p| display_path_for(p, &self.config.cwd))
-                    .collect();
-                self.add_info_message(
-                    format!("Reference images set: {}", display_paths.join(", ")),
-                    None,
-                );
-
-                if let Some(prompt_text) = prompt {
-                    let user_message = UserMessage {
-                        text: prompt_text,
-                        image_paths: Vec::new(),
-                    };
-                    self.queue_user_message(user_message);
-                }
-            }
-        }
-    }
-
     fn flush_answer_stream_with_separator(&mut self) {
         if let Some(mut controller) = self.stream_controller.take()
             && let Some(cell) = controller.finalize()
@@ -692,136 +393,42 @@ impl ChatWidget {
     fn on_session_configured(&mut self, event: codex_core::protocol::SessionConfiguredEvent) {
         self.bottom_pane
             .set_history_metadata(event.history_log_id, event.history_entry_count);
-        let session_id = event.session_id;
-        self.conversation_id = Some(session_id);
+        self.set_skills(None);
+        self.conversation_id = Some(event.session_id);
         self.current_rollout_path = Some(event.rollout_path.clone());
         let initial_messages = event.initial_messages.clone();
         let model_for_header = event.model.clone();
         self.session_header.set_model(&model_for_header);
-
-        // Check if this is a new session (no history) and show alias input
-        let is_new_session = event.history_entry_count == 0 && initial_messages.is_none();
-
         self.add_to_history(history_cell::new_session_info(
             &self.config,
+            &model_for_header,
             event,
             self.show_welcome_banner,
         ));
         if let Some(messages) = initial_messages {
             self.replay_initial_messages(messages);
         }
-
-        if is_new_session {
-            // Store initial user message to submit after alias input
-            let pending_message = self.initial_user_message.take();
-
-            // Show alias input dialog
-            let app_tx = self.app_event_tx.clone();
-            let sid = session_id.to_string();
-            self.bottom_pane.show_session_alias_input(
-                sid,
-                Box::new(move |session_id, alias| {
-                    app_tx.send(AppEvent::SaveSessionAlias { session_id, alias });
-                }),
-            );
-
-            // Restore initial message to be submitted after alias input
-            self.initial_user_message = pending_message;
-        } else {
-            // For existing sessions, submit initial message immediately
-            if let Some(user_message) = self.initial_user_message.take() {
-                self.submit_user_message(user_message);
-            }
-        }
-
         // Ask codex-core to enumerate custom prompts for this session.
         self.submit_op(Op::ListCustomPrompts);
+        self.submit_op(Op::ListSkills {
+            cwds: Vec::new(),
+            force_reload: false,
+        });
+        if let Some(user_message) = self.initial_user_message.take() {
+            self.submit_user_message(user_message);
+        }
         if !self.suppress_session_configured_redraw {
             self.request_redraw();
         }
     }
 
-    /// Show alias input dialog for renaming an existing session
-    pub(crate) fn show_session_alias_input_for_rename(
-        &mut self,
-        session_id: String,
-        on_submit: Box<dyn Fn(String, String) + Send + Sync>,
-    ) {
-        self.bottom_pane
-            .show_session_alias_input(session_id, on_submit);
+    fn set_skills(&mut self, skills: Option<Vec<SkillMetadata>>) {
+        self.bottom_pane.set_skills(skills);
     }
 
-    pub(crate) fn set_delegate_context(&mut self, summary: Option<DelegateSessionSummary>) {
-        let label = summary
-            .as_ref()
-            .map(|s| format!("#{}", s.agent_id.as_str()));
-        self.bottom_pane.set_delegate_label(label);
-        self.delegate_context = summary;
-        self.delegate_user_frames.clear();
-        self.delegate_agent_frames.clear();
-    }
-
-    pub(crate) fn take_delegate_capture(&mut self) -> Option<DelegateCapture> {
-        if self.delegate_user_frames.is_empty() && self.delegate_agent_frames.is_empty() {
-            return None;
-        }
-        Some(DelegateCapture {
-            user_inputs: std::mem::take(&mut self.delegate_user_frames),
-            agent_outputs: std::mem::take(&mut self.delegate_agent_frames),
-        })
-    }
-
-    pub(crate) fn apply_delegate_summary(
-        &mut self,
-        summary: &DelegateSessionSummary,
-        capture: DelegateCapture,
-    ) {
-        if capture.is_empty() {
-            self.add_info_message(
-                format!(
-                    "Returned from #{} (no new messages)",
-                    summary.agent_id.as_str()
-                ),
-                None,
-            );
-            return;
-        }
-
-        let mut context = String::new();
-        let _ = writeln!(
-            context,
-            "Context from #{} (cwd: {})",
-            summary.agent_id.as_str(),
-            summary.cwd.display()
-        );
-
-        for item in capture.user_inputs {
-            if let codex_protocol::user_input::UserInput::Text { text } = item {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    let _ = writeln!(context, "You → {trimmed}");
-                }
-            }
-        }
-
-        for message in capture.agent_outputs {
-            let trimmed = message.trim();
-            if !trimmed.is_empty() {
-                let _ = writeln!(context, "{} → {trimmed}", summary.agent_id.as_str());
-            }
-        }
-
-        let context = context.trim().to_string();
-        if context.is_empty() {
-            return;
-        }
-
-        self.pending_delegate_context.push(context.clone());
-        self.add_to_history(history_cell::new_info_event(
-            format!("Returned from #{}", summary.agent_id.as_str()),
-            Some("Queued delegate context for next prompt.".to_string()),
-        ));
-        self.add_to_history(history_cell::new_info_event(context, None));
+    fn set_skills_from_response(&mut self, response: &ListSkillsResponseEvent) {
+        let skills = skills_for_cwd(&self.config.cwd, &response.skills);
+        self.set_skills(Some(skills));
     }
 
     pub(crate) fn open_feedback_note(
@@ -933,19 +540,11 @@ impl ChatWidget {
         self.last_unified_wait = None;
         self.request_redraw();
 
-        if self.delegate_context.is_some()
-            && let Some(message) = last_agent_message.as_ref()
-            && !message.trim().is_empty()
-        {
-            self.delegate_agent_frames.push(message.clone());
-        }
-
-        let notification_response = last_agent_message.unwrap_or_default();
         // If there is a queued user message, send exactly one now to begin the next turn.
         self.maybe_send_next_queued_input();
         // Emit a notification when the turn completes (suppressed if focused).
         self.notify(Notification::AgentTurnComplete {
-            response: notification_response,
+            response: last_agent_message.unwrap_or_default(),
         });
 
         self.maybe_show_pending_rate_limit_prompt();
@@ -969,10 +568,12 @@ impl ChatWidget {
     }
 
     fn context_remaining_percent(&self, info: &TokenUsageInfo) -> Option<i64> {
-        info.model_context_window.map(|window| {
-            info.last_token_usage
-                .percent_of_context_window_remaining(window)
-        })
+        info.model_context_window
+            .or(self.model_family.context_window)
+            .map(|window| {
+                info.last_token_usage
+                    .percent_of_context_window_remaining(window)
+            })
     }
 
     fn context_used_tokens(&self, info: &TokenUsageInfo, percent_known: bool) -> Option<i64> {
@@ -1040,7 +641,7 @@ impl ChatWidget {
 
             if high_usage
                 && !self.rate_limit_switch_prompt_hidden()
-                && self.config.model != NUDGE_MODEL_SLUG
+                && self.model_family.get_model_slug() != NUDGE_MODEL_SLUG
                 && !matches!(
                     self.rate_limit_switch_prompt,
                     RateLimitSwitchPromptState::Shown
@@ -1241,6 +842,10 @@ impl ChatWidget {
         // TODO: Handle streaming exec output if/when implemented
     }
 
+    fn on_terminal_interaction(&mut self, _ev: TerminalInteractionEvent) {
+        // TODO: Handle once design is ready
+    }
+
     fn on_patch_apply_begin(&mut self, event: PatchApplyBeginEvent) {
         self.add_to_history(history_cell::new_patch_event(
             event.changes,
@@ -1438,17 +1043,10 @@ impl ChatWidget {
         }
         let (command, parsed, source) = match running {
             Some(rc) => (rc.command, rc.parsed_cmd, rc.source),
-            None => (
-                vec![ev.call_id.clone()],
-                Vec::new(),
-                ExecCommandSource::Agent,
-            ),
+            None => (ev.command.clone(), ev.parsed_cmd.clone(), ev.source),
         };
         let is_unified_exec_interaction =
             matches!(source, ExecCommandSource::UnifiedExecInteraction);
-
-        // Sidebar status: Success/Failure summary
-        // 已移除事件发送，改为在 sidebar_status() 中实时计算
 
         let needs_new = self
             .active_cell
@@ -1462,7 +1060,7 @@ impl ChatWidget {
                 command,
                 parsed,
                 source,
-                None,
+                ev.interaction_input.clone(),
                 self.config.animations,
             )));
         }
@@ -1513,15 +1111,11 @@ impl ChatWidget {
             id,
             command: ev.command,
             reason: ev.reason,
-            risk: ev.risk,
             proposed_execpolicy_amendment: ev.proposed_execpolicy_amendment,
         };
         self.bottom_pane
             .push_approval_request(request, &self.config.features);
         self.request_redraw();
-
-        // Sidebar status: Waiting for approval
-        // 已移除事件发送，改为在 sidebar_status() 中实时计算
     }
 
     pub(crate) fn handle_apply_patch_approval_now(
@@ -1621,9 +1215,6 @@ impl ChatWidget {
             )));
         }
 
-        // Sidebar status: Running
-        // 已移除事件发送，改为在 sidebar_status() 中实时计算
-
         self.request_redraw();
     }
 
@@ -1686,10 +1277,12 @@ impl ChatWidget {
             auth_manager,
             models_manager,
             feedback,
-            skills,
             is_first_run,
             model_family,
         } = common;
+        let model_slug = model_family.get_model_slug().to_string();
+        let mut config = config;
+        config.model = Some(model_slug.clone());
         let mut rng = rand::rng();
         let placeholder = EXAMPLE_PROMPTS[rng.random_range(0..EXAMPLE_PROMPTS.len())].to_string();
         let codex_op_tx = spawn_agent(config.clone(), app_event_tx.clone(), conversation_manager);
@@ -1706,14 +1299,14 @@ impl ChatWidget {
                 placeholder_text: placeholder,
                 disable_paste_burst: config.disable_paste_burst,
                 animations_enabled: config.animations,
-                skills,
+                skills: None,
             }),
             active_cell: None,
-            config: config.clone(),
+            config,
             model_family,
             auth_manager,
             models_manager,
-            session_header: SessionHeader::new(config.model),
+            session_header: SessionHeader::new(model_slug),
             initial_user_message: create_initial_user_message(
                 initial_prompt.unwrap_or_default(),
                 initial_images,
@@ -1743,20 +1336,9 @@ impl ChatWidget {
             is_review_mode: false,
             pre_review_token_info: None,
             needs_final_message_separator: false,
-            delegate_run: None,
-            delegate_runs_with_stream: HashSet::new(),
-            delegate_status_owner: None,
-            delegate_previous_status_header: None,
-            delegate_context: None,
-            delegate_user_frames: Vec::new(),
-            delegate_agent_frames: Vec::new(),
-            pending_delegate_context: Vec::new(),
             last_rendered_width: std::cell::Cell::new(None),
             feedback,
             current_rollout_path: None,
-            next_generated_image_index: 0,
-            last_generated_image_path: None,
-            ref_images: RefImageManager::new(),
         };
 
         widget.prefetch_rate_limits();
@@ -1767,7 +1349,6 @@ impl ChatWidget {
     /// Create a ChatWidget attached to an existing conversation (e.g., a fork).
     pub(crate) fn new_from_existing(
         common: ChatWidgetInit,
-        conversation_id: String,
         conversation: std::sync::Arc<codex_core::CodexConversation>,
         session_configured: codex_core::protocol::SessionConfiguredEvent,
     ) -> Self {
@@ -1781,19 +1362,15 @@ impl ChatWidget {
             auth_manager,
             models_manager,
             feedback,
-            skills,
             model_family,
             ..
         } = common;
+        let model_slug = model_family.get_model_slug().to_string();
         let mut rng = rand::rng();
         let placeholder = EXAMPLE_PROMPTS[rng.random_range(0..EXAMPLE_PROMPTS.len())].to_string();
 
-        let codex_op_tx = spawn_agent_from_existing(
-            conversation_id,
-            conversation,
-            session_configured,
-            app_event_tx.clone(),
-        );
+        let codex_op_tx =
+            spawn_agent_from_existing(conversation, session_configured, app_event_tx.clone());
 
         let mut widget = Self {
             app_event_tx: app_event_tx.clone(),
@@ -1807,14 +1384,14 @@ impl ChatWidget {
                 placeholder_text: placeholder,
                 disable_paste_burst: config.disable_paste_burst,
                 animations_enabled: config.animations,
-                skills,
+                skills: None,
             }),
             active_cell: None,
-            config: config.clone(),
+            config,
             model_family,
             auth_manager,
             models_manager,
-            session_header: SessionHeader::new(config.model),
+            session_header: SessionHeader::new(model_slug),
             initial_user_message: create_initial_user_message(
                 initial_prompt.unwrap_or_default(),
                 initial_images,
@@ -1844,20 +1421,9 @@ impl ChatWidget {
             is_review_mode: false,
             pre_review_token_info: None,
             needs_final_message_separator: false,
-            delegate_run: None,
-            delegate_runs_with_stream: HashSet::new(),
-            delegate_status_owner: None,
-            delegate_previous_status_header: None,
-            delegate_context: None,
-            delegate_user_frames: Vec::new(),
-            delegate_agent_frames: Vec::new(),
-            pending_delegate_context: Vec::new(),
             last_rendered_width: std::cell::Cell::new(None),
             feedback,
             current_rollout_path: None,
-            next_generated_image_index: 0,
-            last_generated_image_path: None,
-            ref_images: RefImageManager::new(),
         };
 
         widget.prefetch_rate_limits();
@@ -1933,10 +1499,7 @@ impl ChatWidget {
                         self.queue_user_message(user_message);
                     }
                     InputResult::Command(cmd) => {
-                        self.dispatch_command(cmd, None);
-                    }
-                    InputResult::CommandWithArgs(cmd, args) => {
-                        self.dispatch_command(cmd, Some(args));
+                        self.dispatch_command(cmd);
                     }
                     InputResult::None => {}
                 }
@@ -1959,7 +1522,7 @@ impl ChatWidget {
         self.request_redraw();
     }
 
-    fn dispatch_command(&mut self, cmd: SlashCommand, args: Option<String>) {
+    fn dispatch_command(&mut self, cmd: SlashCommand) {
         if !cmd.available_during_task() && self.bottom_pane.is_task_running() {
             let message = format!(
                 "'/{}' is disabled while a task is in progress.",
@@ -1994,12 +1557,6 @@ impl ChatWidget {
                 }
                 const INIT_PROMPT: &str = include_str!("../prompt_for_init_command.md");
                 self.submit_user_message(INIT_PROMPT.to_string().into());
-            }
-            SlashCommand::Tumix => {
-                self.handle_tumix_command(args);
-            }
-            SlashCommand::TumixStop => {
-                self.handle_tumix_stop_command(args);
             }
             SlashCommand::Compact => {
                 self.clear_token_usage();
@@ -2046,23 +1603,8 @@ impl ChatWidget {
                     tx.send(AppEvent::DiffResult(text));
                 });
             }
-            SlashCommand::OpenImage => {
-                self.open_last_generated_image();
-            }
-            SlashCommand::RefImage => {
-                self.handle_ref_image_command(args);
-            }
-            SlashCommand::ClearRef => {
-                self.ref_images.clear();
-                self.app_event_tx
-                    .send(AppEvent::CodexOp(Op::ClearReferenceImages));
-                self.add_info_message("Reference images cleared.".to_string(), None);
-            }
             SlashCommand::Mention => {
                 self.insert_str("@");
-            }
-            SlashCommand::Agent => {
-                self.app_event_tx.send(AppEvent::OpenDelegatePicker);
             }
             SlashCommand::Skills => {
                 self.insert_str("$");
@@ -2176,45 +1718,9 @@ impl ChatWidget {
     }
 
     fn submit_user_message(&mut self, user_message: UserMessage) {
-        let UserMessage {
-            mut text,
-            image_paths,
-        } = user_message;
+        let UserMessage { text, image_paths } = user_message;
         if text.is_empty() && image_paths.is_empty() {
             return;
-        }
-
-        let display_text = text.clone();
-
-        if self.delegate_context.is_some()
-            && !display_text.trim().is_empty()
-            && image_paths.is_empty()
-        {
-            self.delegate_user_frames
-                .push(codex_protocol::user_input::UserInput::Text {
-                    text: display_text.clone(),
-                });
-        }
-
-        // Intercept explicit delegation commands (only support text-only submissions).
-        if image_paths.is_empty() && !text.is_empty() && self.try_delegate_shortcut(&text) {
-            return;
-        }
-
-        if self.delegate_context.is_none()
-            && !self.pending_delegate_context.is_empty()
-            && !text.trim().is_empty()
-        {
-            let mut prefix = self.pending_delegate_context.join("\n\n");
-            self.pending_delegate_context.clear();
-            if !prefix.is_empty() {
-                if !prefix.ends_with('\n') {
-                    prefix.push('\n');
-                }
-                prefix.push('\n');
-            }
-            prefix.push_str(&text);
-            text = prefix;
         }
 
         let mut items: Vec<UserInput> = Vec::new();
@@ -2245,20 +1751,34 @@ impl ChatWidget {
             items.push(UserInput::LocalImage { path });
         }
 
-        if let Err(e) = self.codex_op_tx.send(Op::UserInput { items }) {
-            tracing::error!("failed to send message: {e}");
+        if let Some(skills) = self.bottom_pane.skills() {
+            let skill_mentions = find_skill_mentions(&text, skills);
+            for skill in skill_mentions {
+                items.push(UserInput::Skill {
+                    name: skill.name.clone(),
+                    path: skill.path.clone(),
+                });
+            }
         }
 
-        if !text.is_empty()
-            && let Err(e) = self
-                .codex_op_tx
+        self.codex_op_tx
+            .send(Op::UserInput { items })
+            .unwrap_or_else(|e| {
+                tracing::error!("failed to send message: {e}");
+            });
+
+        // Persist the text to cross-session message history.
+        if !text.is_empty() {
+            self.codex_op_tx
                 .send(Op::AddToHistory { text: text.clone() })
-        {
-            tracing::error!("failed to send AddHistory op: {e}");
+                .unwrap_or_else(|e| {
+                    tracing::error!("failed to send AddHistory op: {e}");
+                });
         }
 
-        if !display_text.is_empty() {
-            self.add_to_history(history_cell::new_user_prompt(display_text));
+        // Only show the text portion in conversation history.
+        if !text.is_empty() {
+            self.add_to_history(history_cell::new_user_prompt(text));
         }
         self.needs_final_message_separator = false;
     }
@@ -2297,6 +1817,7 @@ impl ChatWidget {
         match msg {
             EventMsg::AgentMessageDelta(_)
             | EventMsg::AgentReasoningDelta(_)
+            | EventMsg::TerminalInteraction(_)
             | EventMsg::ExecCommandOutputDelta(_) => {}
             _ => {
                 tracing::trace!("handle_codex_event: {:?}", msg);
@@ -2354,6 +1875,7 @@ impl ChatWidget {
                 self.on_elicitation_request(ev);
             }
             EventMsg::ExecCommandBegin(ev) => self.on_exec_command_begin(ev),
+            EventMsg::TerminalInteraction(delta) => self.on_terminal_interaction(delta),
             EventMsg::ExecCommandOutputDelta(delta) => self.on_exec_command_output_delta(delta),
             EventMsg::PatchApplyBegin(ev) => self.on_patch_apply_begin(ev),
             EventMsg::PatchApplyEnd(ev) => self.on_patch_apply_end(ev),
@@ -2366,6 +1888,13 @@ impl ChatWidget {
             EventMsg::GetHistoryEntryResponse(ev) => self.on_get_history_entry_response(ev),
             EventMsg::McpListToolsResponse(ev) => self.on_list_mcp_tools(ev),
             EventMsg::ListCustomPromptsResponse(ev) => self.on_list_custom_prompts(ev),
+            EventMsg::ListSkillsResponse(ev) => self.on_list_skills(ev),
+            EventMsg::SkillsUpdateAvailable => {
+                self.submit_op(Op::ListSkills {
+                    cwds: Vec::new(),
+                    force_reload: true,
+                });
+            }
             EventMsg::ShutdownComplete => self.on_shutdown_complete(),
             EventMsg::TurnDiff(TurnDiffEvent { unified_diff }) => self.on_turn_diff(unified_diff),
             EventMsg::DeprecationNotice(ev) => self.on_deprecation_notice(ev),
@@ -2377,9 +1906,6 @@ impl ChatWidget {
             EventMsg::StreamError(StreamErrorEvent { message, .. }) => {
                 self.on_stream_error(message)
             }
-            EventMsg::RawResponseItem(ev) => {
-                self.on_raw_response_item(ev);
-            }
             EventMsg::UserMessage(ev) => {
                 if from_replay {
                     self.on_user_message_event(ev);
@@ -2390,7 +1916,8 @@ impl ChatWidget {
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
             EventMsg::ContextCompacted(_) => self.on_agent_message("Context compacted".to_owned()),
-            EventMsg::ItemStarted(_)
+            EventMsg::RawResponseItem(_)
+            | EventMsg::ItemStarted(_)
             | EventMsg::ItemCompleted(_)
             | EventMsg::AgentMessageContentDelta(_)
             | EventMsg::ReasoningContentDelta(_)
@@ -2434,15 +1961,8 @@ impl ChatWidget {
                     self.app_event_tx
                         .send(AppEvent::InsertHistoryCell(Box::new(body_cell)));
                 }
-            } else {
-                let message_text =
-                    codex_core::review_format::format_review_findings_block(&output.findings, None);
-                let mut message_lines: Vec<ratatui::text::Line<'static>> = Vec::new();
-                append_markdown(&message_text, None, &mut message_lines);
-                let body_cell = AgentMessageCell::new(message_lines, true);
-                self.app_event_tx
-                    .send(AppEvent::InsertHistoryCell(Box::new(body_cell)));
             }
+            // Final message is rendered as part of the AgentMessage.
         }
 
         self.is_review_mode = false;
@@ -2465,154 +1985,7 @@ impl ChatWidget {
         self.app_event_tx.send(AppEvent::ExitRequest);
     }
 
-    fn on_raw_response_item(&mut self, event: RawResponseItemEvent) {
-        let RawResponseItemEvent { item } = event;
-        let ResponseItem::Message { role, content, .. } = item else {
-            return;
-        };
-
-        if role != "assistant" {
-            return;
-        }
-
-        let Some(conversation_id) = self.conversation_id else {
-            return;
-        };
-
-        let mut saved_any = false;
-        let mut last_saved_path: Option<PathBuf> = None;
-
-        for content_item in content {
-            if let ContentItem::InputImage { image_url } = content_item
-                && let Some(path) = self.save_generated_image(&conversation_id, &image_url)
-            {
-                saved_any = true;
-                last_saved_path = Some(path);
-            }
-        }
-
-        if let (true, Some(path)) = (saved_any, last_saved_path) {
-            let display = display_path_for(&path, &self.config.cwd);
-            let hint = format!("{display} · run /open-image to open it");
-            self.add_to_history(history_cell::new_info_event(
-                "Generated image saved".to_string(),
-                Some(hint),
-            ));
-            self.last_generated_image_path = Some(path);
-            self.request_redraw();
-        }
-    }
-
-    fn save_generated_image(
-        &mut self,
-        conversation_id: &ConversationId,
-        image_url: &str,
-    ) -> Option<PathBuf> {
-        // Only handle data URLs of the form data:<mime>;base64,<data>.
-        let without_prefix = image_url.strip_prefix("data:")?;
-        let (meta, data_base64) = without_prefix.split_once(',')?;
-        let (mime, encoding) = meta.split_once(';')?;
-        if !encoding.eq_ignore_ascii_case("base64") {
-            return None;
-        }
-
-        let bytes = match BASE64_STANDARD.decode(data_base64) {
-            Ok(b) => b,
-            Err(err) => {
-                tracing::warn!("failed to decode generated image data: {err}");
-                return None;
-            }
-        };
-
-        let ext = match mime {
-            "image/jpeg" | "image/jpg" => "jpg",
-            "image/png" => "png",
-            "image/gif" => "gif",
-            "image/webp" => "webp",
-            other => {
-                tracing::warn!("saving generated image with unrecognized mime type `{other}`");
-                "bin"
-            }
-        };
-
-        let dir = self
-            .config
-            .codex_home
-            .join("images")
-            .join(conversation_id.to_string());
-        if let Err(err) = std::fs::create_dir_all(&dir) {
-            tracing::warn!("failed to create images directory {}: {err}", dir.display());
-            return None;
-        }
-
-        let index = self.next_generated_image_index;
-        self.next_generated_image_index = self.next_generated_image_index.saturating_add(1);
-        let filename = format!("{index:06}.{ext}");
-        let path = dir.join(filename);
-        if let Err(err) = std::fs::write(&path, &bytes) {
-            tracing::warn!(
-                "failed to write generated image to {}: {err}",
-                path.display()
-            );
-            return None;
-        }
-
-        Some(path)
-    }
-
-    fn open_last_generated_image(&mut self) {
-        let Some(path) = self.last_generated_image_path.clone() else {
-            self.add_to_history(history_cell::new_info_event(
-                "No generated image is available to open yet.".to_string(),
-                None,
-            ));
-            self.request_redraw();
-            return;
-        };
-
-        let display = display_path_for(&path, &self.config.cwd);
-
-        match Self::open_image_in_viewer(&path) {
-            Ok(()) => {
-                self.add_to_history(history_cell::new_info_event(
-                    "Opening generated image".to_string(),
-                    Some(display),
-                ));
-            }
-            Err(error) => {
-                self.add_to_history(history_cell::new_error_event(format!(
-                    "Failed to open generated image: {error}"
-                )));
-            }
-        }
-
-        self.request_redraw();
-    }
-
-    fn open_image_in_viewer(path: &Path) -> Result<(), String> {
-        #[cfg(target_os = "macos")]
-        let cmd_result = std::process::Command::new("open").arg(path).spawn();
-
-        #[cfg(target_os = "linux")]
-        let cmd_result = std::process::Command::new("xdg-open").arg(path).spawn();
-
-        #[cfg(target_os = "windows")]
-        let cmd_result = std::process::Command::new("cmd")
-            .args(["/C", "start", "", &path.to_string_lossy()])
-            .spawn();
-
-        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-        let cmd_result = Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "opening images is not supported on this platform",
-        ));
-
-        cmd_result
-            .map(|_| ())
-            .map_err(|error| format!("failed to spawn image viewer: {error}"))
-    }
-
-    pub(crate) fn request_redraw(&mut self) {
+    fn request_redraw(&mut self) {
         self.frame_requester.schedule_frame();
     }
 
@@ -2620,26 +1993,9 @@ impl ChatWidget {
         if !notification.allowed_for(&self.config.tui_notifications) {
             return;
         }
-        self.maybe_play_completion_sound(&notification);
         self.pending_notification = Some(notification);
         self.request_redraw();
     }
-
-    #[cfg(target_os = "macos")]
-    fn maybe_play_completion_sound(&self, notification: &Notification) {
-        if !matches!(notification, Notification::AgentTurnComplete { .. }) {
-            return;
-        }
-        if let Err(error) = std::process::Command::new("afplay")
-            .arg("/System/Library/Sounds/Glass.aiff")
-            .spawn()
-        {
-            debug!(error = %error, "failed to play completion sound");
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    fn maybe_play_completion_sound(&self, _notification: &Notification) {}
 
     pub(crate) fn maybe_post_pending_notification(&mut self, tui: &mut crate::tui::Tui) {
         if let Some(notif) = self.pending_notification.take() {
@@ -2707,6 +2063,7 @@ impl ChatWidget {
             self.rate_limit_snapshot.as_ref(),
             self.plan_type,
             Local::now(),
+            self.model_family.get_model_slug(),
         ));
     }
     fn stop_rate_limit_poller(&mut self) {
@@ -2849,7 +2206,7 @@ impl ChatWidget {
     /// Open a popup to choose a quick auto model. Selecting "All models"
     /// opens the full picker with every available preset.
     pub(crate) fn open_model_popup(&mut self) {
-        let current_model = self.config.model.clone();
+        let current_model = self.model_family.get_model_slug().to_string();
         let presets: Vec<ModelPreset> =
             // todo(aibrahim): make this async function
             match self.models_manager.try_list_models() {
@@ -2957,7 +2314,7 @@ impl ChatWidget {
             return;
         }
 
-        let current_model = self.config.model.clone();
+        let current_model = self.model_family.get_model_slug().to_string();
         let mut items: Vec<SelectionItem> = Vec::new();
         for preset in presets.into_iter() {
             let description =
@@ -3047,7 +2404,8 @@ impl ChatWidget {
             format!("⚠ {effort_label} reasoning effort can quickly consume Plus plan rate limits.")
         });
         let warn_for_model = preset.model.starts_with("gpt-5.1-codex")
-            || preset.model.starts_with("gpt-5.1-codex-max");
+            || preset.model.starts_with("gpt-5.1-codex-max")
+            || preset.model.starts_with("gpt-5.2");
 
         struct EffortChoice {
             stored: Option<ReasoningEffortConfig>,
@@ -3087,7 +2445,7 @@ impl ChatWidget {
             .or(Some(default_effort));
 
         let model_slug = preset.model.to_string();
-        let is_current_model = self.config.model == preset.model;
+        let is_current_model = self.model_family.get_model_slug() == preset.model;
         let highlight_choice = if is_current_model {
             self.config.model_reasoning_effort
         } else {
@@ -3157,152 +2515,6 @@ impl ChatWidget {
             initial_selected_idx,
             ..Default::default()
         });
-    }
-
-    pub(crate) fn open_delegate_picker(
-        &mut self,
-        mut sessions: Vec<DelegatePickerSession>,
-        detached_runs: Vec<DetachedRunSummary>,
-        active_delegate: Option<&str>,
-    ) {
-        if sessions.is_empty() && detached_runs.is_empty() {
-            self.add_info_message(
-                "No delegate sessions available.".to_string(),
-                Some("Ask the main agent to delegate a task first.".to_string()),
-            );
-            return;
-        }
-
-        sessions.sort_by(|a, b| {
-            b.summary
-                .last_interacted_at
-                .cmp(&a.summary.last_interacted_at)
-        });
-
-        let mut items: Vec<SelectionItem> = Vec::new();
-
-        if active_delegate.is_some() {
-            let actions: Vec<SelectionAction> =
-                vec![Box::new(|tx| tx.send(AppEvent::ExitDelegateSession))];
-            items.push(SelectionItem {
-                name: "Return to main agent".to_string(),
-                description: None,
-                is_current: false,
-                actions,
-                dismiss_on_select: true,
-                ..Default::default()
-            });
-        }
-
-        for entry in sessions {
-            let summary = entry.summary;
-            let run_id = entry.run_id;
-            let conversation_id = summary.conversation_id.clone();
-            let prefix = if summary.mode == DelegateSessionMode::Detached {
-                "Detached · "
-            } else {
-                ""
-            };
-            let label = format!(
-                "{prefix}#{} · {}",
-                summary.agent_id.as_str(),
-                Self::format_delegate_timestamp(summary.last_interacted_at)
-            );
-            let description = Some(summary.cwd.display().to_string());
-            let is_current = active_delegate == Some(conversation_id.as_str());
-            let conversation_id_for_action = conversation_id.clone();
-            let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
-                tx.send(AppEvent::EnterDelegateSession(
-                    conversation_id_for_action.clone(),
-                ));
-            })];
-            items.push(SelectionItem {
-                name: label,
-                description,
-                is_current,
-                actions,
-                dismiss_on_select: true,
-                ..Default::default()
-            });
-
-            if summary.mode == DelegateSessionMode::Detached
-                && let Some(run_id) = run_id.clone()
-            {
-                let dismiss_actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
-                    tx.send(AppEvent::DismissDetachedRun(run_id.clone()));
-                })];
-                items.push(SelectionItem {
-                    name: format!("  Dismiss detached run for #{}", summary.agent_id.as_str()),
-                    description: Some("Remove this detached run from the list.".to_string()),
-                    is_current: false,
-                    actions: dismiss_actions,
-                    dismiss_on_select: true,
-                    ..Default::default()
-                });
-            }
-        }
-
-        for detached in detached_runs {
-            let run_id = detached.run_id.clone();
-            let status = detached.status.clone();
-            let label = match &status {
-                DetachedRunStatusSummary::Pending => format!(
-                    "Pending · #{} (started {})",
-                    detached.agent_id.as_str(),
-                    Self::format_delegate_timestamp(detached.started_at)
-                ),
-                DetachedRunStatusSummary::Failed { .. } => {
-                    format!("Failed · #{}", detached.agent_id.as_str())
-                }
-            };
-            let description = match &status {
-                DetachedRunStatusSummary::Pending => {
-                    let mut text = String::from(
-                        "Run is still executing; you'll be able to dismiss it once it finishes.",
-                    );
-                    if let Some(preview) = detached.prompt_preview.as_ref() {
-                        text.push_str("\nPrompt: ");
-                        text.push_str(preview);
-                    }
-                    Some(text)
-                }
-                DetachedRunStatusSummary::Failed { error, .. } => Some(format!("Error: {error}")),
-            };
-            let (actions, dismiss_on_select): (Vec<SelectionAction>, bool) = match status {
-                DetachedRunStatusSummary::Pending => (Vec::new(), false),
-                DetachedRunStatusSummary::Failed { .. } => {
-                    let run_id_clone = run_id.clone();
-                    (
-                        vec![Box::new(move |tx: &AppEventSender| {
-                            tx.send(AppEvent::DismissDetachedRun(run_id_clone.clone()));
-                        }) as SelectionAction],
-                        true,
-                    )
-                }
-            };
-            items.push(SelectionItem {
-                name: label,
-                description,
-                is_current: false,
-                actions,
-                dismiss_on_select,
-                ..Default::default()
-            });
-        }
-
-        self.bottom_pane.show_selection_view(SelectionViewParams {
-            title: Some("Switch agent".to_string()),
-            footer_hint: Some(standard_popup_hint_line()),
-            items,
-            ..Default::default()
-        });
-    }
-
-    fn format_delegate_timestamp(time: SystemTime) -> String {
-        let utc: DateTime<Utc> = time.into();
-        utc.with_timezone(&Local)
-            .format("%Y-%m-%d %H:%M")
-            .to_string()
     }
 
     fn reasoning_effort_label(effort: ReasoningEffortConfig) -> &'static str {
@@ -3790,7 +3002,6 @@ impl ChatWidget {
     /// Set the model in the widget's config copy.
     pub(crate) fn set_model(&mut self, model: &str, model_family: ModelFamily) {
         self.session_header.set_model(model);
-        self.config.model = model.to_string();
         self.model_family = model_family;
     }
 
@@ -3817,119 +3028,6 @@ impl ChatWidget {
         }
     }
 
-    pub(crate) fn handle_tumix_command(&mut self, user_prompt: Option<String>) {
-        // If no prompt provided, show help instead of starting TUMIX
-        if user_prompt.is_none() {
-            let help_msg = "🚀 **TUMIX** - 多智能体并行执行框架\n\n\
-                 **用法：** `/tumix <任务描述>`\n\n\
-                 **示例：**\n\
-                 • `/tumix 实现一个Rust自动微分库`\n\
-                 • `/tumix 优化这段代码的性能`\n\
-                 • `/tumix 设计分布式缓存系统`\n\n\
-                 **工作流程：**\n\
-                 1. Meta-agent 分析任务复杂度，灵活设计专家团队（2-15个agent）\n\
-                 2. 每个 agent 在独立的 Git worktree 中工作\n\
-                 3. 所有 agents 并行执行\n\
-                 4. 结果保存到 `.tumix/round1_sessions.json`\n\
-                 5. 创建分支：`round1-agent-01`, `round1-agent-02`...\n\n\
-                 💡 **Agent数量根据任务自动调整：**\n\
-                 • 简单任务 → 2-3个agent\n\
-                 • 中等任务 → 4-6个agent\n\
-                 • 复杂任务 → 7-10个agent\n\
-                 • 超大任务 → 10-15个agent\n\n\
-                 _请提供任务描述以启动 TUMIX_";
-
-            self.add_to_history(history_cell::new_info_event(help_msg.to_string(), None));
-            self.request_redraw();
-            return;
-        }
-
-        let session_id = match &self.conversation_id {
-            Some(id) => id.to_string(),
-            None => {
-                self.add_to_history(history_cell::new_error_event(
-                    "Cannot run `/tumix`: No active session".to_string(),
-                ));
-                self.request_redraw();
-                return;
-            }
-        };
-
-        let prompt_text = user_prompt.as_deref().unwrap_or("").trim();
-        let session_short = session_id.chars().take(8).collect::<String>();
-        let run_id = format!("tumix-{}", Uuid::new_v4());
-        let display_prompt = if prompt_text.is_empty() {
-            format!("会话：{session_short}")
-        } else {
-            format!("会话：{session_short} · 任务：{prompt_text}")
-        };
-
-        self.app_event_tx.send(AppEvent::TumixRunRequested {
-            run_id,
-            session_id,
-            user_prompt,
-            display_prompt,
-        });
-    }
-
-    pub(crate) fn handle_tumix_stop_command(&mut self, target: Option<String>) {
-        let target_session = target.as_ref().and_then(|s| {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        });
-
-        if let Some(session_id) = target_session {
-            match codex_tumix::cancel_run(&session_id) {
-                Some(run) => {
-                    let short = run.run_id.chars().take(8).collect::<String>();
-                    let msg = format!(
-                        "🛑 Requested cancellation for TUMIX run {short}\n\
-                         • Session: {session}\n\
-                         • Run ID: {run_id}",
-                        short = short,
-                        session = session_id,
-                        run_id = run.run_id
-                    );
-                    self.add_to_history(history_cell::new_info_event(msg, None));
-                }
-                None => {
-                    let msg = format!("⚠️ No active TUMIX run found for session `{session_id}`.");
-                    self.add_to_history(history_cell::new_error_event(msg));
-                }
-            }
-            self.request_redraw();
-            return;
-        }
-
-        let cancelled = codex_tumix::cancel_all_runs();
-        if cancelled.is_empty() {
-            self.add_to_history(history_cell::new_info_event(
-                "ℹ️ There are no active TUMIX runs to stop.".to_string(),
-                None,
-            ));
-        } else {
-            let lines = cancelled
-                .iter()
-                .map(|run| {
-                    let short = run.run_id.chars().take(8).collect::<String>();
-                    format!("  • Session: {} (run {})", run.session_id, short)
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let msg = format!(
-                "🛑 Requested cancellation for {} active TUMIX run(s):\n{}",
-                cancelled.len(),
-                lines
-            );
-            self.add_to_history(history_cell::new_info_event(msg, None));
-        }
-        self.request_redraw();
-    }
-
     /// Forward file-search results to the bottom pane.
     pub(crate) fn apply_file_search_result(&mut self, query: String, matches: Vec<FileMatch>) {
         self.bottom_pane.on_file_search_result(query, matches);
@@ -3952,10 +3050,6 @@ impl ChatWidget {
 
     pub(crate) fn composer_is_empty(&self) -> bool {
         self.bottom_pane.composer_is_empty()
-    }
-
-    pub(crate) fn is_task_running(&self) -> bool {
-        self.bottom_pane.is_task_running()
     }
 
     /// True when the UI is in the regular composer state with no running task,
@@ -4005,6 +3099,10 @@ impl ChatWidget {
         debug!("received {len} custom prompts");
         // Forward to bottom pane so the slash popup can show them now.
         self.bottom_pane.set_custom_prompts(ev.custom_prompts);
+    }
+
+    fn on_list_skills(&mut self, ev: ListSkillsResponseEvent) {
+        self.set_skills_from_response(&ev);
     }
 
     pub(crate) fn open_review_popup(&mut self) {
@@ -4166,19 +3264,6 @@ impl ChatWidget {
         self.bottom_pane.show_view(Box::new(view));
     }
 
-    /// Programmatically submit a user text message as if typed in the
-    /// composer. The text will be added to conversation history and sent to
-    /// the agent.
-    pub(crate) fn submit_text_message(&mut self, text: String) {
-        if text.is_empty() {
-            return;
-        }
-        if self.try_delegate_shortcut(&text) {
-            return;
-        }
-        self.submit_user_message(text.into());
-    }
-
     pub(crate) fn token_usage(&self) -> TokenUsage {
         self.token_info
             .as_ref()
@@ -4188,215 +3273,6 @@ impl ChatWidget {
 
     pub(crate) fn conversation_id(&self) -> Option<ConversationId> {
         self.conversation_id
-    }
-
-    /// A lightweight status string for the sidebar, derived from existing UI state.
-    /// 优先根据 TaskRunning 状态区分「运行中」和「就绪」，否则再回退到 Exec 活动。
-    ///
-    /// 这样即使为了 UI 效果临时隐藏底部状态指示器（例如流式最终答案已经落盘到历史，
-    /// 但 Task 仍在进行中），会话栏仍然反映「运行中」直到整个任务真正结束
-    ///（核心层发出 TaskComplete 事件）。
-    pub(crate) fn sidebar_status(&self) -> String {
-        // 只要底部 Pane 认为有任务在运行，就视为「运行中」，不依赖状态指示器是否可见。
-        if self.bottom_pane.is_task_running() {
-            return "运行中".to_string();
-        }
-
-        // 检查 ExecCell/运行中命令
-        let exec_active = self
-            .active_cell
-            .as_ref()
-            .and_then(|c| c.as_any().downcast_ref::<ExecCell>())
-            .map(crate::exec_cell::ExecCell::is_active)
-            .unwrap_or(false);
-        if exec_active || !self.running_commands.is_empty() {
-            return "运行中".to_string();
-        }
-
-        // Fallback
-        "就绪".to_string()
-    }
-
-    pub(crate) fn add_delegate_completion(
-        &mut self,
-        response: Option<&str>,
-        duration_hint: Option<String>,
-        label: &DelegateDisplayLabel,
-    ) {
-        let header = format!("{} completed", label.base_label);
-        self.add_info_message(header, duration_hint);
-
-        if label.depth > 0 {
-            return;
-        }
-
-        let Some(text) = response.map(str::trim).filter(|s| !s.is_empty()) else {
-            return;
-        };
-
-        self.flush_answer_stream_with_separator();
-        self.flush_active_cell();
-
-        let mut lines: Vec<ratatui::text::Line<'static>> = Vec::new();
-        append_markdown(text, None, &mut lines);
-        let cell = AgentMessageCell::new(lines, true);
-        self.add_to_history(cell);
-        self.request_redraw();
-    }
-
-    pub(crate) fn on_delegate_started(
-        &mut self,
-        run_id: &str,
-        agent_id: &AgentId,
-        prompt: &str,
-        label: DelegateDisplayLabel,
-        claim_status: bool,
-        mode: DelegateSessionMode,
-    ) {
-        if claim_status {
-            self.set_delegate_status_owner_internal(run_id, agent_id);
-        }
-        if label.depth == 0 {
-            self.delegate_user_frames.clear();
-            self.delegate_agent_frames.clear();
-        }
-        self.delegate_runs_with_stream.remove(run_id);
-        self.delegate_run = Some(run_id.to_string());
-        let trimmed = prompt.trim();
-        let hint = if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        };
-        let mut info_label = label.base_label;
-        if mode == DelegateSessionMode::Detached {
-            info_label = format!("{info_label} (detached)");
-        }
-        self.add_info_message(format!("{info_label}…"), hint);
-        self.request_redraw();
-    }
-
-    pub(crate) fn on_delegate_delta(&mut self, run_id: &str, chunk: &str) {
-        if self.delegate_run.as_deref() != Some(run_id) {
-            self.delegate_run = Some(run_id.to_string());
-        }
-        self.delegate_runs_with_stream.insert(run_id.to_string());
-        self.handle_streaming_delta(chunk.to_string());
-    }
-
-    pub(crate) fn on_delegate_completed(
-        &mut self,
-        run_id: &str,
-        label: &DelegateDisplayLabel,
-    ) -> bool {
-        let had_stream = self.delegate_runs_with_stream.remove(run_id);
-        if self.delegate_run.as_deref() == Some(run_id) {
-            if had_stream {
-                self.flush_answer_stream_with_separator();
-                self.handle_stream_finished();
-                self.app_event_tx.send(AppEvent::StopCommitAnimation);
-            }
-            self.delegate_run = None;
-        }
-        label.depth == 0 && had_stream
-    }
-
-    pub(crate) fn show_detached_completion_actions(
-        &mut self,
-        agent_id: &AgentId,
-        run_id: &str,
-        output: Option<&str>,
-    ) {
-        let mut items: Vec<SelectionItem> = Vec::new();
-        if let Some(text) = output.map(str::trim).filter(|s| !s.is_empty()) {
-            let preview = truncate_text(text, 200);
-            let run_id_insert = run_id.to_string();
-            let text_insert = text.to_string();
-            items.push(SelectionItem {
-                name: format!("Use output from #{}", agent_id.as_str()),
-                description: Some(preview),
-                is_current: false,
-                actions: vec![Box::new(move |tx: &AppEventSender| {
-                    tx.send(AppEvent::InsertUserTextMessage(text_insert.clone()));
-                    tx.send(AppEvent::DismissDetachedRun(run_id_insert.clone()));
-                })],
-                dismiss_on_select: true,
-                ..Default::default()
-            });
-        }
-
-        let run_id_dismiss = run_id.to_string();
-        items.push(SelectionItem {
-            name: format!("Dismiss detached run #{}", agent_id.as_str()),
-            description: Some("Remove this run from the list".to_string()),
-            is_current: false,
-            actions: vec![Box::new(move |tx: &AppEventSender| {
-                tx.send(AppEvent::DismissDetachedRun(run_id_dismiss.clone()));
-            })],
-            dismiss_on_select: true,
-            ..Default::default()
-        });
-
-        self.bottom_pane.show_selection_view(SelectionViewParams {
-            title: Some(format!("#{} finished", agent_id.as_str())),
-            footer_hint: Some(standard_popup_hint_line()),
-            items,
-            ..Default::default()
-        });
-    }
-
-    pub(crate) fn on_delegate_failed(
-        &mut self,
-        run_id: &str,
-        label: &DelegateDisplayLabel,
-        error: &str,
-    ) {
-        let _ = self.on_delegate_completed(run_id, label);
-        self.add_error_message(format!("{} failed: {error}", label.base_label));
-    }
-
-    pub(crate) fn notify_detached_completion(&mut self, label: &DelegateDisplayLabel) {
-        self.notify(Notification::DetachedRunFinished {
-            label: label.base_label.clone(),
-        });
-    }
-
-    pub(crate) fn notify_detached_failure(&mut self, label: &DelegateDisplayLabel, error: &str) {
-        self.notify(Notification::DetachedRunFailed {
-            label: label.base_label.clone(),
-            error: error.to_string(),
-        });
-    }
-
-    pub(crate) fn set_delegate_status_owner(&mut self, run_id: &str, agent_id: &AgentId) {
-        self.set_delegate_status_owner_internal(run_id, agent_id);
-    }
-
-    pub(crate) fn clear_delegate_status_owner(&mut self) {
-        if self.delegate_status_owner.take().is_some() {
-            if let Some(previous) = self.delegate_previous_status_header.take() {
-                self.set_status_header(previous);
-            }
-            self.bottom_pane.set_task_running(false);
-        }
-    }
-
-    fn set_delegate_status_owner_internal(&mut self, run_id: &str, agent_id: &AgentId) {
-        let is_same = self.delegate_status_owner.as_deref() == Some(run_id);
-        if !is_same && self.delegate_status_owner.is_none() {
-            if self.delegate_previous_status_header.is_none() {
-                self.delegate_previous_status_header = Some(self.current_status_header.clone());
-            }
-            if self.bottom_pane.status_widget().is_none() {
-                self.bottom_pane.set_task_running(true);
-            }
-        }
-        self.delegate_status_owner = Some(run_id.to_string());
-        self.set_status_header(format!("Delegating to #{}", agent_id.as_str()));
-    }
-
-    fn try_delegate_shortcut(&mut self, _text: &str) -> bool {
-        false
     }
 
     pub(crate) fn rollout_path(&self) -> Option<PathBuf> {
@@ -4453,8 +3329,6 @@ enum Notification {
     AgentTurnComplete { response: String },
     ExecApprovalRequested { command: String },
     EditApprovalRequested { cwd: PathBuf, changes: Vec<PathBuf> },
-    DetachedRunFinished { label: String },
-    DetachedRunFailed { label: String, error: String },
     ElicitationRequested { server_name: String },
 }
 
@@ -4479,13 +3353,6 @@ impl Notification {
                     }
                 )
             }
-            Notification::DetachedRunFinished { label } => {
-                format!("Detached delegate finished {label}")
-            }
-            Notification::DetachedRunFailed { label, error } => {
-                let preview = truncate_text(error, 60);
-                format!("Detached delegate failed {label}: {preview}")
-            }
             Notification::ElicitationRequested { server_name } => {
                 format!("Approval requested by {server_name}")
             }
@@ -4498,8 +3365,6 @@ impl Notification {
             Notification::ExecApprovalRequested { .. }
             | Notification::EditApprovalRequested { .. }
             | Notification::ElicitationRequested { .. } => "approval-requested",
-            Notification::DetachedRunFinished { .. } => "detached-run-finished",
-            Notification::DetachedRunFailed { .. } => "detached-run-failed",
         }
     }
 
@@ -4622,6 +3487,41 @@ pub(crate) fn show_review_commit_picker_with_entries(
         search_placeholder: Some("Type to search commits".to_string()),
         ..Default::default()
     });
+}
+
+fn skills_for_cwd(cwd: &Path, skills_entries: &[SkillsListEntry]) -> Vec<SkillMetadata> {
+    skills_entries
+        .iter()
+        .find(|entry| entry.cwd.as_path() == cwd)
+        .map(|entry| {
+            entry
+                .skills
+                .iter()
+                .map(|skill| SkillMetadata {
+                    name: skill.name.clone(),
+                    description: skill.description.clone(),
+                    path: skill.path.clone(),
+                    scope: skill.scope,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn find_skill_mentions(text: &str, skills: &[SkillMetadata]) -> Vec<SkillMetadata> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut matches: Vec<SkillMetadata> = Vec::new();
+    for skill in skills {
+        if seen.contains(&skill.name) {
+            continue;
+        }
+        let needle = format!("${}", skill.name);
+        if text.contains(&needle) {
+            seen.insert(skill.name.clone());
+            matches.push(skill.clone());
+        }
+    }
+    matches
 }
 
 #[cfg(test)]

@@ -155,7 +155,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             VERSION
         );
 
-        let mut entries = create_config_summary_entries(config, &config.model);
+        let mut entries = create_config_summary_entries(config, session_configured_event.model.as_str());
         entries.push((
             "session id",
             session_configured_event.session_id.to_string(),
@@ -585,10 +585,12 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             EventMsg::WebSearchBegin(_)
             | EventMsg::ExecApprovalRequest(_)
             | EventMsg::ApplyPatchApprovalRequest(_)
+            | EventMsg::TerminalInteraction(_)
             | EventMsg::ExecCommandOutputDelta(_)
             | EventMsg::GetHistoryEntryResponse(_)
             | EventMsg::McpListToolsResponse(_)
             | EventMsg::ListCustomPromptsResponse(_)
+            | EventMsg::ListSkillsResponse(_)
             | EventMsg::UserMessage(_)
             | EventMsg::EnteredReviewMode(_)
             | EventMsg::ExitedReviewMode(_)
@@ -600,6 +602,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             | EventMsg::AgentMessageContentDelta(_)
             | EventMsg::ReasoningContentDelta(_)
             | EventMsg::ReasoningRawContentDelta(_)
+            | EventMsg::SkillsUpdateAvailable
             | EventMsg::UndoCompleted(_)
             | EventMsg::UndoStarted(_) => {}
         }

@@ -27,14 +27,12 @@ use codex_core::protocol::ExecCommandSource;
 use codex_core::protocol::ExecPolicyAmendment;
 use codex_core::protocol::ExitedReviewModeEvent;
 use codex_core::protocol::FileChange;
+use codex_core::protocol::McpStartupStatus;
+use codex_core::protocol::McpStartupUpdateEvent;
 use codex_core::protocol::Op;
 use codex_core::protocol::PatchApplyBeginEvent;
 use codex_core::protocol::PatchApplyEndEvent;
 use codex_core::protocol::RateLimitWindow;
-use codex_core::protocol::ReviewCodeLocation;
-use codex_core::protocol::ReviewFinding;
-use codex_core::protocol::ReviewLineRange;
-use codex_core::protocol::ReviewOutputEvent;
 use codex_core::protocol::ReviewRequest;
 use codex_core::protocol::ReviewTarget;
 use codex_core::protocol::StreamErrorEvent;
@@ -56,7 +54,7 @@ use codex_protocol::plan_tool::PlanItemArg;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::CodexErrorInfo;
-use codex_protocol::user_input::UserInput;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
@@ -76,6 +74,7 @@ fn set_windows_sandbox_enabled(enabled: bool) {
 
 fn test_config() -> Config {
     // Use base defaults to avoid depending on host state.
+
     Config::load_from_base_config_with_overrides(
         ConfigToml::default(),
         ConfigOverrides::default(),
@@ -122,7 +121,6 @@ fn resumed_initial_messages_render_history() {
                 message: "assistant reply".to_string(),
             }),
         ]),
-        skill_load_outcome: None,
         rollout_path: rollout_file.path().to_path_buf(),
     };
 
@@ -191,41 +189,6 @@ fn entered_review_mode_defaults_to_current_changes_banner() {
     let banner = lines_to_single_string(cells.last().expect("review banner"));
     assert_eq!(banner, ">> Code review started: current changes <<\n");
     assert!(chat.is_review_mode);
-}
-
-/// Completing review with findings shows the selection popup and finishes with
-/// the closing banner while clearing review mode state.
-#[test]
-fn exited_review_mode_emits_results_and_finishes() {
-    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None);
-
-    let review = ReviewOutputEvent {
-        findings: vec![ReviewFinding {
-            title: "[P1] Fix bug".to_string(),
-            body: "Something went wrong".to_string(),
-            confidence_score: 0.9,
-            priority: 1,
-            code_location: ReviewCodeLocation {
-                absolute_file_path: PathBuf::from("src/lib.rs"),
-                line_range: ReviewLineRange { start: 10, end: 12 },
-            },
-        }],
-        overall_correctness: "needs work".to_string(),
-        overall_explanation: "Investigate the failure".to_string(),
-        overall_confidence_score: 0.5,
-    };
-
-    chat.handle_codex_event(Event {
-        id: "review-end".into(),
-        msg: EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
-            review_output: Some(review),
-        }),
-    });
-
-    let cells = drain_insert_history(&mut rx);
-    let banner = lines_to_single_string(cells.last().expect("finished banner"));
-    assert_eq!(banner, "\n<< Code review finished >>\n");
-    assert!(!chat.is_review_mode);
 }
 
 /// Exiting review restores the pre-review context window indicator.
@@ -348,10 +311,12 @@ async fn helpers_are_available_and_do_not_panic() {
     let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
     let tx = AppEventSender::new(tx_raw);
     let cfg = test_config();
-    let model_family = ModelsManager::construct_model_family_offline(&cfg.model, &cfg);
-    let conversation_manager = Arc::new(ConversationManager::with_auth(CodexAuth::from_api_key(
-        "test",
-    )));
+    let resolved_model = ModelsManager::get_model_offline(cfg.model.as_deref());
+    let model_family = ModelsManager::construct_model_family_offline(&resolved_model, &cfg);
+    let conversation_manager = Arc::new(ConversationManager::with_models_provider(
+        CodexAuth::from_api_key("test"),
+        cfg.model_provider.clone(),
+    ));
     let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("test"));
     let init = ChatWidgetInit {
         config: cfg,
@@ -363,7 +328,6 @@ async fn helpers_are_available_and_do_not_panic() {
         auth_manager,
         models_manager: conversation_manager.get_models_manager(),
         feedback: codex_feedback::CodexFeedback::new(),
-        skills: None,
         is_first_run: true,
         model_family,
     };
@@ -384,8 +348,11 @@ fn make_chatwidget_manual(
     let app_event_tx = AppEventSender::new(tx_raw);
     let (op_tx, op_rx) = unbounded_channel::<Op>();
     let mut cfg = test_config();
+    let resolved_model = model_override
+        .map(str::to_owned)
+        .unwrap_or_else(|| ModelsManager::get_model_offline(cfg.model.as_deref()));
     if let Some(model) = model_override {
-        cfg.model = model.to_string();
+        cfg.model = Some(model.to_string());
     }
     let bottom = BottomPane::new(BottomPaneParams {
         app_event_tx: app_event_tx.clone(),
@@ -404,10 +371,10 @@ fn make_chatwidget_manual(
         bottom_pane: bottom,
         active_cell: None,
         config: cfg.clone(),
-        model_family: ModelsManager::construct_model_family_offline(&cfg.model, &cfg),
+        model_family: ModelsManager::construct_model_family_offline(&resolved_model, &cfg),
         auth_manager: auth_manager.clone(),
         models_manager: Arc::new(ModelsManager::new(auth_manager)),
-        session_header: SessionHeader::new(cfg.model),
+        session_header: SessionHeader::new(resolved_model.clone()),
         initial_user_message: None,
         token_info: None,
         rate_limit_snapshot: None,
@@ -435,21 +402,9 @@ fn make_chatwidget_manual(
         is_review_mode: false,
         pre_review_token_info: None,
         needs_final_message_separator: false,
-        // Delegate-related defaults for tests
-        delegate_run: None,
-        delegate_runs_with_stream: std::collections::HashSet::new(),
-        delegate_status_owner: None,
-        delegate_previous_status_header: None,
-        delegate_context: None,
-        delegate_user_frames: Vec::new(),
-        delegate_agent_frames: Vec::new(),
-        pending_delegate_context: Vec::new(),
         last_rendered_width: std::cell::Cell::new(None),
         feedback: codex_feedback::CodexFeedback::new(),
         current_rollout_path: None,
-        next_generated_image_index: 0,
-        last_generated_image_path: None,
-        ref_images: RefImageManager::new(),
     };
     (widget, rx, op_rx)
 }
@@ -664,10 +619,9 @@ fn rate_limit_snapshot_updates_and_retains_plan_type() {
 
 #[test]
 fn rate_limit_switch_prompt_skips_when_on_lower_cost_model() {
-    let (mut chat, _, _) = make_chatwidget_manual(None);
+    let (mut chat, _, _) = make_chatwidget_manual(Some(NUDGE_MODEL_SLUG));
     chat.auth_manager =
         AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
-    chat.config.model = NUDGE_MODEL_SLUG.to_string();
 
     chat.on_rate_limit_snapshot(Some(snapshot(95.0)));
 
@@ -680,8 +634,7 @@ fn rate_limit_switch_prompt_skips_when_on_lower_cost_model() {
 #[test]
 fn rate_limit_switch_prompt_shows_once_per_session() {
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
-    let (mut chat, _, _) = make_chatwidget_manual(None);
-    chat.config.model = "gpt-5".to_string();
+    let (mut chat, _, _) = make_chatwidget_manual(Some("gpt-5"));
     chat.auth_manager = AuthManager::from_auth_for_testing(auth);
 
     chat.on_rate_limit_snapshot(Some(snapshot(90.0)));
@@ -705,8 +658,7 @@ fn rate_limit_switch_prompt_shows_once_per_session() {
 #[test]
 fn rate_limit_switch_prompt_respects_hidden_notice() {
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
-    let (mut chat, _, _) = make_chatwidget_manual(None);
-    chat.config.model = "gpt-5".to_string();
+    let (mut chat, _, _) = make_chatwidget_manual(Some("gpt-5"));
     chat.auth_manager = AuthManager::from_auth_for_testing(auth);
     chat.config.notices.hide_rate_limit_model_nudge = Some(true);
 
@@ -721,8 +673,7 @@ fn rate_limit_switch_prompt_respects_hidden_notice() {
 #[test]
 fn rate_limit_switch_prompt_defers_until_task_complete() {
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
-    let (mut chat, _, _) = make_chatwidget_manual(None);
-    chat.config.model = "gpt-5".to_string();
+    let (mut chat, _, _) = make_chatwidget_manual(Some("gpt-5"));
     chat.auth_manager = AuthManager::from_auth_for_testing(auth);
 
     chat.bottom_pane.set_task_running(true);
@@ -742,10 +693,9 @@ fn rate_limit_switch_prompt_defers_until_task_complete() {
 
 #[test]
 fn rate_limit_switch_prompt_popup_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None);
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5"));
     chat.auth_manager =
         AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
-    chat.config.model = "gpt-5".to_string();
 
     chat.on_rate_limit_snapshot(Some(snapshot(92.0)));
     chat.maybe_show_pending_rate_limit_prompt();
@@ -769,7 +719,6 @@ fn exec_approval_emits_proposed_command_and_decision_history() {
         reason: Some(
             "this is a test reason such as one that would be produced by the model".into(),
         ),
-        risk: None,
         proposed_execpolicy_amendment: None,
         parsed_cmd: vec![],
     };
@@ -814,7 +763,6 @@ fn exec_approval_decision_truncates_multiline_and_long_commands() {
         reason: Some(
             "this is a test reason such as one that would be produced by the model".into(),
         ),
-        risk: None,
         proposed_execpolicy_amendment: None,
         parsed_cmd: vec![],
     };
@@ -865,7 +813,6 @@ fn exec_approval_decision_truncates_multiline_and_long_commands() {
         command: vec!["bash".into(), "-lc".into(), long],
         cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         reason: None,
-        risk: None,
         proposed_execpolicy_amendment: None,
         parsed_cmd: vec![],
     };
@@ -1190,6 +1137,49 @@ fn exec_history_cell_shows_working_then_failed() {
 }
 
 #[test]
+fn exec_end_without_begin_uses_event_command() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None);
+    let command = vec![
+        "bash".to_string(),
+        "-lc".to_string(),
+        "echo orphaned".to_string(),
+    ];
+    let parsed_cmd = codex_core::parse_command::parse_command(&command);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    chat.handle_codex_event(Event {
+        id: "call-orphan".to_string(),
+        msg: EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+            call_id: "call-orphan".to_string(),
+            process_id: None,
+            turn_id: "turn-1".to_string(),
+            command,
+            cwd,
+            parsed_cmd,
+            source: ExecCommandSource::Agent,
+            interaction_input: None,
+            stdout: "done".to_string(),
+            stderr: String::new(),
+            aggregated_output: "done".to_string(),
+            exit_code: 0,
+            duration: std::time::Duration::from_millis(5),
+            formatted_output: "done".to_string(),
+        }),
+    });
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected finalized exec cell to flush");
+    let blob = lines_to_single_string(&cells[0]);
+    assert!(
+        blob.contains("• Ran echo orphaned"),
+        "expected command text to come from event: {blob:?}"
+    );
+    assert!(
+        !blob.contains("call-orphan"),
+        "call id should not be rendered when event has the command: {blob:?}"
+    );
+}
+
+#[test]
 fn exec_history_shows_unified_exec_startup_commands() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None);
 
@@ -1250,7 +1240,7 @@ fn slash_init_skips_when_project_doc_exists() {
     std::fs::write(&existing_path, "existing instructions").unwrap();
     chat.config.cwd = tempdir.path().to_path_buf();
 
-    chat.dispatch_command(SlashCommand::Init, None);
+    chat.dispatch_command(SlashCommand::Init);
 
     match op_rx.try_recv() {
         Err(TryRecvError::Empty) => {}
@@ -1278,7 +1268,7 @@ fn slash_init_skips_when_project_doc_exists() {
 fn slash_quit_requests_exit() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None);
 
-    chat.dispatch_command(SlashCommand::Quit, None);
+    chat.dispatch_command(SlashCommand::Quit);
 
     assert_matches!(rx.try_recv(), Ok(AppEvent::ExitRequest));
 }
@@ -1287,7 +1277,7 @@ fn slash_quit_requests_exit() {
 fn slash_exit_requests_exit() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None);
 
-    chat.dispatch_command(SlashCommand::Exit, None);
+    chat.dispatch_command(SlashCommand::Exit);
 
     assert_matches!(rx.try_recv(), Ok(AppEvent::ExitRequest));
 }
@@ -1296,7 +1286,7 @@ fn slash_exit_requests_exit() {
 fn slash_resume_opens_picker() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None);
 
-    chat.dispatch_command(SlashCommand::Resume, None);
+    chat.dispatch_command(SlashCommand::Resume);
 
     assert_matches!(rx.try_recv(), Ok(AppEvent::OpenResumePicker));
 }
@@ -1305,7 +1295,7 @@ fn slash_resume_opens_picker() {
 fn slash_undo_sends_op() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None);
 
-    chat.dispatch_command(SlashCommand::Undo, None);
+    chat.dispatch_command(SlashCommand::Undo);
 
     match rx.try_recv() {
         Ok(AppEvent::CodexOp(Op::Undo)) => {}
@@ -1319,7 +1309,7 @@ fn slash_rollout_displays_current_path() {
     let rollout_path = PathBuf::from("/tmp/codex-test-rollout.jsonl");
     chat.current_rollout_path = Some(rollout_path.clone());
 
-    chat.dispatch_command(SlashCommand::Rollout, None);
+    chat.dispatch_command(SlashCommand::Rollout);
 
     let cells = drain_insert_history(&mut rx);
     assert_eq!(cells.len(), 1, "expected info message for rollout path");
@@ -1334,7 +1324,7 @@ fn slash_rollout_displays_current_path() {
 fn slash_rollout_handles_missing_path() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None);
 
-    chat.dispatch_command(SlashCommand::Rollout, None);
+    chat.dispatch_command(SlashCommand::Rollout);
 
     let cells = drain_insert_history(&mut rx);
     assert_eq!(
@@ -1384,42 +1374,6 @@ fn undo_success_events_render_info_messages() {
         completed.contains("Undo completed successfully."),
         "expected default success message, got {completed:?}"
     );
-}
-
-#[test]
-fn ref_image_set_with_prompt_sends_set_reference_images_before_user_input() {
-    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None);
-
-    // Execute `/ref-image foo.png -- tweak the style`.
-    chat.handle_ref_image_command(Some("foo.png -- tweak the style".to_string()));
-
-    // First Op should set the reference images for the session.
-    let first = op_rx
-        .try_recv()
-        .expect("expected first op for /ref-image command");
-    match first {
-        Op::SetReferenceImages { paths } => {
-            assert_eq!(paths.len(), 1, "expected one reference image path");
-        }
-        other => panic!("expected SetReferenceImages op first, got {other:?}"),
-    }
-
-    // Second Op should be the user prompt for this turn.
-    let second = op_rx
-        .try_recv()
-        .expect("expected second op (UserInput) for /ref-image prompt");
-    match second {
-        Op::UserInput { items } => {
-            assert_eq!(items.len(), 1, "expected a single user input item");
-            match &items[0] {
-                UserInput::Text { text } => {
-                    assert_eq!(text, "tweak the style");
-                }
-                other => panic!("expected text-only UserInput, got {other:?}"),
-            }
-        }
-        other => panic!("expected UserInput op second, got {other:?}"),
-    }
 }
 
 #[test]
@@ -1784,9 +1738,7 @@ fn render_bottom_popup(chat: &ChatWidget, width: u16) -> String {
 
 #[test]
 fn model_selection_popup_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None);
-
-    chat.config.model = "gpt-5-codex".to_string();
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex"));
     chat.open_model_popup();
 
     let popup = render_bottom_popup(&chat, 80);
@@ -1816,7 +1768,7 @@ fn preset_matching_ignores_extra_writable_roots() {
         .find(|p| p.id == "auto")
         .expect("auto preset exists");
     let current_sandbox = SandboxPolicy::WorkspaceWrite {
-        writable_roots: vec![PathBuf::from("C:\\extra")],
+        writable_roots: vec![AbsolutePathBuf::try_from("C:\\extra").unwrap()],
         network_access: false,
         exclude_tmpdir_env_var: false,
         exclude_slash_tmp: false,
@@ -1889,10 +1841,9 @@ fn startup_prompts_for_windows_sandbox_when_agent_requested() {
 
 #[test]
 fn model_reasoning_selection_popup_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None);
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.1-codex-max"));
 
     set_chatgpt_auth(&mut chat);
-    chat.config.model = "gpt-5.1-codex-max".to_string();
     chat.config.model_reasoning_effort = Some(ReasoningEffortConfig::High);
 
     let preset = get_available_model(&chat, "gpt-5.1-codex-max");
@@ -1904,10 +1855,9 @@ fn model_reasoning_selection_popup_snapshot() {
 
 #[test]
 fn model_reasoning_selection_popup_extra_high_warning_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None);
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.1-codex-max"));
 
     set_chatgpt_auth(&mut chat);
-    chat.config.model = "gpt-5.1-codex-max".to_string();
     chat.config.model_reasoning_effort = Some(ReasoningEffortConfig::XHigh);
 
     let preset = get_available_model(&chat, "gpt-5.1-codex-max");
@@ -1919,10 +1869,9 @@ fn model_reasoning_selection_popup_extra_high_warning_snapshot() {
 
 #[test]
 fn reasoning_popup_shows_extra_high_with_space() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None);
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.1-codex-max"));
 
     set_chatgpt_auth(&mut chat);
-    chat.config.model = "gpt-5.1-codex-max".to_string();
 
     let preset = get_available_model(&chat, "gpt-5.1-codex-max");
     chat.open_reasoning_popup(preset);
@@ -1983,7 +1932,7 @@ fn feedback_selection_popup_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None);
 
     // Open the feedback category selection popup via slash command.
-    chat.dispatch_command(SlashCommand::Feedback, None);
+    chat.dispatch_command(SlashCommand::Feedback);
 
     let popup = render_bottom_popup(&chat, 80);
     assert_snapshot!("feedback_selection_popup", popup);
@@ -2002,9 +1951,7 @@ fn feedback_upload_consent_popup_snapshot() {
 
 #[test]
 fn reasoning_popup_escape_returns_to_model_popup() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None);
-
-    chat.config.model = "gpt-5.1".to_string();
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.1"));
     chat.open_model_popup();
 
     let preset = get_available_model(&chat, "gpt-5.1-codex");
@@ -2080,7 +2027,7 @@ fn disabled_slash_command_while_task_running_snapshot() {
     chat.bottom_pane.set_task_running(true);
 
     // Dispatch a command that is unavailable while a task runs (e.g., /model)
-    chat.dispatch_command(SlashCommand::Model, None);
+    chat.dispatch_command(SlashCommand::Model);
 
     // Drain history and snapshot the rendered error line(s)
     let cells = drain_insert_history(&mut rx);
@@ -2112,7 +2059,6 @@ fn approval_modal_exec_snapshot() {
         reason: Some(
             "this is a test reason such as one that would be produced by the model".into(),
         ),
-        risk: None,
         proposed_execpolicy_amendment: Some(ExecPolicyAmendment::new(vec![
             "echo".into(),
             "hello".into(),
@@ -2164,7 +2110,6 @@ fn approval_modal_exec_without_reason_snapshot() {
         command: vec!["bash".into(), "-lc".into(), "echo hello world".into()],
         cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         reason: None,
-        risk: None,
         proposed_execpolicy_amendment: Some(ExecPolicyAmendment::new(vec![
             "echo".into(),
             "hello".into(),
@@ -2383,7 +2328,6 @@ fn status_widget_and_approval_modal_snapshot() {
         reason: Some(
             "this is a test reason such as one that would be produced by the model".into(),
         ),
-        risk: None,
         proposed_execpolicy_amendment: Some(ExecPolicyAmendment::new(vec![
             "echo".into(),
             "hello world".into(),
@@ -2434,6 +2378,28 @@ fn status_widget_active_snapshot() {
         .draw(|f| chat.render(f.area(), f.buffer_mut()))
         .expect("draw status widget");
     assert_snapshot!("status_widget_active", terminal.backend());
+}
+
+#[test]
+fn mcp_startup_header_booting_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None);
+    chat.show_welcome_banner = false;
+
+    chat.handle_codex_event(Event {
+        id: "mcp-1".into(),
+        msg: EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
+            server: "alpha".into(),
+            status: McpStartupStatus::Starting,
+        }),
+    });
+
+    let height = chat.desired_height(80);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, height))
+        .expect("create terminal");
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw chat widget");
+    assert_snapshot!("mcp_startup_header_booting", terminal.backend());
 }
 
 #[test]

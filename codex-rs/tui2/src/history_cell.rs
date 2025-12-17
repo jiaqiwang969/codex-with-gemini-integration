@@ -1664,8 +1664,8 @@ mod tests {
         assert_eq!(
             rendered,
             vec![
-                "✔ You approved codex".to_string(),
-                "  to run echo something".to_string(),
+                "✔ You approved codex to".to_string(),
+                "  run echo something".to_string(),
                 "  really long to ensure".to_string(),
                 "  wrapping happens this".to_string(),
                 "  time".to_string(),
@@ -2350,10 +2350,11 @@ mod tests {
     #[test]
     fn reasoning_summary_block_respects_config_overrides() {
         let mut config = test_config();
-        config.model = "gpt-3.5-turbo".to_string();
+        config.model = Some("gpt-3.5-turbo".to_string());
         config.model_supports_reasoning_summaries = Some(true);
         config.model_reasoning_summary_format = Some(ReasoningSummaryFormat::Experimental);
-        let model_family = ModelsManager::construct_model_family_offline(&config.model, &config);
+        let model_family =
+            ModelsManager::construct_model_family_offline(&config.model.clone().unwrap(), &config);
         assert_eq!(
             model_family.reasoning_summary_format,
             ReasoningSummaryFormat::Experimental

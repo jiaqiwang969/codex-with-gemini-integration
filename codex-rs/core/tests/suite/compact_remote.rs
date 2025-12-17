@@ -51,14 +51,18 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
     )
     .await;
 
-    let compacted_history = vec![ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![ContentItem::InputText {
-            text: "REMOTE_COMPACTED_SUMMARY".to_string(),
-        }],
-        thought_signature: None,
-    }];
+    let compacted_history = vec![
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "REMOTE_COMPACTED_SUMMARY".to_string(),
+            }],
+        },
+        ResponseItem::Compaction {
+            encrypted_content: "ENCRYPTED_COMPACTION_SUMMARY".to_string(),
+        },
+    ];
     let compact_mock = responses::mount_compact_json_once(
         harness.server(),
         serde_json::json!({ "output": compacted_history.clone() }),
@@ -122,6 +126,10 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
         "expected follow-up request to use compacted history"
     );
     assert!(
+        follow_up_body.contains("ENCRYPTED_COMPACTION_SUMMARY"),
+        "expected follow-up request to include compaction summary item"
+    );
+    assert!(
         !follow_up_body.contains("FIRST_REMOTE_REPLY"),
         "expected follow-up request to drop pre-compaction assistant messages"
     );
@@ -160,14 +168,18 @@ async fn remote_compact_runs_automatically() -> Result<()> {
     )
     .await;
 
-    let compacted_history = vec![ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![ContentItem::InputText {
-            text: "REMOTE_COMPACTED_SUMMARY".to_string(),
-        }],
-        thought_signature: None,
-    }];
+    let compacted_history = vec![
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "REMOTE_COMPACTED_SUMMARY".to_string(),
+            }],
+        },
+        ResponseItem::Compaction {
+            encrypted_content: "ENCRYPTED_COMPACTION_SUMMARY".to_string(),
+        },
+    ];
     let compact_mock = responses::mount_compact_json_once(
         harness.server(),
         serde_json::json!({ "output": compacted_history.clone() }),
@@ -192,6 +204,7 @@ async fn remote_compact_runs_automatically() -> Result<()> {
     assert_eq!(compact_mock.requests().len(), 1);
     let follow_up_body = responses_mock.single_request().body_json().to_string();
     assert!(follow_up_body.contains("REMOTE_COMPACTED_SUMMARY"));
+    assert!(follow_up_body.contains("ENCRYPTED_COMPACTION_SUMMARY"));
 
     Ok(())
 }
@@ -227,7 +240,9 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
             content: vec![ContentItem::InputText {
                 text: "COMPACTED_USER_SUMMARY".to_string(),
             }],
-            thought_signature: None,
+        },
+        ResponseItem::Compaction {
+            encrypted_content: "ENCRYPTED_COMPACTION_SUMMARY".to_string(),
         },
         ResponseItem::Message {
             id: None,
@@ -235,7 +250,6 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
             content: vec![ContentItem::OutputText {
                 text: "COMPACTED_ASSISTANT_NOTE".to_string(),
             }],
-            thought_signature: None,
         },
     ];
     let compact_mock = responses::mount_compact_json_once(

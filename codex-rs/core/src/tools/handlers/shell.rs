@@ -10,7 +10,6 @@ use crate::exec_policy::create_exec_approval_requirement_for_command;
 use crate::function_tool::FunctionCallError;
 use crate::is_safe_command::is_known_safe_command;
 use crate::protocol::ExecCommandSource;
-use crate::sandboxing::SandboxPermissions;
 use crate::shell::Shell;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
@@ -36,7 +35,7 @@ impl ShellHandler {
             cwd: turn_context.resolve_path(params.workdir.clone()),
             expiration: params.timeout_ms.into(),
             env: create_env(&turn_context.shell_environment_policy),
-            with_escalated_permissions: params.with_escalated_permissions,
+            sandbox_permissions: params.sandbox_permissions.unwrap_or_default(),
             justification: params.justification,
             arg0: None,
         }
@@ -62,7 +61,7 @@ impl ShellCommandHandler {
             cwd: turn_context.resolve_path(params.workdir.clone()),
             expiration: params.timeout_ms.into(),
             env: create_env(&turn_context.shell_environment_policy),
-            with_escalated_permissions: params.with_escalated_permissions,
+            sandbox_permissions: params.sandbox_permissions.unwrap_or_default(),
             justification: params.justification,
             arg0: None,
         }
@@ -212,7 +211,9 @@ impl ShellHandler {
         freeform: bool,
     ) -> Result<ToolOutput, FunctionCallError> {
         // Approval policy guard for explicit escalation in non-OnRequest modes.
-        if exec_params.with_escalated_permissions.unwrap_or(false)
+        if exec_params
+            .sandbox_permissions
+            .requires_escalated_permissions()
             && !matches!(
                 turn.approval_policy,
                 codex_protocol::protocol::AskForApproval::OnRequest
@@ -257,7 +258,7 @@ impl ShellHandler {
             &exec_params.command,
             turn.approval_policy,
             &turn.sandbox_policy,
-            SandboxPermissions::from(exec_params.with_escalated_permissions.unwrap_or(false)),
+            exec_params.sandbox_permissions,
         )
         .await;
 
@@ -266,7 +267,7 @@ impl ShellHandler {
             cwd: exec_params.cwd.clone(),
             timeout_ms: exec_params.expiration.timeout_ms(),
             env: exec_params.env.clone(),
-            with_escalated_permissions: exec_params.with_escalated_permissions,
+            sandbox_permissions: exec_params.sandbox_permissions,
             justification: exec_params.justification.clone(),
             exec_approval_requirement,
         };
@@ -302,6 +303,9 @@ mod tests {
     use crate::codex::make_session_and_context;
     use crate::exec_env::create_env;
     use crate::is_safe_command::is_known_safe_command;
+    use crate::powershell::try_find_powershell_executable_blocking;
+    use crate::powershell::try_find_pwsh_executable_blocking;
+    use crate::sandboxing::SandboxPermissions;
     use crate::shell::Shell;
     use crate::shell::ShellType;
     use crate::shell_snapshot::ShellSnapshot;
@@ -326,12 +330,23 @@ mod tests {
         };
         assert_safe(&zsh_shell, "ls -la");
 
-        let powershell = Shell {
-            shell_type: ShellType::PowerShell,
-            shell_path: PathBuf::from("pwsh.exe"),
-            shell_snapshot: None,
-        };
-        assert_safe(&powershell, "ls -Name");
+        if let Some(path) = try_find_powershell_executable_blocking() {
+            let powershell = Shell {
+                shell_type: ShellType::PowerShell,
+                shell_path: path.to_path_buf(),
+                shell_snapshot: None,
+            };
+            assert_safe(&powershell, "ls -Name");
+        }
+
+        if let Some(path) = try_find_pwsh_executable_blocking() {
+            let pwsh = Shell {
+                shell_type: ShellType::PowerShell,
+                shell_path: path.to_path_buf(),
+                shell_snapshot: None,
+            };
+            assert_safe(&pwsh, "ls -Name");
+        }
     }
 
     fn assert_safe(shell: &Shell, command: &str) {
@@ -351,7 +366,7 @@ mod tests {
         let workdir = Some("subdir".to_string());
         let login = None;
         let timeout_ms = Some(1234);
-        let with_escalated_permissions = Some(true);
+        let sandbox_permissions = SandboxPermissions::RequireEscalated;
         let justification = Some("because tests".to_string());
 
         let expected_command = session.user_shell().derive_exec_args(&command, true);
@@ -363,7 +378,7 @@ mod tests {
             workdir,
             login,
             timeout_ms,
-            with_escalated_permissions,
+            sandbox_permissions: Some(sandbox_permissions),
             justification: justification.clone(),
         };
 
@@ -374,10 +389,7 @@ mod tests {
         assert_eq!(exec_params.cwd, expected_cwd);
         assert_eq!(exec_params.env, expected_env);
         assert_eq!(exec_params.expiration.timeout_ms(), timeout_ms);
-        assert_eq!(
-            exec_params.with_escalated_permissions,
-            with_escalated_permissions
-        );
+        assert_eq!(exec_params.sandbox_permissions, sandbox_permissions);
         assert_eq!(exec_params.justification, justification);
         assert_eq!(exec_params.arg0, None);
     }
