@@ -1,3 +1,4 @@
+use codex_core::config::Constrained;
 use codex_core::features::Feature;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
@@ -958,7 +959,7 @@ async fn handle_container_exec_autoapprove_from_config_records_tool_decision() {
 
     let TestCodex { codex, .. } = test_codex()
         .with_config(|config| {
-            config.approval_policy = AskForApproval::OnRequest;
+            config.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
             config.sandbox_policy = SandboxPolicy::DangerFullAccess;
         })
         .build(&server)
@@ -1007,7 +1008,7 @@ async fn handle_container_exec_user_approved_records_tool_decision() {
 
     let TestCodex { codex, .. } = test_codex()
         .with_config(|config| {
-            config.approval_policy = AskForApproval::UnlessTrusted;
+            config.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
         })
         .build(&server)
         .await
@@ -1065,7 +1066,7 @@ async fn handle_container_exec_user_approved_for_session_records_tool_decision()
 
     let TestCodex { codex, .. } = test_codex()
         .with_config(|config| {
-            config.approval_policy = AskForApproval::UnlessTrusted;
+            config.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
         })
         .build(&server)
         .await
@@ -1123,7 +1124,7 @@ async fn handle_sandbox_error_user_approves_retry_records_tool_decision() {
 
     let TestCodex { codex, .. } = test_codex()
         .with_config(|config| {
-            config.approval_policy = AskForApproval::UnlessTrusted;
+            config.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
         })
         .build(&server)
         .await
@@ -1181,7 +1182,7 @@ async fn handle_container_exec_user_denies_records_tool_decision() {
     .await;
     let TestCodex { codex, .. } = test_codex()
         .with_config(|config| {
-            config.approval_policy = AskForApproval::UnlessTrusted;
+            config.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
         })
         .build(&server)
         .await
@@ -1239,7 +1240,7 @@ async fn handle_sandbox_error_user_approves_for_session_records_tool_decision() 
 
     let TestCodex { codex, .. } = test_codex()
         .with_config(|config| {
-            config.approval_policy = AskForApproval::UnlessTrusted;
+            config.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
         })
         .build(&server)
         .await
@@ -1298,7 +1299,7 @@ async fn handle_sandbox_error_user_denies_records_tool_decision() {
 
     let TestCodex { codex, .. } = test_codex()
         .with_config(|config| {
-            config.approval_policy = AskForApproval::UnlessTrusted;
+            config.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
         })
         .build(&server)
         .await

@@ -169,7 +169,9 @@ mod tests {
     #[test]
     fn test_get_codex_user_agent() {
         let user_agent = get_codex_user_agent();
-        assert!(user_agent.starts_with("codex_cli_rs/"));
+        let originator = originator().value.as_str();
+        let prefix = format!("{originator}/");
+        assert!(user_agent.starts_with(&prefix));
     }
 
     #[tokio::test]
@@ -210,7 +212,7 @@ mod tests {
         let originator_header = headers
             .get("originator")
             .expect("originator header missing");
-        assert_eq!(originator_header.to_str().unwrap(), "codex_cli_rs");
+        assert_eq!(originator_header.to_str().unwrap(), originator().value);
 
         // User-Agent matches the computed Codex UA for that originator
         let expected_ua = get_codex_user_agent();
@@ -247,10 +249,10 @@ mod tests {
     fn test_macos() {
         use regex_lite::Regex;
         let user_agent = get_codex_user_agent();
-        // Allow pre-release suffixes in version (e.g., 0.58.0-alpha.9)
-        let re = Regex::new(
-            r"^codex_cli_rs/\d+\.\d+\.\d+(?:-[^\s]+)? \(Mac OS \d+\.\d+\.\d+; (x86_64|arm64)\) (\S+)$",
-        )
+        let originator = regex_lite::escape(originator().value.as_str());
+        let re = Regex::new(&format!(
+            r"^{originator}/\d+\.\d+\.\d+(?:-[^\s]+)? \(Mac OS \d+\.\d+\.\d+; (x86_64|arm64)\) (\S+)$"
+        ))
         .unwrap();
         assert!(re.is_match(&user_agent));
     }
