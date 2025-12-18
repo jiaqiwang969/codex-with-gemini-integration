@@ -1946,6 +1946,7 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
             content: vec![codex_protocol::models::ContentItem::OutputText {
                 text: "REMOTE_COMPACT_SUMMARY".to_string(),
             }],
+            thought_signature: None,
         },
         codex_protocol::models::ResponseItem::Compaction {
             encrypted_content: "ENCRYPTED_COMPACTION_SUMMARY".to_string(),

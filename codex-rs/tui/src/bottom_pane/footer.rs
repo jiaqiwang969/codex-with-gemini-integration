@@ -14,7 +14,7 @@ use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct FooterProps {
     pub(crate) mode: FooterMode,
     pub(crate) esc_backtrack_hint: bool,
@@ -22,7 +22,6 @@ pub(crate) struct FooterProps {
     pub(crate) is_task_running: bool,
     pub(crate) context_window_percent: Option<i64>,
     pub(crate) context_window_used_tokens: Option<i64>,
-    pub(crate) delegate_label: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,11 +62,11 @@ pub(crate) fn reset_mode_after_activity(current: FooterMode) -> FooterMode {
     }
 }
 
-pub(crate) fn footer_height(props: &FooterProps) -> u16 {
+pub(crate) fn footer_height(props: FooterProps) -> u16 {
     footer_lines(props).len() as u16
 }
 
-pub(crate) fn render_footer(area: Rect, buf: &mut Buffer, props: &FooterProps) {
+pub(crate) fn render_footer(area: Rect, buf: &mut Buffer, props: FooterProps) {
     Paragraph::new(prefix_lines(
         footer_lines(props),
         " ".repeat(FOOTER_INDENT_COLS).into(),
@@ -76,7 +75,7 @@ pub(crate) fn render_footer(area: Rect, buf: &mut Buffer, props: &FooterProps) {
     .render(area, buf);
 }
 
-fn footer_lines(props: &FooterProps) -> Vec<Line<'static>> {
+fn footer_lines(props: FooterProps) -> Vec<Line<'static>> {
     // Show the context indicator on the left, appended after the primary hint
     // (e.g., "? for shortcuts"). Keep it visible even when typing (i.e., when
     // the shortcut hint is hidden). Hide it only for the multi-line
@@ -90,14 +89,6 @@ fn footer_lines(props: &FooterProps) -> Vec<Line<'static>> {
                 props.context_window_percent,
                 props.context_window_used_tokens,
             );
-            if let Some(label) = props.delegate_label.as_ref() {
-                let mut spans: Vec<Span<'static>> =
-                    Vec::with_capacity(line.spans.len().saturating_add(3));
-                spans.push(format!("In {label}").cyan());
-                spans.push(" · ".dim());
-                spans.extend(line.spans);
-                line = Line::from(spans);
-            }
             line.push_span(" · ".dim());
             line.extend(vec![
                 key_hint::plain(KeyCode::Char('?')).into(),
@@ -119,21 +110,10 @@ fn footer_lines(props: &FooterProps) -> Vec<Line<'static>> {
             shortcut_overlay_lines(state)
         }
         FooterMode::EscHint => vec![esc_hint_line(props.esc_backtrack_hint)],
-        FooterMode::ContextOnly => {
-            let mut line = context_window_line(
-                props.context_window_percent,
-                props.context_window_used_tokens,
-            );
-            if let Some(label) = props.delegate_label.as_ref() {
-                let mut spans: Vec<Span<'static>> =
-                    Vec::with_capacity(line.spans.len().saturating_add(3));
-                spans.push(format!("In {label}").cyan());
-                spans.push(" · ".dim());
-                spans.extend(line.spans);
-                line = Line::from(spans);
-            }
-            vec![line]
-        }
+        FooterMode::ContextOnly => vec![context_window_line(
+            props.context_window_percent,
+            props.context_window_used_tokens,
+        )],
     }
 }
 
@@ -438,12 +418,12 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     fn snapshot_footer(name: &str, props: FooterProps) {
-        let height = footer_height(&props).max(1);
+        let height = footer_height(props).max(1);
         let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
         terminal
             .draw(|f| {
                 let area = Rect::new(0, 0, f.area().width, height);
-                render_footer(area, f.buffer_mut(), &props);
+                render_footer(area, f.buffer_mut(), props);
             })
             .unwrap();
         assert_snapshot!(name, terminal.backend());
@@ -460,7 +440,6 @@ mod tests {
                 is_task_running: false,
                 context_window_percent: None,
                 context_window_used_tokens: None,
-                delegate_label: None,
             },
         );
 
@@ -473,7 +452,6 @@ mod tests {
                 is_task_running: false,
                 context_window_percent: None,
                 context_window_used_tokens: None,
-                delegate_label: None,
             },
         );
 
@@ -486,7 +464,6 @@ mod tests {
                 is_task_running: false,
                 context_window_percent: None,
                 context_window_used_tokens: None,
-                delegate_label: None,
             },
         );
 
@@ -499,7 +476,6 @@ mod tests {
                 is_task_running: true,
                 context_window_percent: None,
                 context_window_used_tokens: None,
-                delegate_label: None,
             },
         );
 
@@ -512,7 +488,6 @@ mod tests {
                 is_task_running: false,
                 context_window_percent: None,
                 context_window_used_tokens: None,
-                delegate_label: None,
             },
         );
 
@@ -525,7 +500,6 @@ mod tests {
                 is_task_running: false,
                 context_window_percent: None,
                 context_window_used_tokens: None,
-                delegate_label: None,
             },
         );
 
@@ -538,7 +512,6 @@ mod tests {
                 is_task_running: true,
                 context_window_percent: Some(72),
                 context_window_used_tokens: None,
-                delegate_label: None,
             },
         );
 
@@ -551,20 +524,6 @@ mod tests {
                 is_task_running: false,
                 context_window_percent: None,
                 context_window_used_tokens: Some(123_456),
-                delegate_label: None,
-            },
-        );
-
-        snapshot_footer(
-            "footer_shortcuts_delegate",
-            FooterProps {
-                mode: FooterMode::ShortcutSummary,
-                esc_backtrack_hint: false,
-                use_shift_enter_hint: false,
-                is_task_running: false,
-                context_window_percent: Some(85),
-                context_window_used_tokens: None,
-                delegate_label: Some("#critic".to_string()),
             },
         );
     }

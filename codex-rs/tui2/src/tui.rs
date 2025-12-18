@@ -326,6 +326,7 @@ impl Tui {
         if let Some(saved) = self.alt_saved_viewport.take() {
             self.terminal.set_viewport_area(saved);
         }
+        let _ = self.terminal.clear();
         self.alt_screen_active.store(false, Ordering::Relaxed);
         Ok(())
     }

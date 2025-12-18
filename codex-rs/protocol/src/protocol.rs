@@ -630,7 +630,6 @@ pub enum EventMsg {
 
     /// Notification that skill data may have been updated and clients may want to reload.
     SkillsUpdateAvailable,
-
     PlanUpdate(UpdatePlanArgs),
 
     TurnAborted(TurnAbortedEvent),
@@ -1730,22 +1729,9 @@ pub struct SkillsListEntry {
     pub errors: Vec<SkillErrorInfo>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
-pub struct SkillInfo {
-    pub name: String,
-    pub description: String,
-    pub path: PathBuf,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
-pub struct SkillErrorInfo {
-    pub path: PathBuf,
-    pub message: String,
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS, Default)]
 pub struct SkillLoadOutcomeInfo {
-    pub skills: Vec<SkillInfo>,
+    pub skills: Vec<SkillMetadata>,
     pub errors: Vec<SkillErrorInfo>,
 }
 

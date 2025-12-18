@@ -323,16 +323,9 @@ impl ModelClient {
             CodexErr::UnsupportedOperation("Gemini providers must define a base_url".to_string())
         })?;
 
-        let api_model = {
-            let mut api_model = self.config.model.as_str();
-            if let Some(stripped) = api_model.strip_suffix("-codex") {
-                api_model = stripped;
-            }
-            if let Some(stripped) = api_model.strip_suffix("-germini") {
-                api_model = stripped;
-            }
-            api_model
-        };
+        let model = self.get_model();
+        let api_model = model.strip_suffix("-codex").unwrap_or(&model);
+        let api_model = api_model.strip_suffix("-germini").unwrap_or(api_model);
 
         // Use streamGenerateContent endpoint with alt=sse for streaming
         let url = format!(
@@ -466,7 +459,7 @@ impl ModelClient {
             attempt += 1;
 
             let result = self
-                .otel_event_manager
+                .otel_manager
                 .log_request(attempt, || make_request_builder().json(&request).send())
                 .await;
 
@@ -1557,6 +1550,7 @@ struct GeminiThinkingConfig {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[allow(clippy::enum_variant_names)]
 enum GeminiHarmCategory {
     HarmCategoryHarassment,
     HarmCategoryHateSpeech,
@@ -1566,7 +1560,7 @@ enum GeminiHarmCategory {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-#[allow(dead_code)]
+#[allow(dead_code, clippy::enum_variant_names)]
 enum GeminiHarmBlockThreshold {
     BlockNone,
     BlockOnlyHigh,
@@ -1719,6 +1713,7 @@ impl From<GeminiUsageMetadata> for TokenUsage {
             total_tokens: total,
         }
     }
+}
 
 fn beta_feature_headers(config: &Config) -> ApiHeaderMap {
     let enabled = FEATURES

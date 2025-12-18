@@ -22,6 +22,7 @@ use codex_core::config::ConfigToml;
 use codex_core::config::find_codex_home;
 use codex_core::config_loader;
 use codex_core::delegate_tool::DelegateToolAdapter;
+use codex_utils_absolute_path::AbsolutePathBufGuard;
 use serde::Deserialize;
 use serde::Serialize;
 use toml::Value as TomlValue;
@@ -286,9 +287,13 @@ impl AgentConfigLoader {
             .map_err(|err: String| anyhow::anyhow!(err))
             .context("Failed to apply CLI config overrides")?;
 
-        let config_toml: ConfigToml = merged_value.clone().try_into().map_err(|err| {
-            anyhow::anyhow!(err).context("Failed to deserialize merged config into ConfigToml")
-        })?;
+        let config_toml: ConfigToml = {
+            let _guard = AbsolutePathBufGuard::new(&agent_codex_home);
+            merged_value
+                .clone()
+                .try_into()
+                .context("Failed to deserialize merged config into ConfigToml")?
+        };
 
         let config = Config::load_from_base_config_with_overrides(
             config_toml.clone(),
@@ -401,7 +406,11 @@ mod tests {
 
         assert!(context.agent_id().is_none());
         assert_eq!(context.codex_home(), global.as_path());
-        assert_eq!(context.config().model, "o2", "CLI override should win");
+        assert_eq!(
+            context.config().model.as_deref(),
+            Some("o2"),
+            "CLI override should win"
+        );
         assert!(context.allowed_agents().is_empty());
 
         let agent_id = AgentId::parse("rust_test_writer").expect("parse");

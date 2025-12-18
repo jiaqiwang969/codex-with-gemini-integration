@@ -39,6 +39,7 @@ pub mod popup_consts;
 mod queued_user_messages;
 mod scroll_state;
 mod selection_popup_common;
+mod session_alias_input;
 mod textarea;
 pub(crate) use feedback_view::FeedbackNoteView;
 
@@ -414,6 +415,10 @@ impl BottomPane {
         self.composer.is_empty()
     }
 
+    pub(crate) fn has_active_view(&self) -> bool {
+        !self.view_stack.is_empty()
+    }
+
     pub(crate) fn is_task_running(&self) -> bool {
         self.is_task_running
     }
@@ -427,6 +432,16 @@ impl BottomPane {
 
     pub(crate) fn show_view(&mut self, view: Box<dyn BottomPaneView>) {
         self.push_view(view);
+    }
+
+    pub(crate) fn show_session_alias_input(
+        &mut self,
+        codex_home: PathBuf,
+        session_id: String,
+        on_submit: session_alias_input::AliasSubmitted,
+    ) {
+        let view = session_alias_input::SessionAliasInput::new(codex_home, session_id, on_submit);
+        self.push_view(Box::new(view));
     }
 
     /// Called when the agent requests user approval.

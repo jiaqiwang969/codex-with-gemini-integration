@@ -50,6 +50,10 @@ pub struct Cli {
     #[arg(long = "profile", short = 'p')]
     pub config_profile: Option<String>,
 
+    /// Load configuration from `~/.codex/agents/<AGENT_ID>` in addition to the global config.
+    #[arg(long = "agent")]
+    pub agent: Option<String>,
+
     /// Select the sandbox policy to use when executing model-generated shell
     /// commands.
     #[arg(long = "sandbox", short = 's')]
@@ -102,6 +106,7 @@ impl From<codex_tui::Cli> for Cli {
             oss: cli.oss,
             oss_provider: cli.oss_provider,
             config_profile: cli.config_profile,
+            agent: cli.agent,
             sandbox_mode: cli.sandbox_mode,
             approval_policy: cli.approval_policy,
             full_auto: cli.full_auto,

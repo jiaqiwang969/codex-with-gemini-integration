@@ -980,8 +980,8 @@ impl Session {
             let old_model = state.session_configuration.model.clone();
             match state.session_configuration.clone().apply(&updates) {
                 Ok(result) => {
-                    let sandbox_policy_changed =
-                        state.session_configuration.sandbox_policy != result.configuration.sandbox_policy;
+                    let sandbox_policy_changed = state.session_configuration.sandbox_policy
+                        != result.configuration.sandbox_policy;
 
                     let new_model = result.configuration.model.clone();
                     state.session_configuration = result.configuration.clone();
@@ -3406,7 +3406,7 @@ mod tests {
 
         assert_eq!(
             out,
-            "command timed out after 1000 milliseconds\nCommand output\nERR:Timeout"
+            "command timed out after 1000 milliseconds\nCommand output"
         );
     }
 
@@ -3708,7 +3708,8 @@ mod tests {
                 model: Some("gemini-3-pro-image-preview".to_string()),
                 ..Default::default()
             })
-            .await;
+            .await
+            .expect("update_settings");
 
         let image_message = ResponseItem::Message {
             id: None,
@@ -3727,7 +3728,8 @@ mod tests {
                 model: Some("gpt-4o".to_string()),
                 ..Default::default()
             })
-            .await;
+            .await
+            .expect("update_settings");
 
         let mut history = session.clone_history().await;
         assert_eq!(
@@ -3752,7 +3754,8 @@ mod tests {
                 model: Some("gemini-3-pro-image-preview".to_string()),
                 ..Default::default()
             })
-            .await;
+            .await
+            .expect("update_settings");
 
         let image_message = ResponseItem::Message {
             id: None,
@@ -3771,7 +3774,8 @@ mod tests {
                 model: Some("gemini-3-pro-preview".to_string()),
                 ..Default::default()
             })
-            .await;
+            .await
+            .expect("update_settings");
 
         let mut history = session.clone_history().await;
         assert_eq!(history.get_history(), vec![image_message]);

@@ -80,3 +80,8 @@ pub async fn load_config_layers_state(
         }),
     })
 }
+
+pub async fn load_config_as_toml(codex_home: &Path) -> io::Result<TomlValue> {
+    let layers = load_config_layers_state(codex_home, &[], LoaderOverrides::default()).await?;
+    Ok(layers.effective_config())
+}

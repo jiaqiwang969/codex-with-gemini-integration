@@ -1,7 +1,10 @@
 use std::io::Result;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
+use crate::cxresume_picker_widget::SessionPickerOutcome;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::UserHistoryCell;
 use crate::key_hint;
@@ -29,10 +32,41 @@ use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
 use ratatui::widgets::WidgetRef;
 use ratatui::widgets::Wrap;
+use tokio::sync::mpsc;
+use unicode_width::UnicodeWidthStr;
+
+type GitGraphRefreshCallback =
+    Arc<dyn Fn() -> std::result::Result<Vec<Line<'static>>, String> + Send + Sync>;
 
 pub(crate) enum Overlay {
     Transcript(TranscriptOverlay),
     Static(StaticOverlay),
+    SessionPicker(Box<SessionPickerOverlay>),
+    GitGraph(GitGraphOverlay),
+}
+
+/// Session picker overlay integrating PickerState for interactive navigation.
+pub(crate) struct SessionPickerOverlay {
+    picker_state: crate::cxresume_picker_widget::PickerState,
+    codex_home: PathBuf,
+    cwd: PathBuf,
+    is_done: bool,
+    outcome: Option<SessionPickerOutcome>,
+}
+
+pub(crate) struct GitGraphOverlay {
+    title: String,
+    lines: Vec<Line<'static>>,
+    is_done: bool,
+    scroll_y: usize,
+    scroll_x: usize,
+    last_content_height: Option<usize>,
+    refresh_callback: Option<GitGraphRefreshCallback>,
+    refresh_cooldown: Duration,
+    last_refresh_time: Option<Instant>,
+    refresh_in_flight: bool,
+    refresh_rx: Option<mpsc::UnboundedReceiver<std::result::Result<Vec<Line<'static>>, String>>>,
+    status_message: Option<(String, Instant)>,
 }
 
 impl Overlay {
@@ -55,6 +89,8 @@ impl Overlay {
         match self {
             Overlay::Transcript(o) => o.handle_event(tui, event),
             Overlay::Static(o) => o.handle_event(tui, event),
+            Overlay::SessionPicker(o) => o.handle_event(tui, event),
+            Overlay::GitGraph(o) => o.handle_event(tui, event),
         }
     }
 
@@ -62,6 +98,24 @@ impl Overlay {
         match self {
             Overlay::Transcript(o) => o.is_done(),
             Overlay::Static(o) => o.is_done(),
+            Overlay::SessionPicker(o) => o.is_done(),
+            Overlay::GitGraph(o) => o.is_done(),
+        }
+    }
+
+    pub(crate) fn session_picker_outcome(&self) -> Option<SessionPickerOutcome> {
+        match self {
+            Overlay::SessionPicker(o) => o.outcome(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn session_picker_state(
+        &self,
+    ) -> Option<crate::cxresume_picker_widget::PickerState> {
+        match self {
+            Overlay::SessionPicker(o) => Some(o.picker_state.clone()),
+            _ => None,
         }
     }
 }
@@ -85,6 +139,11 @@ const KEY_ESC: KeyBinding = key_hint::plain(KeyCode::Esc);
 const KEY_ENTER: KeyBinding = key_hint::plain(KeyCode::Enter);
 const KEY_CTRL_T: KeyBinding = key_hint::ctrl(KeyCode::Char('t'));
 const KEY_CTRL_C: KeyBinding = key_hint::ctrl(KeyCode::Char('c'));
+const KEY_LEFT: KeyBinding = key_hint::plain(KeyCode::Left);
+const KEY_RIGHT: KeyBinding = key_hint::plain(KeyCode::Right);
+const KEY_H: KeyBinding = key_hint::plain(KeyCode::Char('h'));
+const KEY_L: KeyBinding = key_hint::plain(KeyCode::Char('l'));
+const KEY_R: KeyBinding = key_hint::plain(KeyCode::Char('r'));
 
 // Common pager navigation hints rendered on the first line
 const PAGER_KEY_HINTS: &[(&[KeyBinding], &str)] = &[
@@ -112,6 +171,450 @@ fn render_key_hints(area: Rect, buf: &mut Buffer, pairs: &[(&[KeyBinding], &str)
         first = false;
     }
     Paragraph::new(vec![Line::from(spans).dim()]).render_ref(area, buf);
+}
+
+impl SessionPickerOverlay {
+    pub(crate) fn from_state(
+        codex_home: PathBuf,
+        cwd: PathBuf,
+        mut state: crate::cxresume_picker_widget::PickerState,
+    ) -> Self {
+        state.reload_aliases(codex_home.as_path());
+        Self {
+            picker_state: state,
+            codex_home,
+            cwd,
+            is_done: false,
+            outcome: None,
+        }
+    }
+
+    pub(crate) fn refresh_sessions(
+        &mut self,
+        codex_home: &std::path::Path,
+        cwd: &std::path::Path,
+    ) -> std::result::Result<(), String> {
+        self.codex_home = codex_home.to_path_buf();
+        self.cwd = cwd.to_path_buf();
+        let state = crate::cxresume_picker_widget::load_picker_state(codex_home, cwd)?;
+        self.replace_state(state);
+        Ok(())
+    }
+
+    pub(crate) fn handle_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()> {
+        match event {
+            TuiEvent::Key(key_event) => {
+                if let Some(picker_event) = self.picker_state.key_to_event(key_event.code) {
+                    if let Some(outcome) = self.picker_state.handle_event(picker_event) {
+                        if matches!(outcome, SessionPickerOutcome::Refresh) {
+                            let codex_home = self.codex_home.clone();
+                            let cwd = self.cwd.clone();
+                            if let Err(err) =
+                                self.refresh_sessions(codex_home.as_path(), cwd.as_path())
+                            {
+                                tracing::warn!("failed to refresh session picker: {err}");
+                            }
+                        } else {
+                            self.outcome = Some(outcome);
+                            self.is_done = true;
+                        }
+                    }
+                    tui.frame_requester().schedule_frame();
+                }
+                Ok(())
+            }
+            TuiEvent::Draw => {
+                tui.draw(u16::MAX, |frame| {
+                    crate::cxresume_picker_widget::render_picker_view(frame, &self.picker_state);
+                })?;
+                if self.picker_state.advance_animation() {
+                    tui.frame_requester().schedule_frame();
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub(crate) fn is_done(&self) -> bool {
+        self.is_done
+    }
+
+    pub(crate) fn outcome(&self) -> Option<SessionPickerOutcome> {
+        self.outcome.clone()
+    }
+
+    pub(crate) fn replace_state(&mut self, mut state: crate::cxresume_picker_widget::PickerState) {
+        self.picker_state.reload_aliases(self.codex_home.as_path());
+        self.picker_state
+            .reload_sessions(std::mem::take(&mut state.sessions));
+        self.is_done = false;
+        self.outcome = None;
+    }
+}
+
+impl GitGraphOverlay {
+    pub(crate) fn new_with_refresh(
+        lines: Vec<Line<'static>>,
+        title: String,
+        refresh_callback: GitGraphRefreshCallback,
+    ) -> Self {
+        Self {
+            title,
+            lines,
+            is_done: false,
+            scroll_y: 0,
+            scroll_x: 0,
+            last_content_height: None,
+            refresh_callback: Some(refresh_callback),
+            refresh_cooldown: Duration::from_millis(500),
+            last_refresh_time: None,
+            refresh_in_flight: false,
+            refresh_rx: None,
+            status_message: None,
+        }
+    }
+
+    fn can_refresh(&self) -> bool {
+        if self.refresh_in_flight || self.refresh_callback.is_none() {
+            return false;
+        }
+        self.last_refresh_time.is_none_or(|last_time| {
+            Instant::now().duration_since(last_time) >= self.refresh_cooldown
+        })
+    }
+
+    fn start_refresh(&mut self, frame_requester: crate::tui::FrameRequester) {
+        if !self.can_refresh() {
+            return;
+        }
+        let Some(callback) = self.refresh_callback.as_ref() else {
+            return;
+        };
+
+        self.last_refresh_time = Some(Instant::now());
+        self.refresh_in_flight = true;
+        self.status_message = Some(("Refreshing git graph…".to_string(), Instant::now()));
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.refresh_rx = Some(rx);
+
+        let callback = Arc::clone(callback);
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || (callback)()).await;
+            let outcome = match result {
+                Ok(outcome) => outcome,
+                Err(err) => Err(err.to_string()),
+            };
+            let _ = tx.send(outcome);
+            frame_requester.schedule_frame();
+        });
+    }
+
+    fn page_height(&self, viewport_area: Rect) -> usize {
+        self.last_content_height
+            .unwrap_or_else(|| self.content_area(viewport_area).height as usize)
+    }
+
+    fn content_area(&self, area: Rect) -> Rect {
+        let top_h = area.height.saturating_sub(3);
+        let top = Rect::new(area.x, area.y, area.width, top_h);
+        Rect::new(
+            top.x,
+            top.y.saturating_add(1),
+            top.width,
+            top.height.saturating_sub(2),
+        )
+    }
+
+    fn max_line_width(&self) -> usize {
+        self.lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                    .sum::<usize>()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn clamp_scroll(&mut self, content_area: Rect) {
+        let visible_h = content_area.height as usize;
+        let max_scroll_y = self.lines.len().saturating_sub(visible_h);
+        self.scroll_y = if self.scroll_y == usize::MAX {
+            max_scroll_y
+        } else {
+            self.scroll_y.min(max_scroll_y)
+        };
+
+        let visible_w = content_area.width as usize;
+        let max_scroll_x = self.max_line_width().saturating_sub(visible_w);
+        self.scroll_x = self.scroll_x.min(max_scroll_x);
+    }
+
+    fn render_header(&self, area: Rect, buf: &mut Buffer) {
+        Span::from("/ ".repeat(area.width as usize / 2))
+            .dim()
+            .render_ref(area, buf);
+        let header = format!("/ {}", self.title);
+        header.dim().render_ref(area, buf);
+    }
+
+    fn render_status_bar(&mut self, area: Rect, buf: &mut Buffer, content_area: Rect) {
+        if area.height == 0 {
+            return;
+        }
+
+        let now = Instant::now();
+        if let Some((_, created_at)) = self.status_message.as_ref()
+            && now.duration_since(*created_at) > Duration::from_secs(2)
+        {
+            self.status_message = None;
+        }
+
+        if area.width == 0 {
+            return;
+        }
+
+        let sep = "─".repeat(area.width as usize).dim();
+        sep.render_ref(area, buf);
+
+        let total = self.lines.len();
+        let visible = content_area.height as usize;
+        let max_scroll = total.saturating_sub(visible);
+        let percent = if max_scroll == 0 {
+            100u8
+        } else {
+            (((self.scroll_y.min(max_scroll)) as f32 / max_scroll as f32) * 100.0).round() as u8
+        };
+
+        let left = if total == 0 {
+            format!(" y:0/0  x:{} ", self.scroll_x)
+        } else {
+            format!(
+                " y:{}/{}  x:{} ",
+                self.scroll_y.saturating_add(1),
+                total,
+                self.scroll_x
+            )
+        };
+
+        let mut right = format!(" {percent}% ");
+        if self.refresh_in_flight {
+            right = format!("{right}refreshing");
+        } else if let Some((msg, _)) = &self.status_message {
+            right = format!("{right}{msg}");
+        }
+
+        let left_w = left.chars().count() as u16;
+        let right_w = right.chars().count() as u16;
+        let left_area = Rect::new(area.x, area.y, left_w.min(area.width), 1);
+        let right_x = area
+            .x
+            .saturating_add(area.width)
+            .saturating_sub(right_w.min(area.width));
+        let right_area = Rect::new(right_x, area.y, right_w.min(area.width), 1);
+        left.dim().render_ref(left_area, buf);
+        right.dim().render_ref(right_area, buf);
+    }
+
+    fn render_line_with_horizontal_scroll(
+        &self,
+        line: &Line<'static>,
+        area: Rect,
+        buf: &mut Buffer,
+    ) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        let temp_width = self
+            .scroll_x
+            .saturating_add(area.width as usize)
+            .min(u16::MAX as usize) as u16;
+        if temp_width == 0 {
+            return;
+        }
+        let mut temp_buf = Buffer::empty(Rect::new(0, 0, temp_width, 1));
+        line.render_ref(Rect::new(0, 0, temp_width, 1), &mut temp_buf);
+
+        for x in 0..area.width {
+            let src_x = self.scroll_x.saturating_add(x as usize);
+            if src_x < temp_width as usize {
+                buf[(area.x + x, area.y)] = temp_buf[(src_x as u16, 0)].clone();
+            } else {
+                buf[(area.x + x, area.y)] = Cell::from(' ');
+            }
+        }
+    }
+
+    fn render_content(&self, area: Rect, buf: &mut Buffer) {
+        let mut drawn_bottom = area.y;
+        for row in 0..area.height {
+            let idx = self.scroll_y.saturating_add(row as usize);
+            let row_area = Rect::new(area.x, area.y + row, area.width, 1);
+            if let Some(line) = self.lines.get(idx) {
+                self.render_line_with_horizontal_scroll(line, row_area, buf);
+                drawn_bottom = row_area.bottom();
+            } else {
+                break;
+            }
+        }
+
+        for y in drawn_bottom..area.bottom() {
+            if area.width == 0 {
+                break;
+            }
+            buf[(area.x, y)] = Cell::from('~');
+            for x in area.x + 1..area.right() {
+                buf[(x, y)] = Cell::from(' ');
+            }
+        }
+    }
+
+    fn render_hints(&self, area: Rect, buf: &mut Buffer) {
+        let line1 = Rect::new(area.x, area.y, area.width, 1);
+        let line2 = Rect::new(area.x, area.y.saturating_add(1), area.width, 1);
+        render_key_hints(
+            line1,
+            buf,
+            &[
+                (&[KEY_UP, KEY_DOWN], "to scroll"),
+                (&[KEY_LEFT, KEY_RIGHT], "to pan"),
+                (&[KEY_PAGE_UP, KEY_PAGE_DOWN], "to page"),
+            ],
+        );
+        let mut pairs: Vec<(&[KeyBinding], &str)> = vec![(&[KEY_Q, KEY_ESC], "to quit")];
+        if self.refresh_callback.is_some() {
+            pairs.insert(0, (&[KEY_R], "to refresh"));
+        }
+        render_key_hints(line2, buf, &pairs);
+    }
+
+    fn render(&mut self, area: Rect, buf: &mut Buffer) {
+        Clear.render(area, buf);
+
+        let top_h = area.height.saturating_sub(3);
+        let top = Rect::new(area.x, area.y, area.width, top_h);
+        let bottom = Rect::new(area.x, area.y + top_h, area.width, 3);
+
+        if top.height == 0 {
+            return;
+        }
+
+        let header = Rect::new(top.x, top.y, top.width, 1);
+        self.render_header(header, buf);
+
+        let status = Rect::new(top.x, top.bottom().saturating_sub(1), top.width, 1);
+        let content = Rect::new(
+            top.x,
+            top.y.saturating_add(1),
+            top.width,
+            top.height.saturating_sub(2),
+        );
+
+        self.last_content_height = Some(content.height as usize);
+        self.render_content(content, buf);
+        self.render_status_bar(status, buf, content);
+        self.render_hints(bottom, buf);
+    }
+
+    pub(crate) fn handle_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()> {
+        match event {
+            TuiEvent::Key(key_event) => {
+                if KEY_Q.is_press(key_event)
+                    || KEY_ESC.is_press(key_event)
+                    || KEY_CTRL_C.is_press(key_event)
+                {
+                    self.is_done = true;
+                    return Ok(());
+                }
+
+                let page_height = self.page_height(tui.terminal.viewport_area);
+                if KEY_UP.is_press(key_event) || KEY_K.is_press(key_event) {
+                    self.scroll_y = self.scroll_y.saturating_sub(1);
+                } else if KEY_DOWN.is_press(key_event) || KEY_J.is_press(key_event) {
+                    self.scroll_y = self.scroll_y.saturating_add(1);
+                } else if KEY_PAGE_UP.is_press(key_event) {
+                    self.scroll_y = self.scroll_y.saturating_sub(page_height);
+                } else if KEY_PAGE_DOWN.is_press(key_event) {
+                    self.scroll_y = self.scroll_y.saturating_add(page_height);
+                } else if KEY_HOME.is_press(key_event) {
+                    self.scroll_y = 0;
+                } else if KEY_END.is_press(key_event) {
+                    self.scroll_y = usize::MAX;
+                } else if KEY_LEFT.is_press(key_event) || KEY_H.is_press(key_event) {
+                    self.scroll_x = self.scroll_x.saturating_sub(4);
+                } else if KEY_RIGHT.is_press(key_event) || KEY_L.is_press(key_event) {
+                    self.scroll_x = self.scroll_x.saturating_add(4);
+                } else if KEY_R.is_press(key_event) {
+                    self.start_refresh(tui.frame_requester());
+                }
+
+                tui.frame_requester().schedule_frame();
+                Ok(())
+            }
+            TuiEvent::Mouse(mouse_event) => {
+                let step: usize = 3;
+                match mouse_event.kind {
+                    MouseEventKind::ScrollUp => {
+                        self.scroll_y = self.scroll_y.saturating_sub(step);
+                        tui.frame_requester().schedule_frame();
+                    }
+                    MouseEventKind::ScrollDown => {
+                        self.scroll_y = self.scroll_y.saturating_add(step);
+                        tui.frame_requester().schedule_frame();
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+            TuiEvent::Draw => {
+                if self.refresh_in_flight
+                    && let Some(rx) = self.refresh_rx.as_mut()
+                {
+                    match rx.try_recv() {
+                        Ok(result) => {
+                            self.refresh_in_flight = false;
+                            self.refresh_rx = None;
+                            match result {
+                                Ok(lines) => {
+                                    self.lines = lines;
+                                    self.status_message =
+                                        Some(("Refreshed".to_string(), Instant::now()));
+                                }
+                                Err(err) => {
+                                    self.status_message =
+                                        Some((format!("Refresh failed: {err}"), Instant::now()));
+                                }
+                            }
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => {}
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            self.refresh_in_flight = false;
+                            self.refresh_rx = None;
+                            self.status_message =
+                                Some(("Refresh cancelled".to_string(), Instant::now()));
+                        }
+                    }
+                }
+
+                tui.draw(u16::MAX, |frame| {
+                    let content_area = self.content_area(frame.area());
+                    self.clamp_scroll(content_area);
+                    self.render(frame.area(), frame.buffer);
+                })?;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub(crate) fn is_done(&self) -> bool {
+        self.is_done
+    }
 }
 
 /// Generic widget for rendering a pager view.

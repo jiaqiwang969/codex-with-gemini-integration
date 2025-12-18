@@ -25,7 +25,7 @@ pub(crate) fn spawn_agent(
     let app_event_tx_clone = app_event_tx;
     tokio::spawn(async move {
         let NewConversation {
-            conversation_id,
+            conversation_id: _,
             conversation,
             session_configured,
         } = match server.new_conversation(config).await {
@@ -50,10 +50,7 @@ pub(crate) fn spawn_agent(
             id: "".to_string(),
             msg: codex_core::protocol::EventMsg::SessionConfigured(session_configured),
         };
-        app_event_tx_clone.send(AppEvent::CodexEventFor {
-            conversation_id: conversation_id.to_string(),
-            event: ev,
-        });
+        app_event_tx_clone.send(AppEvent::CodexEvent(ev));
 
         let conversation_clone = conversation.clone();
         tokio::spawn(async move {
@@ -66,10 +63,7 @@ pub(crate) fn spawn_agent(
         });
 
         while let Ok(event) = conversation.next_event().await {
-            app_event_tx_clone.send(AppEvent::CodexEventFor {
-                conversation_id: conversation_id.to_string(),
-                event,
-            });
+            app_event_tx_clone.send(AppEvent::CodexEvent(event));
         }
     });
 
@@ -80,7 +74,6 @@ pub(crate) fn spawn_agent(
 /// Sends the provided `SessionConfiguredEvent` immediately, then forwards subsequent
 /// events and accepts Ops for submission.
 pub(crate) fn spawn_agent_from_existing(
-    conversation_id: String,
     conversation: std::sync::Arc<CodexConversation>,
     session_configured: codex_core::protocol::SessionConfiguredEvent,
     app_event_tx: AppEventSender,
@@ -94,10 +87,7 @@ pub(crate) fn spawn_agent_from_existing(
             id: "".to_string(),
             msg: codex_core::protocol::EventMsg::SessionConfigured(session_configured),
         };
-        app_event_tx_clone.send(AppEvent::CodexEventFor {
-            conversation_id: conversation_id.clone(),
-            event: ev,
-        });
+        app_event_tx_clone.send(AppEvent::CodexEvent(ev));
 
         let conversation_clone = conversation.clone();
         tokio::spawn(async move {
@@ -110,10 +100,7 @@ pub(crate) fn spawn_agent_from_existing(
         });
 
         while let Ok(event) = conversation.next_event().await {
-            app_event_tx_clone.send(AppEvent::CodexEventFor {
-                conversation_id: conversation_id.clone(),
-                event,
-            });
+            app_event_tx_clone.send(AppEvent::CodexEvent(event));
         }
     });
 

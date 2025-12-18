@@ -1346,7 +1346,9 @@ impl Config {
         // `gemini` so the default session uses a compatible backend without
         // requiring an extra `/model` step in the TUI.
         if !user_explicit_model_provider {
-            let is_gemini_model = model.starts_with("gemini-");
+            let is_gemini_model = model
+                .as_deref()
+                .is_some_and(|model| model.starts_with("gemini-"));
             let current_provider_id = Some(model_provider_id.as_str());
 
             if is_gemini_model {
@@ -3656,9 +3658,11 @@ model_verbosity = "high"
         // model from the TUI, but the top-level `model_provider` is still the
         // OpenAI proxy. On startup we should automatically switch the provider
         // to `gemini` so the model and provider remain compatible.
-        let mut cfg = ConfigToml::default();
-        cfg.model = Some("gemini-3-pro-preview-thinking-codex".to_string());
-        cfg.model_provider = Some("openai-proxy".to_string());
+        let mut cfg = ConfigToml {
+            model: Some("gemini-3-pro-preview-thinking-codex".to_string()),
+            model_provider: Some("openai-proxy".to_string()),
+            ..Default::default()
+        };
         cfg.model_providers.insert(
             "openai-proxy".to_string(),
             ModelProviderInfo {
@@ -3685,7 +3689,10 @@ model_verbosity = "high"
             codex_home.path().to_path_buf(),
         )?;
 
-        assert_eq!(config.model, "gemini-3-pro-preview-thinking-codex");
+        assert_eq!(
+            config.model.as_deref(),
+            Some("gemini-3-pro-preview-thinking-codex")
+        );
         assert_eq!(config.model_provider_id, "gemini");
 
         Ok(())
@@ -3698,9 +3705,11 @@ model_verbosity = "high"
         // When using a GPT-style model, a top-level `model_provider =
         // \"openai-proxy\"` should remain in effect so that traffic continues
         // to flow through the proxy.
-        let mut cfg = ConfigToml::default();
-        cfg.model = Some("gpt-5.1-codex".to_string());
-        cfg.model_provider = Some("openai-proxy".to_string());
+        let mut cfg = ConfigToml {
+            model: Some("gpt-5.1-codex".to_string()),
+            model_provider: Some("openai-proxy".to_string()),
+            ..Default::default()
+        };
         cfg.model_providers.insert(
             "openai-proxy".to_string(),
             ModelProviderInfo {
@@ -3727,7 +3736,7 @@ model_verbosity = "high"
             codex_home.path().to_path_buf(),
         )?;
 
-        assert_eq!(config.model, "gpt-5.1-codex");
+        assert_eq!(config.model.as_deref(), Some("gpt-5.1-codex"));
         assert_eq!(config.model_provider_id, "openai-proxy");
 
         Ok(())

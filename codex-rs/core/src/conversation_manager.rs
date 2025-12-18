@@ -102,13 +102,12 @@ impl ConversationManager {
             session_source: SessionSource::Exec,
             models_manager: Arc::new(ModelsManager::with_provider(auth_manager, provider)),
             skills_manager,
+            delegate_adapter: None,
             _test_codex_home_guard: None,
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    /// Construct with a dummy AuthManager containing the provided CodexAuth.
-    /// Used for integration tests: should not be used by ordinary business logic.
+    /// Returns the configured session source for sessions created by this manager.
     pub fn session_source(&self) -> SessionSource {
         self.session_source.clone()
     }

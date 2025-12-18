@@ -44,12 +44,14 @@ mod clipboard_copy;
 mod clipboard_paste;
 mod color;
 pub mod custom_terminal;
+mod cxresume_picker_widget;
 mod diff_render;
 mod exec_cell;
 mod exec_command;
 mod file_search;
 mod frames;
 mod get_git_diff;
+mod git_graph_widget;
 mod history_cell;
 pub mod insert_history;
 mod key_hint;
@@ -66,6 +68,8 @@ pub mod public_widgets;
 mod render;
 mod resume_picker;
 mod selection_list;
+mod session_alias_manager;
+mod session_bar;
 mod session_log;
 mod shimmer;
 mod skill_error_prompt;
@@ -216,6 +220,7 @@ pub async fn run_main(
         base_instructions: None,
         developer_instructions: None,
         compact_prompt: None,
+        include_delegate_tool: None,
         include_apply_patch_tool: None,
         show_raw_agent_reasoning: cli.oss.then_some(true),
         tools_web_search_request: None,

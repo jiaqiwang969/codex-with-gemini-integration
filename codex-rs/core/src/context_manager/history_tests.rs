@@ -801,6 +801,7 @@ fn normalize_adds_missing_output_for_function_call_inserts_output() {
                 name: "do_it".to_string(),
                 arguments: "{}".to_string(),
                 call_id: "call-x".to_string(),
+                thought_signature: None,
             },
             ResponseItem::FunctionCallOutput {
                 call_id: "call-x".to_string(),

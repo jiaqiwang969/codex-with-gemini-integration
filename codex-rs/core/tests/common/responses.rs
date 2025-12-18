@@ -676,6 +676,8 @@ pub async fn start_mock_server() -> MockServer {
         .start()
         .await;
 
+    wait_for_mock_server_ready(&server).await;
+
     // Provide a default `/models` response so tests remain hermetic when the client queries it.
     let _ = mount_models_once(
         &server,
@@ -687,6 +689,21 @@ pub async fn start_mock_server() -> MockServer {
     .await;
 
     server
+}
+
+async fn wait_for_mock_server_ready(server: &MockServer) {
+    use tokio::net::TcpStream;
+    use tokio::time::Duration;
+
+    let addr = *server.address();
+    for _ in 0..200 {
+        if TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    panic!("mock server did not become ready: {}", server.uri());
 }
 
 // todo(aibrahim): remove this and use our search matching patterns directly

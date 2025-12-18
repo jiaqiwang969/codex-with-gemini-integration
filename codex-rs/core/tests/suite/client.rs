@@ -190,6 +190,7 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
         content: vec![codex_protocol::models::ContentItem::InputText {
             text: "resumed user message".to_string(),
         }],
+        thought_signature: None,
     };
     let prior_user_json = serde_json::to_value(&prior_user).unwrap();
     writeln!(
@@ -210,6 +211,7 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
         content: vec![codex_protocol::models::ContentItem::OutputText {
             text: "resumed system instruction".to_string(),
         }],
+        thought_signature: None,
     };
     let prior_system_json = serde_json::to_value(&prior_system).unwrap();
     writeln!(
@@ -230,6 +232,7 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
         content: vec![codex_protocol::models::ContentItem::OutputText {
             text: "resumed assistant message".to_string(),
         }],
+        thought_signature: None,
     };
     let prior_item_json = serde_json::to_value(&prior_item).unwrap();
     writeln!(
@@ -1108,6 +1111,7 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
         env_key: None,
         env_key_instructions: None,
         experimental_bearer_token: None,
+        auth_json_key: None,
         wire_api: WireApi::Responses,
         query_params: None,
         http_headers: None,
@@ -1171,6 +1175,7 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
         content: vec![ContentItem::OutputText {
             text: "message".into(),
         }],
+        thought_signature: None,
     });
     prompt.input.push(ResponseItem::WebSearchCall {
         id: Some("web-search-id".into()),
@@ -1184,6 +1189,7 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
         name: "do_thing".into(),
         arguments: "{}".into(),
         call_id: "function-call-id".into(),
+        thought_signature: None,
     });
     prompt.input.push(ResponseItem::LocalShellCall {
         id: Some("local-shell-id".into()),
@@ -1597,6 +1603,7 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
         // Reuse the existing environment variable to avoid using unsafe code
         env_key: Some(existing_env_var_with_random_value.to_string()),
         experimental_bearer_token: None,
+        auth_json_key: None,
         query_params: Some(std::collections::HashMap::from([(
             "api-version".to_string(),
             "2025-04-01-preview".to_string(),
@@ -1678,6 +1685,7 @@ async fn env_var_overrides_loaded_auth() {
         base_url: Some(format!("{}/openai", server.uri())),
         // Reuse the existing environment variable to avoid using unsafe code
         env_key: Some(existing_env_var_with_random_value.to_string()),
+        auth_json_key: None,
         query_params: Some(std::collections::HashMap::from([(
             "api-version".to_string(),
             "2025-04-01-preview".to_string(),

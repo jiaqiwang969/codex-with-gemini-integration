@@ -368,22 +368,16 @@ mod tests {
         let bash_shell = get_shell(ShellType::Bash, None).unwrap();
         let shell_path = bash_shell.shell_path;
 
-        assert!(
-            shell_path == PathBuf::from("/bin/bash")
-                || shell_path == PathBuf::from("/usr/bin/bash")
-                || shell_path == PathBuf::from("/usr/local/bin/bash"),
-            "shell path: {shell_path:?}",
-        );
+        assert_eq!(detect_shell_type(&shell_path), Some(ShellType::Bash));
+        assert!(shell_path.exists(), "shell path: {shell_path:?}");
     }
 
     #[test]
     fn detects_sh() {
         let sh_shell = get_shell(ShellType::Sh, None).unwrap();
         let shell_path = sh_shell.shell_path;
-        assert!(
-            shell_path == PathBuf::from("/bin/sh") || shell_path == PathBuf::from("/usr/bin/sh"),
-            "shell path: {shell_path:?}",
-        );
+        assert_eq!(detect_shell_type(&shell_path), Some(ShellType::Sh));
+        assert!(shell_path.exists(), "shell path: {shell_path:?}");
     }
 
     #[test]

@@ -34,7 +34,6 @@ mod prompt_args;
 mod skill_popup;
 pub(crate) use list_selection_view::SelectionViewParams;
 mod feedback_view;
-mod session_alias_input;
 pub(crate) use feedback_view::feedback_selection_params;
 pub(crate) use feedback_view::feedback_upload_consent_params;
 mod paste_burst;
@@ -88,7 +87,6 @@ pub(crate) struct BottomPane {
     queued_user_messages: QueuedUserMessages,
     context_window_percent: Option<i64>,
     context_window_used_tokens: Option<i64>,
-    delegate_label: Option<String>,
 }
 
 pub(crate) struct BottomPaneParams {
@@ -138,7 +136,6 @@ impl BottomPane {
             animations_enabled,
             context_window_percent: None,
             context_window_used_tokens: None,
-            delegate_label: None,
         }
     }
 
@@ -392,16 +389,6 @@ impl BottomPane {
         self.request_redraw();
     }
 
-    pub(crate) fn set_delegate_label(&mut self, label: Option<String>) {
-        if self.delegate_label == label {
-            return;
-        }
-        self.delegate_label = label.clone();
-        if self.composer.set_delegate_label(label) {
-            self.request_redraw();
-        }
-    }
-
     /// Show a generic list selection view with the provided items.
     pub(crate) fn show_selection_view(&mut self, params: list_selection_view::SelectionViewParams) {
         let view = list_selection_view::ListSelectionView::new(params, self.app_event_tx.clone());
@@ -443,16 +430,6 @@ impl BottomPane {
 
     pub(crate) fn show_view(&mut self, view: Box<dyn BottomPaneView>) {
         self.push_view(view);
-    }
-
-    /// Show session alias input dialog for naming a new session.
-    pub(crate) fn show_session_alias_input(
-        &mut self,
-        session_id: String,
-        on_submit: session_alias_input::AliasSubmitted,
-    ) {
-        let view = session_alias_input::SessionAliasInput::new(session_id, on_submit);
-        self.push_view(Box::new(view));
     }
 
     /// Called when the agent requests user approval.

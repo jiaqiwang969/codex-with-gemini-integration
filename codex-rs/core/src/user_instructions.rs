@@ -28,14 +28,13 @@ impl UserInstructions {
 
 impl From<UserInstructions> for ResponseItem {
     fn from(ui: UserInstructions) -> Self {
+        let UserInstructions { directory, text } = ui;
         ResponseItem::Message {
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
                 text: format!(
-                    "{USER_INSTRUCTIONS_PREFIX}{directory}\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>",
-                    directory = ui.directory,
-                    contents = ui.text
+                    "{USER_INSTRUCTIONS_PREFIX}{directory}\n\n<INSTRUCTIONS>\n{text}\n</INSTRUCTIONS>"
                 ),
             }],
             thought_signature: None,
@@ -63,15 +62,20 @@ impl SkillInstructions {
 
 impl From<SkillInstructions> for ResponseItem {
     fn from(si: SkillInstructions) -> Self {
+        let SkillInstructions {
+            name,
+            path,
+            contents,
+        } = si;
         ResponseItem::Message {
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
                 text: format!(
-                    "<skill>\n<name>{}</name>\n<path>{}</path>\n{}\n</skill>",
-                    si.name, si.path, si.contents
+                    "<skill>\n<name>{name}</name>\n<path>{path}</path>\n{contents}\n</skill>"
                 ),
             }],
+            thought_signature: None,
         }
     }
 }

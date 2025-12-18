@@ -58,6 +58,7 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
             content: vec![ContentItem::InputText {
                 text: "REMOTE_COMPACTED_SUMMARY".to_string(),
             }],
+            thought_signature: None,
         },
         ResponseItem::Compaction {
             encrypted_content: "ENCRYPTED_COMPACTION_SUMMARY".to_string(),
@@ -175,6 +176,7 @@ async fn remote_compact_runs_automatically() -> Result<()> {
             content: vec![ContentItem::InputText {
                 text: "REMOTE_COMPACTED_SUMMARY".to_string(),
             }],
+            thought_signature: None,
         },
         ResponseItem::Compaction {
             encrypted_content: "ENCRYPTED_COMPACTION_SUMMARY".to_string(),
@@ -240,6 +242,7 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
             content: vec![ContentItem::InputText {
                 text: "COMPACTED_USER_SUMMARY".to_string(),
             }],
+            thought_signature: None,
         },
         ResponseItem::Compaction {
             encrypted_content: "ENCRYPTED_COMPACTION_SUMMARY".to_string(),
@@ -250,6 +253,7 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
             content: vec![ContentItem::OutputText {
                 text: "COMPACTED_ASSISTANT_NOTE".to_string(),
             }],
+            thought_signature: None,
         },
     ];
     let compact_mock = responses::mount_compact_json_once(

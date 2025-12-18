@@ -76,7 +76,6 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
         self.display_lines(width)
     }
 
-    #[allow(dead_code)]
     fn desired_transcript_height(&self, width: u16) -> u16 {
         let lines = self.transcript_lines(width);
         // Workaround for ratatui bug: if there's only one line and it's whitespace-only, ratatui gives 2 lines.
@@ -764,11 +763,6 @@ pub(crate) fn new_user_prompt(message: String) -> UserHistoryCell {
     UserHistoryCell { message }
 }
 
-#[allow(dead_code)]
-pub(crate) fn new_user_approval_decision(lines: Vec<Line<'static>>) -> PlainHistoryCell {
-    PlainHistoryCell { lines }
-}
-
 #[derive(Debug)]
 struct SessionHeaderHistoryCell {
     version: &'static str,
@@ -1357,58 +1351,14 @@ pub(crate) fn new_mcp_tools_output(
 
     PlainHistoryCell { lines }
 }
-#[derive(Debug)]
-pub(crate) struct InfoHistoryCell {
-    message: String,
-    hint: Option<String>,
-}
-
-impl HistoryCell for InfoHistoryCell {
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let wrap_width = width.saturating_sub(2).max(1) as usize;
-        let mut source_lines: Vec<Line<'static>> = self
-            .message
-            .split('\n')
-            .map(|segment| Line::from(segment.to_string()))
-            .collect();
-        if source_lines.is_empty() {
-            source_lines.push(Line::from(""));
-        }
-
-        let mut wrapped = word_wrap_lines(&source_lines, RtOptions::new(wrap_width));
-        if wrapped.is_empty() {
-            wrapped.push(Line::from(""));
-        }
-
-        let bullet_prefix: Span<'static> = "• ".dim();
-        let indent_prefix: Span<'static> = "  ".into();
-        let mut lines = prefix_lines(wrapped, bullet_prefix, indent_prefix);
-
-        // Remove the bullet prefix on blank lines to keep spacing compact.
-        for line in &mut lines {
-            let has_content = line
-                .spans
-                .iter()
-                .skip(1)
-                .any(|span| span.content.chars().any(|ch| !ch.is_whitespace()));
-            if !has_content {
-                line.spans.clear();
-            }
-        }
-
-        if let Some(hint) = &self.hint
-            && let Some(first_line) = lines.first_mut()
-        {
-            first_line.spans.push(" ".into());
-            first_line.spans.push(hint.clone().dark_gray());
-        }
-
-        lines
+pub(crate) fn new_info_event(message: String, hint: Option<String>) -> PlainHistoryCell {
+    let mut line = vec!["• ".dim(), message.into()];
+    if let Some(hint) = hint {
+        line.push(" ".into());
+        line.push(hint.dark_gray());
     }
-}
-
-pub(crate) fn new_info_event(message: String, hint: Option<String>) -> InfoHistoryCell {
-    InfoHistoryCell { message, hint }
+    let lines: Vec<Line<'static>> = vec![line.into()];
+    PlainHistoryCell { lines }
 }
 
 pub(crate) fn new_error_event(message: String) -> PlainHistoryCell {

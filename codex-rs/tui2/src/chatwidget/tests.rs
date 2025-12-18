@@ -122,6 +122,7 @@ fn resumed_initial_messages_render_history() {
                 message: "assistant reply".to_string(),
             }),
         ]),
+        skill_load_outcome: None,
         rollout_path: rollout_file.path().to_path_buf(),
     };
 
@@ -377,6 +378,7 @@ fn make_chatwidget_manual(
         models_manager: Arc::new(ModelsManager::new(auth_manager)),
         session_header: SessionHeader::new(resolved_model.clone()),
         initial_user_message: None,
+        defer_initial_message_for_alias_input: false,
         token_info: None,
         rate_limit_snapshot: None,
         plan_type: None,
@@ -406,6 +408,9 @@ fn make_chatwidget_manual(
         last_rendered_width: std::cell::Cell::new(None),
         feedback: codex_feedback::CodexFeedback::new(),
         current_rollout_path: None,
+        next_generated_image_index: 0,
+        last_generated_image_path: None,
+        ref_images: RefImageManager::new(),
     };
     (widget, rx, op_rx)
 }
@@ -1241,7 +1246,7 @@ fn slash_init_skips_when_project_doc_exists() {
     std::fs::write(&existing_path, "existing instructions").unwrap();
     chat.config.cwd = tempdir.path().to_path_buf();
 
-    chat.dispatch_command(SlashCommand::Init);
+    chat.dispatch_command(SlashCommand::Init, None);
 
     match op_rx.try_recv() {
         Err(TryRecvError::Empty) => {}
@@ -1269,7 +1274,7 @@ fn slash_init_skips_when_project_doc_exists() {
 fn slash_quit_requests_exit() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None);
 
-    chat.dispatch_command(SlashCommand::Quit);
+    chat.dispatch_command(SlashCommand::Quit, None);
 
     assert_matches!(rx.try_recv(), Ok(AppEvent::ExitRequest));
 }
@@ -1278,7 +1283,7 @@ fn slash_quit_requests_exit() {
 fn slash_exit_requests_exit() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None);
 
-    chat.dispatch_command(SlashCommand::Exit);
+    chat.dispatch_command(SlashCommand::Exit, None);
 
     assert_matches!(rx.try_recv(), Ok(AppEvent::ExitRequest));
 }
@@ -1287,16 +1292,103 @@ fn slash_exit_requests_exit() {
 fn slash_resume_opens_picker() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None);
 
-    chat.dispatch_command(SlashCommand::Resume);
+    chat.dispatch_command(SlashCommand::Resume, None);
 
     assert_matches!(rx.try_recv(), Ok(AppEvent::OpenResumePicker));
+}
+
+#[test]
+fn slash_open_image_without_saved_image_shows_info() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None);
+
+    chat.dispatch_command(SlashCommand::OpenImage, None);
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one info message");
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(
+        rendered.contains("No generated image"),
+        "expected a helpful message: {rendered:?}"
+    );
+}
+
+#[test]
+fn slash_ref_image_sends_set_reference_images_op() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None);
+    let cwd = tempdir().unwrap();
+    chat.config.cwd = cwd.path().to_path_buf();
+
+    chat.dispatch_command(SlashCommand::RefImage, Some("a.png b.png".to_string()));
+
+    match op_rx.try_recv() {
+        Ok(Op::SetReferenceImages { paths }) => {
+            assert_eq!(
+                paths,
+                vec![cwd.path().join("a.png"), cwd.path().join("b.png")]
+            );
+        }
+        other => panic!("expected Op::SetReferenceImages, got {other:?}"),
+    }
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one info message");
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(
+        rendered.contains("Reference images set"),
+        "expected confirmation text: {rendered:?}"
+    );
+}
+
+#[test]
+fn raw_response_item_saves_generated_image() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None);
+    let codex_home = tempdir().unwrap();
+    chat.config.codex_home = codex_home.path().to_path_buf();
+
+    let conversation_id = ConversationId::new();
+    let conversation_dir = conversation_id.to_string();
+    chat.conversation_id = Some(conversation_id);
+
+    const ONE_BY_ONE_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/6XwP3cAAAAASUVORK5CYII=";
+    let image_url = format!("data:image/png;base64,{ONE_BY_ONE_PNG}");
+    chat.handle_codex_event(Event {
+        id: "turn-1".to_string(),
+        msg: EventMsg::RawResponseItem(codex_core::protocol::RawResponseItemEvent {
+            item: codex_protocol::models::ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![codex_protocol::models::ContentItem::InputImage { image_url }],
+                thought_signature: None,
+            },
+        }),
+    });
+
+    let expected_path = codex_home
+        .path()
+        .join("images")
+        .join(conversation_dir)
+        .join("000000.png");
+    assert!(
+        expected_path.exists(),
+        "expected saved image at {}",
+        expected_path.display()
+    );
+    assert_eq!(chat.last_generated_image_path, Some(expected_path));
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected info message about saved image");
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(
+        rendered.contains("Generated image saved"),
+        "expected confirmation message: {rendered:?}"
+    );
 }
 
 #[test]
 fn slash_undo_sends_op() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None);
 
-    chat.dispatch_command(SlashCommand::Undo);
+    chat.dispatch_command(SlashCommand::Undo, None);
 
     match rx.try_recv() {
         Ok(AppEvent::CodexOp(Op::Undo)) => {}
@@ -1310,7 +1402,7 @@ fn slash_rollout_displays_current_path() {
     let rollout_path = PathBuf::from("/tmp/codex-test-rollout.jsonl");
     chat.current_rollout_path = Some(rollout_path.clone());
 
-    chat.dispatch_command(SlashCommand::Rollout);
+    chat.dispatch_command(SlashCommand::Rollout, None);
 
     let cells = drain_insert_history(&mut rx);
     assert_eq!(cells.len(), 1, "expected info message for rollout path");
@@ -1325,7 +1417,7 @@ fn slash_rollout_displays_current_path() {
 fn slash_rollout_handles_missing_path() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None);
 
-    chat.dispatch_command(SlashCommand::Rollout);
+    chat.dispatch_command(SlashCommand::Rollout, None);
 
     let cells = drain_insert_history(&mut rx);
     assert_eq!(
@@ -1933,7 +2025,7 @@ fn feedback_selection_popup_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None);
 
     // Open the feedback category selection popup via slash command.
-    chat.dispatch_command(SlashCommand::Feedback);
+    chat.dispatch_command(SlashCommand::Feedback, None);
 
     let popup = render_bottom_popup(&chat, 80);
     assert_snapshot!("feedback_selection_popup", popup);
@@ -2028,7 +2120,7 @@ fn disabled_slash_command_while_task_running_snapshot() {
     chat.bottom_pane.set_task_running(true);
 
     // Dispatch a command that is unavailable while a task runs (e.g., /model)
-    chat.dispatch_command(SlashCommand::Model);
+    chat.dispatch_command(SlashCommand::Model, None);
 
     // Drain history and snapshot the rendered error line(s)
     let cells = drain_insert_history(&mut rx);

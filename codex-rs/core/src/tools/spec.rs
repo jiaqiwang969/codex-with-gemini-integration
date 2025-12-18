@@ -19,10 +19,10 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub(crate) struct ToolsConfig {
     pub shell_type: ConfigShellToolType,
-    pub delegate_tool: bool,
     pub apply_patch_tool_type: Option<ApplyPatchToolType>,
     pub web_search_request: bool,
     pub include_view_image_tool: bool,
+    pub include_delegate_tool: bool,
     pub experimental_supported_tools: Vec<String>,
 }
 
@@ -34,7 +34,6 @@ pub(crate) struct ToolsConfigParams<'a> {
 
 impl ToolsConfig {
     pub fn new(params: &ToolsConfigParams) -> Self {
-        // Destructure and include our delegate tool flag (custom) alongside upstream fields.
         let ToolsConfigParams {
             model_family,
             features,
@@ -71,10 +70,10 @@ impl ToolsConfig {
 
         Self {
             shell_type,
-            delegate_tool: *include_delegate_tool,
             apply_patch_tool_type,
             web_search_request: include_web_search_request,
             include_view_image_tool,
+            include_delegate_tool: *include_delegate_tool,
             experimental_supported_tools: model_family.experimental_supported_tools.clone(),
         }
     }
@@ -296,7 +295,7 @@ fn create_shell_tool() -> ToolSpec {
         },
     );
 
-    let description = if cfg!(windows) {
+    let description  = if cfg!(windows) {
         r#"Runs a Powershell command (Windows) and returns its output. Arguments to `shell` will be passed to CreateProcessW(). Most commands should be prefixed with ["powershell.exe", "-Command"].
         
 Examples of valid command strings:
@@ -310,8 +309,7 @@ Examples of valid command strings:
     } else {
         r#"Runs a shell command and returns its output.
 - The arguments to `shell` will be passed to execvp(). Most terminal commands should be prefixed with ["bash", "-lc"].
-- Always set the `workdir` param when using the shell function. Do not use `cd` unless absolutely necessary.
-- When searching code, prefer commands of the form ["bash","-lc","rg <pattern> ."] or ["bash","-lc","rg <pattern> <path>"], where <path> is "." or a real directory/file name (never a bare number like "5")."#
+- Always set the `workdir` param when using the shell function. Do not use `cd` unless absolutely necessary."#
     }.to_string();
 
     ToolSpec::Function(ResponsesApiTool {
@@ -383,8 +381,7 @@ Examples of valid command strings:
 - running an inline Python script: "@'\\nprint('Hello, world!')\\n'@ | python -"#
     } else {
         r#"Runs a shell command and returns its output.
-- Always set the `workdir` param when using the shell_command function. Do not use `cd` unless absolutely necessary.
-- When searching code, prefer commands like "rg <pattern> ." or "rg <pattern> <path>" where <path> is "." or a real directory/file name (never a bare number like "5")."#
+- Always set the `workdir` param when using the shell_command function. Do not use `cd` unless absolutely necessary."#
     }.to_string();
 
     ToolSpec::Function(ResponsesApiTool {
@@ -507,18 +504,7 @@ fn create_grep_files_tool() -> ToolSpec {
         "path".to_string(),
         JsonSchema::String {
             description: Some(
-                "Directory or file path to search (absolute or relative to the session working \
-                 directory). Defaults to the session's working directory."
-                    .to_string(),
-            ),
-        },
-    );
-    properties.insert(
-        "mode".to_string(),
-        JsonSchema::String {
-            description: Some(
-                "Output mode: `first_match` (default) returns one representative \
-                 `path:line:snippet` match per file; `files` returns matching file paths only."
+                "Directory or file path to search. Defaults to the session's working directory."
                     .to_string(),
             ),
         },
@@ -526,15 +512,17 @@ fn create_grep_files_tool() -> ToolSpec {
     properties.insert(
         "limit".to_string(),
         JsonSchema::Number {
-            description: Some("Maximum number of results to return (defaults to 100).".to_string()),
+            description: Some(
+                "Maximum number of file paths to return (defaults to 100).".to_string(),
+            ),
         },
     );
 
     ToolSpec::Function(ResponsesApiTool {
         name: "grep_files".to_string(),
-        description:
-            "Searches for a pattern and returns matching results ordered by file modification time."
-                .to_string(),
+        description: "Finds files whose contents match the pattern and lists them by modification \
+                      time."
+            .to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
@@ -549,12 +537,7 @@ fn create_read_file_tool() -> ToolSpec {
     properties.insert(
         "file_path".to_string(),
         JsonSchema::String {
-            description: Some(
-                "Path to the file (absolute or relative to the session working directory). Also \
-                 accepts ripgrep-style `path:line` or `path:line:...` inputs; when `offset` is \
-                 left at its default, the handler will treat `line` as the starting line."
-                    .to_string(),
-            ),
+            description: Some("Absolute path to the file".to_string()),
         },
     );
     properties.insert(
@@ -652,10 +635,7 @@ fn create_list_dir_tool() -> ToolSpec {
     properties.insert(
         "dir_path".to_string(),
         JsonSchema::String {
-            description: Some(
-                "Path to the directory to list (absolute or relative to the session working directory)."
-                    .to_string(),
-            ),
+            description: Some("Absolute path to the directory to list.".to_string()),
         },
     );
     properties.insert(
@@ -1025,7 +1005,6 @@ pub(crate) fn build_specs(
     let shell_handler = Arc::new(ShellHandler);
     let unified_exec_handler = Arc::new(UnifiedExecHandler);
     let plan_handler = Arc::new(PlanHandler);
-    let delegate_handler = Arc::new(DelegateToolHandler);
     let apply_patch_handler = Arc::new(ApplyPatchHandler);
     let view_image_handler = Arc::new(ViewImageHandler);
     let mcp_handler = Arc::new(McpHandler);
@@ -1070,11 +1049,6 @@ pub(crate) fn build_specs(
 
     builder.push_spec(PLAN_TOOL.clone());
     builder.register_handler("update_plan", plan_handler);
-
-    if config.delegate_tool {
-        builder.push_spec_with_parallel_support(DELEGATE_TOOL.clone(), true);
-        builder.register_handler("delegate_agent", delegate_handler);
-    }
 
     if let Some(apply_patch_tool_type) = &config.apply_patch_tool_type {
         match apply_patch_tool_type {
@@ -1132,6 +1106,12 @@ pub(crate) fn build_specs(
     if config.include_view_image_tool {
         builder.push_spec_with_parallel_support(create_view_image_tool(), true);
         builder.register_handler("view_image", view_image_handler);
+    }
+
+    if config.include_delegate_tool {
+        let delegate_handler = Arc::new(DelegateToolHandler);
+        builder.push_spec(DELEGATE_TOOL.clone());
+        builder.register_handler("delegate_agent", delegate_handler);
     }
 
     if let Some(mcp_tools) = mcp_tools {
@@ -1539,7 +1519,7 @@ mod tests {
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_family: &model_family,
             features: &features,
-            include_delegate_tool: true,
+            include_delegate_tool: false,
         });
         let (tools, _) = build_specs(&tools_config, None).build();
 
@@ -1548,7 +1528,6 @@ mod tests {
         assert!(find_tool(&tools, "grep_files").supports_parallel_tool_calls);
         assert!(find_tool(&tools, "list_dir").supports_parallel_tool_calls);
         assert!(find_tool(&tools, "read_file").supports_parallel_tool_calls);
-        assert!(find_tool(&tools, "delegate_agent").supports_parallel_tool_calls);
     }
 
     #[test]
@@ -2005,10 +1984,8 @@ Examples of valid command strings:
         } else {
             r#"Runs a shell command and returns its output.
 - The arguments to `shell` will be passed to execvp(). Most terminal commands should be prefixed with ["bash", "-lc"].
-- Always set the `workdir` param when using the shell function. Do not use `cd` unless absolutely necessary.
-- When searching code, prefer commands of the form ["bash","-lc","rg <pattern> ."] or ["bash","-lc","rg <pattern> <path>"], where <path> is "." or a real directory/file name (never a bare number like "5")."#
-        }
-        .to_string();
+- Always set the `workdir` param when using the shell function. Do not use `cd` unless absolutely necessary."#
+        }.to_string();
         assert_eq!(description, &expected);
     }
 
@@ -2036,8 +2013,7 @@ Examples of valid command strings:
 - running an inline Python script: "@'\\nprint('Hello, world!')\\n'@ | python -"#.to_string()
         } else {
             r#"Runs a shell command and returns its output.
-- Always set the `workdir` param when using the shell_command function. Do not use `cd` unless absolutely necessary.
-- When searching code, prefer commands like "rg <pattern> ." or "rg <pattern> <path>" where <path> is "." or a real directory/file name (never a bare number like "5")."#.to_string()
+- Always set the `workdir` param when using the shell_command function. Do not use `cd` unless absolutely necessary."#.to_string()
         };
         assert_eq!(description, &expected);
     }
@@ -2154,25 +2130,6 @@ Examples of valid command strings:
                 description: "Do something cool".to_string(),
                 strict: false,
             })
-        );
-    }
-
-    #[test]
-    fn delegate_tool_enabled_by_flag() {
-        let config = test_config();
-        let model_family = ModelsManager::construct_model_family_offline("gpt-5-codex", &config);
-        let features = Features::with_defaults();
-        let tools_config = ToolsConfig::new(&ToolsConfigParams {
-            model_family: &model_family,
-            include_delegate_tool: true,
-            features: &features,
-        });
-        let (tools, _) = build_specs(&tools_config, None).build();
-
-        assert!(
-            tools
-                .iter()
-                .any(|tool| tool_name(&tool.spec) == "delegate_agent")
         );
     }
 

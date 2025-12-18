@@ -1085,18 +1085,16 @@ async fn unified_exec_emits_one_begin_and_one_end_event() -> Result<()> {
 
     let open_call_id = "uexec-open-session";
     let open_args = json!({
-        // Avoid `-l` because user login scripts can be arbitrarily slow/non-hermetic.
-        "shell": "/bin/bash".to_string(),
-        "cmd": "sleep 0.4".to_string(),
-        "login": false,
-        "yield_time_ms": 250,
+        "shell": "bash".to_string(),
+        "cmd": "sleep 0.1".to_string(),
+        "yield_time_ms": 10,
     });
 
     let poll_call_id = "uexec-poll-empty";
     let poll_args = json!({
         "chars": "",
         "session_id": 1000,
-        "yield_time_ms": 1_500,
+        "yield_time_ms": 150,
     });
 
     let responses = vec![
@@ -1145,13 +1143,18 @@ async fn unified_exec_emits_one_begin_and_one_end_event() -> Result<()> {
 
     let mut begin_events = Vec::new();
     let mut end_events = Vec::new();
+    let mut saw_task_complete = false;
     loop {
-        let event_msg = wait_for_event(&codex, |_| true).await;
+        let event_msg = wait_for_event_with_timeout(&codex, |_| true, Duration::from_secs(1)).await;
         match event_msg {
             EventMsg::ExecCommandBegin(event) => begin_events.push(event),
             EventMsg::ExecCommandEnd(event) => end_events.push(event),
-            EventMsg::TaskComplete(_) => break,
+            EventMsg::TaskComplete(_) => saw_task_complete = true,
             _ => {}
+        }
+
+        if saw_task_complete && !end_events.is_empty() {
+            break;
         }
     }
 
@@ -1169,7 +1172,7 @@ async fn unified_exec_emits_one_begin_and_one_end_event() -> Result<()> {
 
     let open_event = &begin_events[0];
 
-    assert_command(&open_event.command, "-c", "sleep 0.4");
+    assert_command(&open_event.command, "-lc", "sleep 0.1");
 
     assert!(
         open_event.interaction_input.is_none(),

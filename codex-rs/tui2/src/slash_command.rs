@@ -19,10 +19,16 @@ pub enum SlashCommand {
     New,
     Resume,
     Init,
+    Tumix,
+    TumixStop,
     Compact,
     Undo,
     Diff,
+    OpenImage,
+    RefImage,
+    ClearRef,
     Mention,
+    Agent,
     Status,
     Mcp,
     Logout,
@@ -40,13 +46,19 @@ impl SlashCommand {
             SlashCommand::Feedback => "send logs to maintainers",
             SlashCommand::New => "start a new chat during a conversation",
             SlashCommand::Init => "create an AGENTS.md file with instructions for Codex",
+            SlashCommand::Tumix => "run TUMIX multi-agent parallel execution (Round 1)",
+            SlashCommand::TumixStop => "stop running TUMIX agents (optionally specify a session)",
             SlashCommand::Compact => "summarize conversation to prevent hitting the context limit",
             SlashCommand::Review => "review my current changes and find issues",
             SlashCommand::Resume => "resume a saved chat",
             SlashCommand::Undo => "ask Codex to undo a turn",
             SlashCommand::Quit | SlashCommand::Exit => "exit Codex",
             SlashCommand::Diff => "show git diff (including untracked files)",
+            SlashCommand::OpenImage => "open the most recently generated image",
+            SlashCommand::RefImage => "set reference images for image models",
+            SlashCommand::ClearRef => "clear active reference images",
             SlashCommand::Mention => "mention a file",
+            SlashCommand::Agent => "switch into a delegated agent session",
             SlashCommand::Skills => "use skills to improve how Codex performs specific tasks",
             SlashCommand::Status => "show current session configuration and token usage",
             SlashCommand::Model => "choose what model and reasoning effort to use",
@@ -56,6 +68,18 @@ impl SlashCommand {
             SlashCommand::Rollout => "print the rollout file path",
             SlashCommand::TestApproval => "test approval request",
         }
+    }
+
+    /// Whether this command accepts free-form arguments after the name.
+    ///
+    /// Commands that return `true` receive the raw argument string in
+    /// `InputResult::CommandWithArgs` so their handlers can parse it in a
+    /// context-aware way.
+    pub fn accepts_args(self) -> bool {
+        matches!(
+            self,
+            SlashCommand::Tumix | SlashCommand::TumixStop | SlashCommand::RefImage
+        )
     }
 
     /// Command string without the leading '/'. Provided for compatibility with
@@ -70,6 +94,7 @@ impl SlashCommand {
             SlashCommand::New
             | SlashCommand::Resume
             | SlashCommand::Init
+            | SlashCommand::Tumix
             | SlashCommand::Compact
             | SlashCommand::Undo
             | SlashCommand::Model
@@ -77,10 +102,15 @@ impl SlashCommand {
             | SlashCommand::Review
             | SlashCommand::Logout => false,
             SlashCommand::Diff
+            | SlashCommand::OpenImage
+            | SlashCommand::RefImage
+            | SlashCommand::ClearRef
             | SlashCommand::Mention
+            | SlashCommand::Agent
             | SlashCommand::Skills
             | SlashCommand::Status
             | SlashCommand::Mcp
+            | SlashCommand::TumixStop
             | SlashCommand::Feedback
             | SlashCommand::Quit
             | SlashCommand::Exit => true,

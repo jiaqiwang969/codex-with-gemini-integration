@@ -50,8 +50,8 @@ pub struct Cli {
     #[arg(long = "profile", short = 'p')]
     pub config_profile: Option<String>,
 
-    /// Run the CLI using the configuration scoped to `~/.codex/agents/<agent_id>/`.
-    #[arg(long = "agent", value_name = "AGENT_ID")]
+    /// Load configuration from `~/.codex/agents/<AGENT_ID>` in addition to the global config.
+    #[arg(long = "agent")]
     pub agent: Option<String>,
 
     /// Select the sandbox policy to use when executing model-generated shell

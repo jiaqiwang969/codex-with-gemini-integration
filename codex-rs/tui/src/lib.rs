@@ -7,7 +7,6 @@ use additional_dirs::add_dir_warning_message;
 use app::App;
 pub use app::AppExitInfo;
 use codex_app_server_protocol::AuthMode;
-use codex_common::CliConfigOverrides;
 use codex_common::oss::ensure_oss_provider_ready;
 use codex_common::oss::get_default_model_for_oss_provider;
 use codex_core::AuthManager;
@@ -23,14 +22,9 @@ use codex_core::config::resolve_oss_provider;
 use codex_core::find_conversation_path_by_id_str;
 use codex_core::get_platform_sandbox;
 use codex_core::protocol::AskForApproval;
-use codex_core::protocol::SessionSource;
-use codex_multi_agent::AgentContext;
-use codex_multi_agent::AgentId;
-use codex_multi_agent::AgentOrchestrator;
 use codex_protocol::config_types::SandboxMode;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
-use std::sync::Arc;
 use tracing::error;
 use tracing_appender::non_blocking;
 use tracing_subscriber::EnvFilter;
@@ -49,14 +43,12 @@ mod cli;
 mod clipboard_paste;
 mod color;
 pub mod custom_terminal;
-mod cxresume_picker_widget;
 mod diff_render;
 mod exec_cell;
 mod exec_command;
 mod file_search;
 mod frames;
 mod get_git_diff;
-mod git_graph_widget;
 mod history_cell;
 pub mod insert_history;
 mod key_hint;
@@ -73,8 +65,6 @@ pub mod public_widgets;
 mod render;
 mod resume_picker;
 mod selection_list;
-mod session_alias_manager;
-mod session_bar;
 mod session_log;
 mod shimmer;
 mod skill_error_prompt;
@@ -225,25 +215,14 @@ pub async fn run_main(
         base_instructions: None,
         developer_instructions: None,
         compact_prompt: None,
-        include_delegate_tool: Some(true),
+        include_delegate_tool: None,
         include_apply_patch_tool: None,
         show_raw_agent_reasoning: cli.oss.then_some(true),
         tools_web_search_request: None,
         additional_writable_roots: additional_dirs,
     };
-    let mut delegate_config_overrides = overrides.clone();
-    delegate_config_overrides.include_delegate_tool = None;
-    let delegate_cli_overrides = cli.config_overrides.clone();
 
-    let agent_context = load_agent_context_or_exit(
-        cli.agent.as_deref(),
-        &cli.config_overrides,
-        overrides.clone(),
-    )
-    .await;
-    let allowed_agents = agent_context.allowed_agents().to_vec();
-    let global_codex_home = agent_context.global_codex_home().to_path_buf();
-    let config = agent_context.into_config();
+    let config = load_config_or_exit(cli_kv_overrides.clone(), overrides.clone()).await;
 
     if let Some(warning) = add_dir_warning_message(&cli.add_dir, &config.sandbox_policy) {
         #[allow(clippy::print_stderr)]
@@ -345,32 +324,23 @@ pub async fn run_main(
         cli,
         config,
         overrides,
+        cli_kv_overrides,
         active_profile,
         feedback,
-        global_codex_home,
-        delegate_cli_overrides,
-        delegate_config_overrides,
-        allowed_agents,
     )
     .await
     .map_err(|err| std::io::Error::other(err.to_string()))
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_ratatui_app(
     cli: Cli,
     initial_config: Config,
     overrides: ConfigOverrides,
+    cli_kv_overrides: Vec<(String, toml::Value)>,
     active_profile: Option<String>,
     feedback: codex_feedback::CodexFeedback,
-    global_codex_home: PathBuf,
-    delegate_cli_overrides: CliConfigOverrides,
-    delegate_config_overrides: ConfigOverrides,
-    allowed_agents: Vec<AgentId>,
 ) -> color_eyre::Result<AppExitInfo> {
     color_eyre::install()?;
-    let mut global_codex_home = global_codex_home;
-    let mut allowed_agents = allowed_agents;
 
     // Forward panic reports through tracing so they appear in the UI status
     // line, but do not swallow the default/color-eyre panic handler.
@@ -409,7 +379,7 @@ async fn run_ratatui_app(
     // Initialize high-fidelity session event logging if enabled.
     session_log::maybe_init(&initial_config);
 
-    let mut auth_manager = AuthManager::shared(
+    let auth_manager = AuthManager::shared(
         initial_config.codex_home.clone(),
         false,
         initial_config.cli_auth_credentials_store_mode,
@@ -441,42 +411,19 @@ async fn run_ratatui_app(
                 update_action: None,
             });
         }
-        // if the user made an explicit decision to trust the directory, reload the config accordingly
+        // if the user acknowledged windows or made an explicit decision ato trust the directory, reload the config accordingly
         if onboarding_result
             .directory_trust_decision
             .map(|d| d == TrustDirectorySelection::Trust)
             .unwrap_or(false)
         {
-            let context = load_agent_context_or_exit(
-                cli.agent.as_deref(),
-                &delegate_cli_overrides,
-                overrides.clone(),
-            )
-            .await;
-            allowed_agents = context.allowed_agents().to_vec();
-            global_codex_home = context.global_codex_home().to_path_buf();
-            auth_manager = AuthManager::shared(
-                global_codex_home.clone(),
-                false,
-                initial_config.cli_auth_credentials_store_mode,
-            );
-            context.into_config()
+            load_config_or_exit(cli_kv_overrides, overrides).await
         } else {
             initial_config
         }
     } else {
         initial_config
     };
-
-    let delegate_orchestrator = Arc::new(AgentOrchestrator::new(
-        global_codex_home.clone(),
-        auth_manager.clone(),
-        SessionSource::Cli,
-        delegate_cli_overrides,
-        delegate_config_overrides,
-        allowed_agents,
-        config.multi_agent.max_concurrent_delegates,
-    ));
 
     // Determine resume behavior: explicit id, then resume last, then picker.
     let resume_selection = if let Some(id_str) = cli.resume_session_id.as_deref() {
@@ -548,7 +495,6 @@ async fn run_ratatui_app(
     let app_result = App::run(
         &mut tui,
         auth_manager,
-        delegate_orchestrator,
         config,
         active_profile,
         prompt,
@@ -602,14 +548,13 @@ fn get_login_status(config: &Config) -> LoginStatus {
     }
 }
 
-async fn load_agent_context_or_exit(
-    agent_slug: Option<&str>,
-    cli_overrides: &CliConfigOverrides,
+async fn load_config_or_exit(
+    cli_kv_overrides: Vec<(String, toml::Value)>,
     overrides: ConfigOverrides,
-) -> AgentContext {
+) -> Config {
     #[allow(clippy::print_stderr)]
-    match codex_multi_agent::load_agent_context(agent_slug, cli_overrides, overrides).await {
-        Ok(context) => context,
+    match Config::load_with_cli_overrides(cli_kv_overrides, overrides).await {
+        Ok(config) => config,
         Err(err) => {
             eprintln!("Error loading configuration: {err}");
             std::process::exit(1);

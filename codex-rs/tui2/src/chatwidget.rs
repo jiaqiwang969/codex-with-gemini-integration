@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_app_server_protocol::AuthMode;
 use codex_backend_client::Client as BackendClient;
 use codex_core::config::Config;
@@ -43,6 +46,7 @@ use codex_core::protocol::McpToolCallEndEvent;
 use codex_core::protocol::Op;
 use codex_core::protocol::PatchApplyBeginEvent;
 use codex_core::protocol::RateLimitSnapshot;
+use codex_core::protocol::RawResponseItemEvent;
 use codex_core::protocol::ReviewRequest;
 use codex_core::protocol::ReviewTarget;
 use codex_core::protocol::SkillsListEntry;
@@ -64,12 +68,15 @@ use codex_core::skills::model::SkillMetadata;
 use codex_protocol::ConversationId;
 use codex_protocol::account::PlanType;
 use codex_protocol::approvals::ElicitationRequestEvent;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::parse_command::ParsedCommand;
 use codex_protocol::user_input::UserInput;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
+use dirs::home_dir;
 use rand::Rng;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -78,6 +85,7 @@ use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
+use shlex::Shlex;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use tracing::debug;
@@ -124,7 +132,6 @@ use self::agent::spawn_agent_from_existing;
 mod session_header;
 use self::session_header::SessionHeader;
 use crate::streaming::controller::StreamController;
-use std::path::Path;
 
 use chrono::Local;
 use codex_common::approval_presets::ApprovalPreset;
@@ -288,6 +295,7 @@ pub(crate) struct ChatWidget {
     models_manager: Arc<ModelsManager>,
     session_header: SessionHeader,
     initial_user_message: Option<UserMessage>,
+    defer_initial_message_for_alias_input: bool,
     token_info: Option<TokenUsageInfo>,
     rate_limit_snapshot: Option<RateLimitSnapshotDisplay>,
     plan_type: Option<PlanType>,
@@ -334,11 +342,149 @@ pub(crate) struct ChatWidget {
     feedback: codex_feedback::CodexFeedback,
     // Current session rollout path (if known)
     current_rollout_path: Option<PathBuf>,
+    // Monotonic counter for generated images in this session.
+    next_generated_image_index: i64,
+    // Last generated image path for quick reopening via slash command.
+    last_generated_image_path: Option<PathBuf>,
+    // UI-level view of the active reference image set for this session.
+    ref_images: RefImageManager,
 }
 
 struct UserMessage {
     text: String,
     image_paths: Vec<PathBuf>,
+}
+
+/// Manager for the reference image set used by `/ref-image`.
+///
+/// This tracks the UI's view of the active reference images as local paths.
+/// Core maintains its own data URL representation; the two are kept in sync
+/// via `Op::SetReferenceImages` / `Op::ClearReferenceImages`.
+struct RefImageManager {
+    active_paths: Vec<PathBuf>,
+}
+
+impl RefImageManager {
+    fn new() -> Self {
+        Self {
+            active_paths: Vec::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.active_paths.clear();
+    }
+
+    fn set_paths(&mut self, paths: Vec<PathBuf>) {
+        self.active_paths = paths;
+    }
+
+    fn active_paths(&self) -> &[PathBuf] {
+        &self.active_paths
+    }
+}
+
+struct RefImageContext<'a> {
+    cwd: &'a Path,
+    codex_home: &'a Path,
+    conversation_id: Option<&'a ConversationId>,
+}
+
+enum RefImageCommand {
+    ShowHelpAndMaybeStatus,
+    ShowStatusOnly,
+    Clear,
+    Set {
+        paths: Vec<PathBuf>,
+        prompt: Option<String>,
+    },
+}
+
+impl RefImageManager {
+    fn parse_command(&self, args: Option<String>, ctx: &RefImageContext<'_>) -> RefImageCommand {
+        let raw = args.unwrap_or_default();
+        let trimmed = raw.trim();
+
+        if trimmed.is_empty() {
+            return RefImageCommand::ShowHelpAndMaybeStatus;
+        }
+
+        if trimmed.eq_ignore_ascii_case("ls") {
+            return RefImageCommand::ShowStatusOnly;
+        }
+
+        if trimmed.eq_ignore_ascii_case("clear") {
+            return RefImageCommand::Clear;
+        }
+
+        let (paths_raw, prompt_raw) = if let Some((left, right)) = trimmed.split_once("--") {
+            (left.trim_end(), Some(right.trim_start().to_string()))
+        } else {
+            (trimmed, None)
+        };
+
+        let path_tokens: Vec<String> = Shlex::new(paths_raw).filter(|s| !s.is_empty()).collect();
+        if path_tokens.is_empty() {
+            if let Some(prompt_raw) = prompt_raw {
+                let prompt = prompt_raw.trim();
+                let prompt = (!prompt.is_empty()).then(|| prompt.to_string());
+                return RefImageCommand::Set {
+                    paths: Vec::new(),
+                    prompt,
+                };
+            }
+            return RefImageCommand::ShowHelpAndMaybeStatus;
+        }
+
+        let mut resolved: Vec<PathBuf> = Vec::new();
+        for token in path_tokens {
+            resolved.push(Self::resolve_path(&token, ctx));
+        }
+
+        let prompt = prompt_raw.and_then(|prompt_raw| {
+            let prompt = prompt_raw.trim();
+            (!prompt.is_empty()).then(|| prompt.to_string())
+        });
+
+        RefImageCommand::Set {
+            paths: resolved,
+            prompt,
+        }
+    }
+
+    fn resolve_path(raw: &str, ctx: &RefImageContext<'_>) -> PathBuf {
+        let expanded = if let Some(stripped) = raw.strip_prefix("~/") {
+            if let Some(home) = home_dir() {
+                home.join(stripped)
+            } else {
+                PathBuf::from(raw)
+            }
+        } else {
+            PathBuf::from(raw)
+        };
+
+        if expanded.is_absolute() {
+            return expanded;
+        }
+
+        let mut components = expanded.components();
+        if components.next().is_some() && components.next().is_some() {
+            return ctx.cwd.join(expanded);
+        }
+
+        if let Some(conversation_id) = ctx.conversation_id {
+            let candidate = ctx
+                .codex_home
+                .join("images")
+                .join(conversation_id.to_string())
+                .join(&expanded);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+
+        ctx.cwd.join(expanded)
+    }
 }
 
 impl From<String> for UserMessage {
@@ -394,11 +540,13 @@ impl ChatWidget {
         self.bottom_pane
             .set_history_metadata(event.history_log_id, event.history_entry_count);
         self.set_skills(None);
-        self.conversation_id = Some(event.session_id);
+        let session_id = event.session_id;
+        self.conversation_id = Some(session_id);
         self.current_rollout_path = Some(event.rollout_path.clone());
         let initial_messages = event.initial_messages.clone();
         let model_for_header = event.model.clone();
         self.session_header.set_model(&model_for_header);
+        let is_new_session = event.history_entry_count == 0 && initial_messages.is_none();
         self.add_to_history(history_cell::new_session_info(
             &self.config,
             &model_for_header,
@@ -414,14 +562,39 @@ impl ChatWidget {
             cwds: Vec::new(),
             force_reload: false,
         });
-        if let Some(user_message) = self.initial_user_message.take() {
-            self.submit_user_message(user_message);
+        if is_new_session {
+            self.defer_initial_message_for_alias_input = true;
+            let app_tx = self.app_event_tx.clone();
+            self.bottom_pane.show_session_alias_input(
+                self.config.codex_home.clone(),
+                session_id.to_string(),
+                Box::new(move |session_id, alias| {
+                    app_tx.send(crate::app_event::AppEvent::SaveSessionAlias { session_id, alias });
+                }),
+            );
+        } else {
+            self.defer_initial_message_for_alias_input = false;
+            if let Some(user_message) = self.initial_user_message.take() {
+                self.submit_user_message(user_message);
+            }
         }
         if !self.suppress_session_configured_redraw {
             self.request_redraw();
         }
     }
 
+    pub(crate) fn show_session_alias_input_for_rename(
+        &mut self,
+        session_id: String,
+        on_submit: Box<dyn Fn(String, String) + Send + Sync>,
+    ) {
+        self.bottom_pane.show_session_alias_input(
+            self.config.codex_home.clone(),
+            session_id,
+            on_submit,
+        );
+        self.request_redraw();
+    }
     fn set_skills(&mut self, skills: Option<Vec<SkillMetadata>>) {
         self.bottom_pane.set_skills(skills);
     }
@@ -1311,6 +1484,7 @@ impl ChatWidget {
                 initial_prompt.unwrap_or_default(),
                 initial_images,
             ),
+            defer_initial_message_for_alias_input: false,
             token_info: None,
             rate_limit_snapshot: None,
             plan_type: None,
@@ -1339,6 +1513,9 @@ impl ChatWidget {
             last_rendered_width: std::cell::Cell::new(None),
             feedback,
             current_rollout_path: None,
+            next_generated_image_index: 0,
+            last_generated_image_path: None,
+            ref_images: RefImageManager::new(),
         };
 
         widget.prefetch_rate_limits();
@@ -1396,6 +1573,7 @@ impl ChatWidget {
                 initial_prompt.unwrap_or_default(),
                 initial_images,
             ),
+            defer_initial_message_for_alias_input: false,
             token_info: None,
             rate_limit_snapshot: None,
             plan_type: None,
@@ -1424,6 +1602,9 @@ impl ChatWidget {
             last_rendered_width: std::cell::Cell::new(None),
             feedback,
             current_rollout_path: None,
+            next_generated_image_index: 0,
+            last_generated_image_path: None,
+            ref_images: RefImageManager::new(),
         };
 
         widget.prefetch_rate_limits();
@@ -1499,10 +1680,20 @@ impl ChatWidget {
                         self.queue_user_message(user_message);
                     }
                     InputResult::Command(cmd) => {
-                        self.dispatch_command(cmd);
+                        self.dispatch_command(cmd, None);
+                    }
+                    InputResult::CommandWithArgs(cmd, args) => {
+                        self.dispatch_command(cmd, Some(args));
                     }
                     InputResult::None => {}
                 }
+            }
+        }
+
+        if self.defer_initial_message_for_alias_input && !self.bottom_pane.has_active_view() {
+            self.defer_initial_message_for_alias_input = false;
+            if let Some(user_message) = self.initial_user_message.take() {
+                self.submit_user_message(user_message);
             }
         }
     }
@@ -1522,7 +1713,7 @@ impl ChatWidget {
         self.request_redraw();
     }
 
-    fn dispatch_command(&mut self, cmd: SlashCommand) {
+    fn dispatch_command(&mut self, cmd: SlashCommand, args: Option<String>) {
         if !cmd.available_during_task() && self.bottom_pane.is_task_running() {
             let message = format!(
                 "'/{}' is disabled while a task is in progress.",
@@ -1557,6 +1748,12 @@ impl ChatWidget {
                 }
                 const INIT_PROMPT: &str = include_str!("../prompt_for_init_command.md");
                 self.submit_user_message(INIT_PROMPT.to_string().into());
+            }
+            SlashCommand::Tumix => {
+                self.handle_tumix_command(args);
+            }
+            SlashCommand::TumixStop => {
+                self.handle_tumix_stop_command(args);
             }
             SlashCommand::Compact => {
                 self.clear_token_usage();
@@ -1603,8 +1800,22 @@ impl ChatWidget {
                     tx.send(AppEvent::DiffResult(text));
                 });
             }
+            SlashCommand::OpenImage => {
+                self.open_last_generated_image();
+            }
+            SlashCommand::RefImage => {
+                self.handle_ref_image_command(args);
+            }
+            SlashCommand::ClearRef => {
+                self.ref_images.clear();
+                self.submit_op(Op::ClearReferenceImages);
+                self.add_info_message("Reference images cleared.".to_string(), None);
+            }
             SlashCommand::Mention => {
                 self.insert_str("@");
+            }
+            SlashCommand::Agent => {
+                self.add_info_message("`/agent` is not supported in tui2 yet.".to_string(), None);
             }
             SlashCommand::Skills => {
                 self.insert_str("$");
@@ -1916,8 +2127,8 @@ impl ChatWidget {
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
             EventMsg::ContextCompacted(_) => self.on_agent_message("Context compacted".to_owned()),
-            EventMsg::RawResponseItem(_)
-            | EventMsg::ItemStarted(_)
+            EventMsg::RawResponseItem(ev) => self.on_raw_response_item(ev),
+            EventMsg::ItemStarted(_)
             | EventMsg::ItemCompleted(_)
             | EventMsg::AgentMessageContentDelta(_)
             | EventMsg::ReasoningContentDelta(_)
@@ -1979,6 +2190,100 @@ impl ChatWidget {
         if !message.is_empty() {
             self.add_to_history(history_cell::new_user_prompt(message.to_string()));
         }
+    }
+
+    fn on_raw_response_item(&mut self, event: RawResponseItemEvent) {
+        let RawResponseItemEvent { item } = event;
+        let ResponseItem::Message { role, content, .. } = item else {
+            return;
+        };
+
+        if role != "assistant" {
+            return;
+        }
+
+        let Some(conversation_id) = self.conversation_id else {
+            return;
+        };
+
+        let mut saved_any = false;
+        let mut last_saved_path: Option<PathBuf> = None;
+
+        for content_item in content {
+            if let ContentItem::InputImage { image_url } = content_item
+                && let Some(path) = self.save_generated_image(&conversation_id, &image_url)
+            {
+                saved_any = true;
+                last_saved_path = Some(path);
+            }
+        }
+
+        if let (true, Some(path)) = (saved_any, last_saved_path) {
+            let display = display_path_for(&path, &self.config.cwd);
+            let hint = format!("{display} · run /open-image to open it");
+            self.add_to_history(history_cell::new_info_event(
+                "Generated image saved".to_string(),
+                Some(hint),
+            ));
+            self.last_generated_image_path = Some(path);
+            self.request_redraw();
+        }
+    }
+
+    fn save_generated_image(
+        &mut self,
+        conversation_id: &ConversationId,
+        image_url: &str,
+    ) -> Option<PathBuf> {
+        let without_prefix = image_url.strip_prefix("data:")?;
+        let (meta, data_base64) = without_prefix.split_once(',')?;
+        let (mime, encoding) = meta.split_once(';')?;
+        if !encoding.eq_ignore_ascii_case("base64") {
+            return None;
+        }
+
+        let bytes = match BASE64_STANDARD.decode(data_base64) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!("failed to decode generated image data: {err}");
+                return None;
+            }
+        };
+
+        let ext = match mime {
+            "image/jpeg" | "image/jpg" => "jpg",
+            "image/png" => "png",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            other => {
+                tracing::warn!("saving generated image with unrecognized mime type `{other}`");
+                "bin"
+            }
+        };
+
+        let dir = self
+            .config
+            .codex_home
+            .join("images")
+            .join(conversation_id.to_string());
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            tracing::warn!("failed to create images directory {}: {err}", dir.display());
+            return None;
+        }
+
+        let index = self.next_generated_image_index;
+        self.next_generated_image_index = self.next_generated_image_index.saturating_add(1);
+        let filename = format!("{index:06}.{ext}");
+        let path = dir.join(filename);
+        if let Err(err) = std::fs::write(&path, &bytes) {
+            tracing::warn!(
+                "failed to write generated image to {}: {err}",
+                path.display()
+            );
+            return None;
+        }
+
+        Some(path)
     }
 
     fn request_exit(&self) {
@@ -3007,6 +3312,262 @@ impl ChatWidget {
         self.model_family = model_family;
     }
 
+    fn handle_ref_image_command(&mut self, args: Option<String>) {
+        let ctx = RefImageContext {
+            cwd: &self.config.cwd,
+            codex_home: &self.config.codex_home,
+            conversation_id: self.conversation_id.as_ref(),
+        };
+
+        match self.ref_images.parse_command(args, &ctx) {
+            RefImageCommand::ShowHelpAndMaybeStatus => {
+                let message = "Usage: /ref-image <path1> <path2> ... [-- <prompt>]\n\
+                               • `/ref-image ls` — show current reference images\n\
+                               • `/ref-image clear` — clear the active reference images";
+                self.add_info_message(message.to_string(), None);
+
+                if !self.ref_images.active_paths().is_empty() {
+                    let display_paths: Vec<String> = self
+                        .ref_images
+                        .active_paths()
+                        .iter()
+                        .map(|p| display_path_for(p, &self.config.cwd))
+                        .collect();
+                    let display_paths = display_paths.join(", ");
+                    self.add_info_message(
+                        format!("Active reference images: {display_paths}"),
+                        None,
+                    );
+                }
+            }
+            RefImageCommand::ShowStatusOnly => {
+                if self.ref_images.active_paths().is_empty() {
+                    self.add_info_message(
+                        "No active reference images. The model will infer references from recent images."
+                            .to_string(),
+                        None,
+                    );
+                } else {
+                    let display_paths: Vec<String> = self
+                        .ref_images
+                        .active_paths()
+                        .iter()
+                        .map(|p| display_path_for(p, &self.config.cwd))
+                        .collect();
+                    let display_paths = display_paths.join(", ");
+                    self.add_info_message(
+                        format!("Active reference images: {display_paths}"),
+                        None,
+                    );
+                }
+            }
+            RefImageCommand::Clear => {
+                self.ref_images.clear();
+                self.submit_op(Op::ClearReferenceImages);
+                self.add_info_message("Reference images cleared.".to_string(), None);
+            }
+            RefImageCommand::Set { paths, prompt } => {
+                let attached_paths = self.bottom_pane.take_recent_submission_images();
+                let final_paths = if attached_paths.is_empty() {
+                    paths
+                } else {
+                    attached_paths
+                };
+
+                self.ref_images.set_paths(final_paths.clone());
+                self.submit_op(Op::SetReferenceImages { paths: final_paths });
+
+                let display_paths: Vec<String> = self
+                    .ref_images
+                    .active_paths()
+                    .iter()
+                    .map(|p| display_path_for(p, &self.config.cwd))
+                    .collect();
+                let display_paths = display_paths.join(", ");
+                self.add_info_message(format!("Reference images set: {display_paths}"), None);
+
+                if let Some(prompt_text) = prompt {
+                    let user_message = UserMessage {
+                        text: prompt_text,
+                        image_paths: Vec::new(),
+                    };
+                    self.queue_user_message(user_message);
+                }
+            }
+        }
+    }
+
+    fn handle_tumix_command(&mut self, user_prompt: Option<String>) {
+        if user_prompt.is_none() {
+            let help_msg = "🚀 **TUMIX** - 多智能体并行执行框架\n\n\
+                 **用法：** `/tumix <任务描述>`\n\n\
+                 **示例：**\n\
+                 • `/tumix 实现一个Rust自动微分库`\n\
+                 • `/tumix 优化这段代码的性能`\n\
+                 • `/tumix 设计分布式缓存系统`\n\n\
+                 **工作流程：**\n\
+                 1. Meta-agent 分析任务复杂度，灵活设计专家团队（2-15个agent）\n\
+                 2. 每个 agent 在独立的 Git worktree 中工作\n\
+                 3. 所有 agents 并行执行\n\
+                 4. 结果保存到 `.tumix/round1_sessions.json`\n\
+                 5. 创建分支：`round1-agent-01`, `round1-agent-02`...\n\n\
+                 💡 **Agent数量根据任务自动调整：**\n\
+                 • 简单任务 → 2-3个agent\n\
+                 • 中等任务 → 4-6个agent\n\
+                 • 复杂任务 → 7-10个agent\n\
+                 • 超大任务 → 10-15个agent\n\n\
+                 _请提供任务描述以启动 TUMIX_";
+
+            self.add_info_message(help_msg.to_string(), None);
+            return;
+        }
+
+        let session_id = match &self.conversation_id {
+            Some(id) => id.to_string(),
+            None => {
+                self.add_error_message("Cannot run `/tumix`: No active session".to_string());
+                return;
+            }
+        };
+
+        let frame_requester = self.frame_requester.clone();
+        let tx = self.app_event_tx.clone();
+
+        tokio::spawn(async move {
+            let progress_tx = tx.clone();
+            let progress_frame = frame_requester.clone();
+            let progress_cb: codex_tumix::ProgressCallback = Box::new(move |msg: String| {
+                progress_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                    history_cell::new_info_event(msg, None),
+                )));
+                progress_frame.schedule_frame();
+            });
+
+            let result = codex_tumix::run_tumix(session_id, user_prompt, Some(progress_cb)).await;
+
+            match result {
+                Ok(round_result) => {
+                    tx.send(AppEvent::InsertHistoryCell(Box::new(
+                        history_cell::new_info_event(format_tumix_summary(&round_result), None),
+                    )));
+                }
+                Err(err) => {
+                    tx.send(AppEvent::InsertHistoryCell(Box::new(
+                        history_cell::new_error_event(format!("TUMIX失败：{err}")),
+                    )));
+                }
+            }
+            frame_requester.schedule_frame();
+        });
+    }
+
+    fn handle_tumix_stop_command(&mut self, target: Option<String>) {
+        let target_session = target.and_then(|target| {
+            let trimmed = target.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        });
+
+        if let Some(session_id) = target_session {
+            match codex_tumix::cancel_run(&session_id) {
+                Some(run) => {
+                    let run_id = run.run_id;
+                    let short = run_id.chars().take(8).collect::<String>();
+                    let msg = format!(
+                        "🛑 Requested cancellation for TUMIX run {short}\n\
+                         • Session: {session_id}\n\
+                         • Run ID: {run_id}",
+                    );
+                    self.add_info_message(msg, None);
+                }
+                None => {
+                    self.add_error_message(format!(
+                        "⚠️ No active TUMIX run found for session `{session_id}`."
+                    ));
+                }
+            }
+            return;
+        }
+
+        let cancelled = codex_tumix::cancel_all_runs();
+        if cancelled.is_empty() {
+            self.add_info_message(
+                "ℹ️ There are no active TUMIX runs to stop.".to_string(),
+                None,
+            );
+            return;
+        }
+
+        let lines = cancelled
+            .iter()
+            .map(|run| {
+                let short = run.run_id.chars().take(8).collect::<String>();
+                let session_id = run.session_id.as_str();
+                format!("  • Session: {session_id} (run {short})")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        self.add_info_message(
+            format!(
+                "🛑 Requested cancellation for {} active TUMIX run(s):\n{lines}",
+                cancelled.len()
+            ),
+            None,
+        );
+    }
+
+    fn open_last_generated_image(&mut self) {
+        let Some(path) = self.last_generated_image_path.clone() else {
+            self.add_to_history(history_cell::new_info_event(
+                "No generated image is available to open yet.".to_string(),
+                None,
+            ));
+            self.request_redraw();
+            return;
+        };
+
+        let display = display_path_for(&path, &self.config.cwd);
+
+        match Self::open_image_in_viewer(&path) {
+            Ok(()) => {
+                self.add_to_history(history_cell::new_info_event(
+                    "Opening generated image".to_string(),
+                    Some(display),
+                ));
+            }
+            Err(error) => {
+                self.add_to_history(history_cell::new_error_event(format!(
+                    "Failed to open generated image: {error}"
+                )));
+            }
+        }
+
+        self.request_redraw();
+    }
+
+    fn open_image_in_viewer(path: &Path) -> std::result::Result<(), String> {
+        #[cfg(target_os = "macos")]
+        let cmd_result = std::process::Command::new("open").arg(path).spawn();
+
+        #[cfg(target_os = "linux")]
+        let cmd_result = std::process::Command::new("xdg-open").arg(path).spawn();
+
+        #[cfg(target_os = "windows")]
+        let cmd_result = std::process::Command::new("cmd")
+            .args(["/C", "start", "", &path.to_string_lossy()])
+            .spawn();
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        let cmd_result = Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "opening images is not supported on this platform",
+        ));
+
+        cmd_result
+            .map(|_| ())
+            .map_err(|error| format!("failed to spawn image viewer: {error}"))
+    }
+
     pub(crate) fn add_info_message(&mut self, message: String, hint: Option<String>) {
         self.add_to_history(history_cell::new_info_event(message, hint));
         self.request_redraw();
@@ -3301,6 +3862,25 @@ impl ChatWidget {
         self.conversation_id
     }
 
+    pub(crate) fn sidebar_status(&self) -> String {
+        if self.bottom_pane.is_task_running() {
+            return "运行中".to_string();
+        }
+
+        let exec_active = self
+            .active_cell
+            .as_ref()
+            .and_then(|c| c.as_any().downcast_ref::<crate::exec_cell::ExecCell>())
+            .map(crate::exec_cell::ExecCell::is_active)
+            .unwrap_or(false);
+
+        if exec_active || !self.running_commands.is_empty() {
+            return "运行中".to_string();
+        }
+
+        "就绪".to_string()
+    }
+
     pub(crate) fn rollout_path(&self) -> Option<PathBuf> {
         self.current_rollout_path.clone()
     }
@@ -3550,5 +4130,29 @@ fn skills_for_cwd(cwd: &Path, skills_entries: &[SkillsListEntry]) -> Vec<SkillMe
         .unwrap_or_default()
 }
 
+fn format_tumix_summary(result: &codex_tumix::Round1Result) -> String {
+    if result.agents.is_empty() {
+        return "⚠️ TUMIX Round 1 完成，但没有任何 agent 返回结果。".to_string();
+    }
+
+    let branch_lines = result
+        .agents
+        .iter()
+        .map(|agent| {
+            let commit_short = agent.commit_hash.chars().take(8).collect::<String>();
+            let branch = agent.branch.as_str();
+            format!("  - {branch} (commit: {commit_short})")
+        })
+        .collect::<Vec<_>>();
+
+    let count = result.agents.len();
+    let branches = branch_lines.join("\n");
+    format!(
+        "✨ TUMIX Round 1 完成\n\
+         📊 共执行 {count} 个 agent\n\
+         📁 详细日志与会话文件位于 `.tumix/`\n\
+         🌳 生成分支：\n{branches}",
+    )
+}
 #[cfg(test)]
 pub(crate) mod tests;

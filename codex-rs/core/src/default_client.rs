@@ -147,10 +147,11 @@ pub fn build_reqwest_client() -> reqwest::Client {
     if is_sandboxed() {
         builder = builder.no_proxy();
     }
-    // Tests spin up local mock servers (127.0.0.1). Respecting system proxies breaks
-    // those connections on some developer machines/CI (e.g., HTTP_PROXY=127.0.0.1:7890).
-    // Disable proxies for tests to ensure hermetic local IO.
-    if cfg!(test) {
+    // Tests spin up local mock servers (127.0.0.1). Respecting system proxies breaks those
+    // connections on some developer machines/CI (e.g., HTTP_PROXY=127.0.0.1:7890). We gate this
+    // on the `test-support` feature so it also applies to integration tests (where `cfg(test)` is
+    // false for the library crate).
+    if cfg!(any(test, feature = "test-support")) {
         builder = builder.no_proxy();
     }
 

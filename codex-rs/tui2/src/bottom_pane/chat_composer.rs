@@ -73,6 +73,7 @@ const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
 pub enum InputResult {
     Submitted(String),
     Command(SlashCommand),
+    CommandWithArgs(SlashCommand, String),
     None,
 }
 
@@ -1090,13 +1091,20 @@ impl ChatComposer {
                 // literal text.
                 let first_line = self.textarea.text().lines().next().unwrap_or("");
                 if let Some((name, rest)) = parse_slash_name(first_line)
-                    && rest.is_empty()
                     && let Some((_n, cmd)) = built_in_slash_commands()
                         .into_iter()
                         .find(|(n, _)| *n == name)
                 {
-                    self.textarea.set_text("");
-                    return (InputResult::Command(cmd), true);
+                    let rest_str = rest.trim().to_string();
+                    let has_args = !rest_str.is_empty();
+                    if !has_args {
+                        self.textarea.set_text("");
+                        return (InputResult::Command(cmd), true);
+                    }
+                    if cmd.accepts_args() {
+                        self.textarea.set_text("");
+                        return (InputResult::CommandWithArgs(cmd, rest_str), true);
+                    }
                 }
                 // If we're in a paste-like burst capture, treat Enter as part of the burst
                 // and accumulate it rather than submitting or inserting immediately.
@@ -2731,6 +2739,12 @@ mod tests {
             InputResult::Command(cmd) => {
                 assert_eq!(cmd.command(), "init");
             }
+            InputResult::CommandWithArgs(cmd, args) => {
+                panic!(
+                    "expected '/init' with no args, got '/{} {args}'",
+                    cmd.command()
+                )
+            }
             InputResult::Submitted(text) => {
                 panic!("expected command dispatch, but composer submitted literal text: {text}")
             }
@@ -2771,7 +2785,7 @@ mod tests {
             false,
         );
 
-        type_chars_humanlike(&mut composer, &['/', 'c']);
+        type_chars_humanlike(&mut composer, &['/', 'c', 'o']);
 
         let (_result, _needs_redraw) =
             composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -2804,6 +2818,12 @@ mod tests {
             composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match result {
             InputResult::Command(cmd) => assert_eq!(cmd.command(), "diff"),
+            InputResult::CommandWithArgs(cmd, args) => {
+                panic!(
+                    "expected '/diff' with no args, got '/{} {args}'",
+                    cmd.command()
+                )
+            }
             InputResult::Submitted(text) => {
                 panic!("expected command dispatch after Tab completion, got literal submit: {text}")
             }
@@ -2836,6 +2856,12 @@ mod tests {
         match result {
             InputResult::Command(cmd) => {
                 assert_eq!(cmd.command(), "mention");
+            }
+            InputResult::CommandWithArgs(cmd, args) => {
+                panic!(
+                    "expected '/mention' with no args, got '/{} {args}'",
+                    cmd.command()
+                )
             }
             InputResult::Submitted(text) => {
                 panic!("expected command dispatch, but composer submitted literal text: {text}")

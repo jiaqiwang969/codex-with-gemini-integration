@@ -179,14 +179,14 @@ fn ensure_codex_cli() -> Result<PathBuf> {
 
 async fn resolve_git_path() -> Result<String> {
     let git = Command::new("bash")
-        .arg("-lc")
+        .arg("-c")
         .arg("command -v git")
         .output()
         .await
-        .context("failed to resolve git via login shell")?;
+        .context("failed to resolve git via shell")?;
     ensure!(
         git.status.success(),
-        "failed to resolve git via login shell: {}",
+        "failed to resolve git via shell: {}",
         String::from_utf8_lossy(&git.stderr)
     );
     let git_path = String::from_utf8(git.stdout)

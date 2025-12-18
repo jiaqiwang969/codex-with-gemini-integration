@@ -17,6 +17,7 @@ use crate::pager_overlay::Overlay;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::Renderable;
 use crate::resume_picker::ResumeSelection;
+use crate::session_bar::SessionBar;
 use crate::skill_error_prompt::SkillErrorPromptOutcome;
 use crate::skill_error_prompt::run_skill_error_prompt;
 use crate::tui;
@@ -71,8 +72,10 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::select;
 use tokio::sync::mpsc::unbounded_channel;
+use tokio::task::JoinHandle;
 use unicode_width::UnicodeWidthStr;
 
 #[cfg(not(debug_assertions))]
@@ -329,6 +332,10 @@ pub(crate) struct App {
 
     // Esc-backtracking state grouped
     pub(crate) backtrack: crate::app_backtrack::BacktrackState,
+
+    cxresume_cache: Option<crate::cxresume_picker_widget::PickerState>,
+    cxresume_idle: CxresumeIdleLoader,
+
     pub(crate) feedback: codex_feedback::CodexFeedback,
     /// Set when the user confirms an update; propagated on exit.
     pub(crate) pending_update_action: Option<UpdateAction>,
@@ -339,8 +346,16 @@ pub(crate) struct App {
 
     // One-shot suppression of the next world-writable scan after user confirmation.
     skip_world_writable_scan_once: bool,
+
+    session_bar: SessionBar,
+    panel_focus: PanelFocus,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanelFocus {
+    Chat,
+    Sessions,
+}
 /// Content-relative selection within the inline transcript viewport.
 ///
 /// Selection endpoints are expressed in terms of flattened, wrapped transcript
@@ -369,6 +384,156 @@ impl App {
             self.chat_widget.submit_op(Op::Shutdown);
             self.server.remove_conversation(&conversation_id).await;
         }
+    }
+
+    async fn resume_session_from_rollout(
+        &mut self,
+        tui: &mut tui::Tui,
+        path: PathBuf,
+    ) -> Result<()> {
+        let summary = session_summary(
+            self.chat_widget.token_usage(),
+            self.chat_widget.conversation_id(),
+        );
+        let resumed = self
+            .server
+            .resume_conversation_from_rollout(
+                self.config.clone(),
+                path.clone(),
+                self.auth_manager.clone(),
+            )
+            .await
+            .wrap_err_with(|| format!("Failed to resume session from {}", path.display()))?;
+
+        self.render_transcript_once(tui);
+        self.transcript_cells.clear();
+        self.deferred_history_lines.clear();
+        self.has_emitted_history_lines = false;
+        self.transcript_scroll = TranscriptScroll::default();
+        self.transcript_selection = TranscriptSelection::default();
+        self.transcript_view_top = 0;
+        self.transcript_total_lines = 0;
+        self.reset_backtrack_state();
+
+        let models_manager = self.server.get_models_manager();
+        let resumed_model = resumed.session_configured.model.clone();
+        let model_family = models_manager
+            .construct_model_family(&resumed_model, &self.config)
+            .await;
+        let init = crate::chatwidget::ChatWidgetInit {
+            config: self.config.clone(),
+            frame_requester: tui.frame_requester(),
+            app_event_tx: self.app_event_tx.clone(),
+            initial_prompt: None,
+            initial_images: Vec::new(),
+            enhanced_keys_supported: self.enhanced_keys_supported,
+            auth_manager: self.auth_manager.clone(),
+            models_manager,
+            feedback: self.feedback.clone(),
+            is_first_run: false,
+            model_family: model_family.clone(),
+        };
+
+        self.shutdown_current_conversation().await;
+
+        self.chat_widget =
+            ChatWidget::new_from_existing(init, resumed.conversation, resumed.session_configured);
+        self.current_model = model_family.get_model_slug().to_string();
+
+        if let Some(summary) = summary {
+            let mut lines: Vec<Line<'static>> = vec![summary.usage_line.clone().into()];
+            if let Some(command) = summary.resume_command {
+                let spans = vec!["To continue this session, run ".into(), command.cyan()];
+                lines.push(spans.into());
+            }
+            self.chat_widget.add_plain_history_lines(lines);
+        }
+
+        self.panel_focus = PanelFocus::Chat;
+        self.session_bar.set_focus(false);
+        self.session_bar.refresh_sessions();
+
+        tui.frame_requester().schedule_frame();
+        Ok(())
+    }
+
+    pub(crate) fn open_or_refresh_session_picker(&mut self, tui: &mut tui::Tui) {
+        if let Some(Overlay::SessionPicker(picker)) = self.overlay.as_mut() {
+            if let Err(err) = picker.refresh_sessions(&self.config.codex_home, &self.config.cwd) {
+                self.chat_widget
+                    .add_error_message(format!("Failed to refresh sessions: {err}"));
+                tracing::warn!("Failed to refresh session picker: {err}");
+            }
+            tui.frame_requester().schedule_frame();
+            return;
+        }
+
+        let using_cache = self.cxresume_cache.is_some();
+        let overlay = if let Some(state) = self.cxresume_cache.clone() {
+            Ok(Overlay::SessionPicker(Box::new(
+                crate::pager_overlay::SessionPickerOverlay::from_state(
+                    self.config.codex_home.clone(),
+                    self.config.cwd.clone(),
+                    state,
+                ),
+            )))
+        } else {
+            crate::cxresume_picker_widget::create_session_picker_overlay(
+                &self.config.codex_home,
+                &self.config.cwd,
+            )
+        };
+
+        match overlay {
+            Ok(overlay) => {
+                let _ = tui.enter_alt_screen();
+                self.overlay = Some(overlay);
+                if let Some(state) = self
+                    .overlay
+                    .as_ref()
+                    .and_then(super::pager_overlay::Overlay::session_picker_state)
+                {
+                    self.update_cxresume_cache(state);
+                }
+                tui.frame_requester().schedule_frame();
+
+                if using_cache {
+                    let tx = self.app_event_tx.clone();
+                    let codex_home = self.config.codex_home.clone();
+                    let cwd = self.config.cwd.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let result = crate::cxresume_picker_widget::load_picker_state(
+                            codex_home.as_path(),
+                            cwd.as_path(),
+                        );
+                        match result {
+                            Ok(state) => tx.send(AppEvent::CxresumePrewarmReady(state)),
+                            Err(err) => tx.send(AppEvent::CxresumePrewarmFailed(err)),
+                        }
+                    });
+                }
+            }
+            Err(err) => {
+                self.chat_widget
+                    .add_error_message(format!("Failed to load sessions: {err}"));
+                tracing::warn!("Failed to create session picker: {err}");
+            }
+        }
+    }
+
+    pub(crate) fn refresh_session_bar(&mut self) {
+        self.session_bar.refresh_sessions();
+    }
+
+    pub(crate) fn update_cxresume_cache(
+        &mut self,
+        state: crate::cxresume_picker_widget::PickerState,
+    ) {
+        self.cxresume_cache = Some(state);
+    }
+
+    pub(crate) fn reset_cxresume_idle(&mut self) {
+        self.cxresume_idle.on_user_activity(&self.app_event_tx);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -470,6 +635,8 @@ impl App {
         #[cfg(not(debug_assertions))]
         let upgrade_version = crate::updates::get_upgrade_version(&config);
 
+        let session_bar = SessionBar::new(config.codex_home.clone(), config.cwd.clone());
+
         let mut app = Self {
             server: conversation_manager.clone(),
             app_event_tx,
@@ -490,11 +657,17 @@ impl App {
             has_emitted_history_lines: false,
             commit_anim_running: Arc::new(AtomicBool::new(false)),
             backtrack: BacktrackState::default(),
+            cxresume_cache: None,
+            cxresume_idle: CxresumeIdleLoader::new(Duration::from_secs(2)),
             feedback: feedback.clone(),
             pending_update_action: None,
             suppress_shutdown_complete: false,
             skip_world_writable_scan_once: false,
+            session_bar,
+            panel_focus: PanelFocus::Chat,
         };
+
+        app.cxresume_idle.trigger_immediate(&app.app_event_tx);
 
         // On startup, if Agent mode (workspace-write) or ReadOnly is active, warn about world-writable dirs on Windows.
         #[cfg(target_os = "windows")]
@@ -572,6 +745,10 @@ impl App {
         tui: &mut tui::Tui,
         event: TuiEvent,
     ) -> Result<bool> {
+        if matches!(event, TuiEvent::Key(_) | TuiEvent::Paste(_)) {
+            self.reset_cxresume_idle();
+        }
+
         if self.overlay.is_some() {
             let _ = self.handle_backtrack_overlay_event(tui, event).await?;
         } else {
@@ -598,20 +775,41 @@ impl App {
                     {
                         return Ok(true);
                     }
+                    let current_conv_id =
+                        self.chat_widget.conversation_id().map(|id| id.to_string());
+                    self.session_bar
+                        .set_current_session(current_conv_id.clone());
+                    if let Some(id) = current_conv_id {
+                        self.session_bar
+                            .set_session_status(id, self.chat_widget.sidebar_status());
+                    }
+
                     let cells = self.transcript_cells.clone();
                     tui.draw(tui.terminal.size()?.height, |frame| {
-                        let chat_height = self.chat_widget.desired_height(frame.area().width);
-                        let chat_top = self.render_transcript_cells(frame, &cells, chat_height);
+                        let session_height = 4u16.min(frame.area().height);
+                        let available_for_chat = frame.area().height.saturating_sub(session_height);
+                        let chat_height = self
+                            .chat_widget
+                            .desired_height(frame.area().width)
+                            .min(available_for_chat);
+
+                        let chat_top = self.render_transcript_cells(
+                            frame,
+                            &cells,
+                            chat_height.saturating_add(session_height),
+                        );
+                        let session_area = Rect {
+                            x: frame.area().x,
+                            y: frame.area().bottom().saturating_sub(session_height),
+                            width: frame.area().width,
+                            height: session_height,
+                        };
+                        let chat_max_height = session_area.y.saturating_sub(chat_top);
                         let chat_area = Rect {
                             x: frame.area().x,
                             y: chat_top,
                             width: frame.area().width,
-                            height: chat_height.min(
-                                frame
-                                    .area()
-                                    .height
-                                    .saturating_sub(chat_top.saturating_sub(frame.area().y)),
-                            ),
+                            height: chat_height.min(chat_max_height),
                         };
                         self.chat_widget.render(chat_area, frame.buffer);
                         let chat_bottom = chat_area.y.saturating_add(chat_area.height);
@@ -626,7 +824,14 @@ impl App {
                                 frame.buffer,
                             );
                         }
-                        if let Some((x, y)) = self.chat_widget.cursor_pos(chat_area) {
+
+                        if !session_area.is_empty() {
+                            frame.render_widget_ref(&self.session_bar, session_area);
+                        }
+
+                        if self.panel_focus == PanelFocus::Chat
+                            && let Some((x, y)) = self.chat_widget.cursor_pos(chat_area)
+                        {
                             frame.set_cursor_position((x, y));
                         }
                     })?;
@@ -829,13 +1034,15 @@ impl App {
             return;
         }
 
+        let session_height = 4u16.min(height);
         let chat_height = self.chat_widget.desired_height(width);
-        if chat_height >= height {
+        let reserved = chat_height.saturating_add(session_height);
+        if reserved >= height {
             return;
         }
 
         // Only handle events over the transcript area above the composer.
-        let transcript_height = height.saturating_sub(chat_height);
+        let transcript_height = height.saturating_sub(reserved);
         if transcript_height == 0 {
             return;
         }
@@ -1209,12 +1416,14 @@ impl App {
             return;
         }
 
+        let session_height = 4u16.min(height);
         let chat_height = self.chat_widget.desired_height(width);
-        if chat_height >= height {
+        let reserved = chat_height.saturating_add(session_height);
+        if reserved >= height {
             return;
         }
 
-        let transcript_height = height.saturating_sub(chat_height);
+        let transcript_height = height.saturating_sub(reserved);
         if transcript_height == 0 {
             return;
         }
@@ -1393,6 +1602,15 @@ impl App {
                     self.chat_widget.token_usage(),
                     self.chat_widget.conversation_id(),
                 );
+                self.render_transcript_once(tui);
+                self.transcript_cells.clear();
+                self.deferred_history_lines.clear();
+                self.has_emitted_history_lines = false;
+                self.transcript_scroll = TranscriptScroll::default();
+                self.transcript_selection = TranscriptSelection::default();
+                self.transcript_view_top = 0;
+                self.transcript_total_lines = 0;
+                self.reset_backtrack_state();
                 self.shutdown_current_conversation().await;
                 let init = crate::chatwidget::ChatWidgetInit {
                     config: self.config.clone(),
@@ -1417,78 +1635,123 @@ impl App {
                     }
                     self.chat_widget.add_plain_history_lines(lines);
                 }
+                self.panel_focus = PanelFocus::Chat;
+                self.session_bar.set_focus(false);
+                self.session_bar.refresh_sessions();
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::ResumeSession(path) => {
+                if let Err(err) = self.resume_session_from_rollout(tui, path.clone()).await {
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to resume session from {}: {err}",
+                        path.display()
+                    ));
+                }
+            }
+            AppEvent::SaveSessionAlias { session_id, alias } => {
+                self.session_bar.set_session_alias(session_id, alias);
+                self.session_bar.refresh_sessions();
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::CloneSession(source_path) => {
+                if self.chat_widget.is_task_running() {
+                    self.chat_widget.add_error_message(
+                        "Cannot clone a session while a task is running.".to_string(),
+                    );
+                    return Ok(true);
+                }
+
+                let config = self.chat_widget.config_ref().clone();
+                let cloned = match self
+                    .server
+                    .clone_conversation_from_rollout(config, source_path.clone())
+                    .await
+                {
+                    Ok(cloned) => cloned,
+                    Err(err) => {
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to clone session from {}: {err}",
+                            source_path.display()
+                        ));
+                        return Ok(true);
+                    }
+                };
+
+                let codex_core::NewConversation {
+                    conversation_id,
+                    conversation,
+                    session_configured,
+                } = cloned;
+                let session_id = session_configured.session_id.to_string();
+                self.server.remove_conversation(&conversation_id).await;
+                drop(conversation);
+
+                let app_tx = self.app_event_tx.clone();
+                self.chat_widget.show_session_alias_input_for_rename(
+                    session_id,
+                    Box::new(move |sid, alias| {
+                        app_tx.send(AppEvent::SaveSessionAlias {
+                            session_id: sid,
+                            alias,
+                        });
+                    }),
+                );
+
+                self.session_bar.refresh_sessions();
                 tui.frame_requester().schedule_frame();
             }
             AppEvent::OpenResumePicker => {
-                match crate::resume_picker::run_resume_picker(
-                    tui,
-                    &self.config.codex_home,
-                    &self.config.model_provider_id,
-                    false,
-                )
-                .await?
+                self.open_or_refresh_session_picker(tui);
+            }
+            AppEvent::CxresumeIdleCheck => {
+                if self
+                    .cxresume_idle
+                    .handle_idle_check(self.overlay.is_some(), &self.app_event_tx)
                 {
-                    ResumeSelection::Resume(path) => {
-                        let summary = session_summary(
-                            self.chat_widget.token_usage(),
-                            self.chat_widget.conversation_id(),
-                        );
-                        match self
-                            .server
-                            .resume_conversation_from_rollout(
-                                self.config.clone(),
-                                path.clone(),
-                                self.auth_manager.clone(),
+                    let tx = self.app_event_tx.clone();
+                    let codex_home = self.config.codex_home.clone();
+                    let cwd = self.config.cwd.clone();
+                    tokio::spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            crate::cxresume_picker_widget::load_picker_state(
+                                codex_home.as_path(),
+                                cwd.as_path(),
                             )
-                            .await
-                        {
-                            Ok(resumed) => {
-                                self.shutdown_current_conversation().await;
-                                let init = crate::chatwidget::ChatWidgetInit {
-                                    config: self.config.clone(),
-                                    frame_requester: tui.frame_requester(),
-                                    app_event_tx: self.app_event_tx.clone(),
-                                    initial_prompt: None,
-                                    initial_images: Vec::new(),
-                                    enhanced_keys_supported: self.enhanced_keys_supported,
-                                    auth_manager: self.auth_manager.clone(),
-                                    models_manager: self.server.get_models_manager(),
-                                    feedback: self.feedback.clone(),
-                                    is_first_run: false,
-                                    model_family: model_family.clone(),
-                                };
-                                self.chat_widget = ChatWidget::new_from_existing(
-                                    init,
-                                    resumed.conversation,
-                                    resumed.session_configured,
-                                );
-                                self.current_model = model_family.get_model_slug().to_string();
-                                if let Some(summary) = summary {
-                                    let mut lines: Vec<Line<'static>> =
-                                        vec![summary.usage_line.clone().into()];
-                                    if let Some(command) = summary.resume_command {
-                                        let spans = vec![
-                                            "To continue this session, run ".into(),
-                                            command.cyan(),
-                                        ];
-                                        lines.push(spans.into());
-                                    }
-                                    self.chat_widget.add_plain_history_lines(lines);
-                                }
+                        })
+                        .await;
+                        match result {
+                            Ok(Ok(state)) => {
+                                tx.send(AppEvent::CxresumePrewarmReady(state));
                             }
-                            Err(err) => {
-                                self.chat_widget.add_error_message(format!(
-                                    "Failed to resume session from {}: {err}",
-                                    path.display()
-                                ));
+                            Ok(Err(err)) => {
+                                tx.send(AppEvent::CxresumePrewarmFailed(err));
+                            }
+                            Err(join_err) => {
+                                tx.send(AppEvent::CxresumePrewarmFailed(join_err.to_string()));
                             }
                         }
-                    }
-                    ResumeSelection::Exit | ResumeSelection::StartFresh => {}
+                    });
                 }
-
-                // Leaving alt-screen may blank the inline viewport; force a redraw either way.
-                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::CxresumePrewarmReady(state) => {
+                tracing::debug!(
+                    "cxresume prewarm completed with {} sessions",
+                    state.sessions.len()
+                );
+                self.update_cxresume_cache(state.clone());
+                if self.cxresume_idle.job_in_flight {
+                    self.cxresume_idle.job_complete(&self.app_event_tx, true);
+                }
+                if let Some(Overlay::SessionPicker(picker)) = self.overlay.as_mut() {
+                    picker.replace_state(state);
+                    tui.frame_requester().schedule_frame();
+                }
+            }
+            AppEvent::CxresumePrewarmFailed(err) => {
+                tracing::debug!("cxresume prewarm failed: {err}");
+                if self.cxresume_idle.job_in_flight {
+                    self.cxresume_idle.job_complete(&self.app_event_tx, false);
+                }
             }
             AppEvent::InsertHistoryCell(cell) => {
                 let cell: Arc<dyn HistoryCell> = cell.into();
@@ -1952,15 +2215,75 @@ impl App {
                 kind: KeyEventKind::Press,
                 ..
             } => {
-                // Enter alternate screen and set viewport to full size.
                 let _ = tui.enter_alt_screen();
                 self.overlay = Some(Overlay::new_transcript(self.transcript_cells.clone()));
                 tui.frame_requester().schedule_frame();
+                return;
             }
-            // Esc primes/advances backtracking only in normal (not working) mode
-            // with the composer focused and empty. In any other state, forward
-            // Esc so the active UI (e.g. status indicator, modals, popups)
-            // handles it.
+            KeyEvent {
+                code: KeyCode::Char('x' | 'q'),
+                modifiers: crossterm::event::KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                self.open_or_refresh_session_picker(tui);
+                return;
+            }
+            KeyEvent {
+                code: KeyCode::Char('g'),
+                modifiers: crossterm::event::KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                match crate::git_graph_widget::create_git_graph_overlay(".") {
+                    Ok(overlay) => {
+                        let _ = tui.enter_alt_screen();
+                        self.overlay = Some(overlay);
+                        tui.frame_requester().schedule_frame();
+                    }
+                    Err(err) => {
+                        let error_lines = vec![
+                            "Failed to generate git graph:".red().into(),
+                            Line::from(""),
+                            err.clone().dim().into(),
+                            Line::from(""),
+                            "Make sure you are in a git repository.".italic().into(),
+                        ];
+                        let _ = tui.enter_alt_screen();
+                        self.overlay = Some(Overlay::new_static_with_lines(
+                            error_lines,
+                            "G I T   G R A P H   E R R O R".to_string(),
+                        ));
+                        tui.frame_requester().schedule_frame();
+                        tracing::warn!("Failed to create git graph: {err}");
+                    }
+                }
+                return;
+            }
+            KeyEvent {
+                code: KeyCode::Char('p'),
+                modifiers: crossterm::event::KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                self.panel_focus = PanelFocus::Sessions;
+                self.session_bar.set_focus(true);
+                self.session_bar.refresh_sessions();
+                let current_id = self.chat_widget.conversation_id().map(|id| id.to_string());
+                self.session_bar
+                    .reset_selection_for_focus(current_id.as_deref());
+                tui.frame_requester().schedule_frame();
+                return;
+            }
+            _ => {}
+        }
+
+        if self.panel_focus == PanelFocus::Sessions {
+            self.handle_session_bar_key_event(tui, key_event).await;
+            return;
+        }
+
+        match key_event {
             KeyEvent {
                 code: KeyCode::Esc,
                 kind: KeyEventKind::Press | KeyEventKind::Repeat,
@@ -1991,9 +2314,11 @@ impl App {
                 let width = size.width;
                 let height = size.height;
                 if width > 0 && height > 0 {
+                    let session_height = 4u16.min(height);
                     let chat_height = self.chat_widget.desired_height(width);
-                    if chat_height < height {
-                        let transcript_height = height.saturating_sub(chat_height);
+                    let reserved = chat_height.saturating_add(session_height);
+                    if reserved < height {
+                        let transcript_height = height.saturating_sub(reserved);
                         if transcript_height > 0 {
                             let delta = -i32::from(transcript_height);
                             self.scroll_transcript(
@@ -2015,9 +2340,11 @@ impl App {
                 let width = size.width;
                 let height = size.height;
                 if width > 0 && height > 0 {
+                    let session_height = 4u16.min(height);
                     let chat_height = self.chat_widget.desired_height(width);
-                    if chat_height < height {
-                        let transcript_height = height.saturating_sub(chat_height);
+                    let reserved = chat_height.saturating_add(session_height);
+                    if reserved < height {
+                        let transcript_height = height.saturating_sub(reserved);
                         if transcript_height > 0 {
                             let delta = i32::from(transcript_height);
                             self.scroll_transcript(
@@ -2060,25 +2387,179 @@ impl App {
                 && self.backtrack.nth_user_message != usize::MAX
                 && self.chat_widget.composer_is_empty() =>
             {
-                // Delegate to helper for clarity; preserves behavior.
                 self.confirm_backtrack_from_main();
             }
             KeyEvent {
                 kind: KeyEventKind::Press | KeyEventKind::Repeat,
                 ..
             } => {
-                // Any non-Esc key press should cancel a primed backtrack.
-                // This avoids stale "Esc-primed" state after the user starts typing
-                // (even if they later backspace to empty).
                 if key_event.code != KeyCode::Esc && self.backtrack.primed {
                     self.reset_backtrack_state();
                 }
                 self.chat_widget.handle_key_event(key_event);
             }
-            _ => {
-                // Ignore Release key events.
+            _ => {}
+        }
+    }
+
+    async fn handle_session_bar_key_event(&mut self, tui: &mut tui::Tui, key_event: KeyEvent) {
+        if matches!(key_event.kind, KeyEventKind::Release) {
+            return;
+        }
+
+        match key_event {
+            KeyEvent {
+                code: KeyCode::Esc,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            } => {
+                self.panel_focus = PanelFocus::Chat;
+                self.session_bar.set_focus(false);
+                tui.frame_requester().schedule_frame();
             }
-        };
+            KeyEvent {
+                code: KeyCode::Left,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            } => {
+                self.session_bar.select_previous();
+                tui.frame_requester().schedule_frame();
+            }
+            KeyEvent {
+                code: KeyCode::Right,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            } => {
+                self.session_bar.select_next();
+                tui.frame_requester().schedule_frame();
+            }
+            KeyEvent {
+                code: KeyCode::Enter,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                if self.chat_widget.is_task_running() {
+                    self.chat_widget.add_error_message(
+                        "Cannot switch sessions while a task is running.".to_string(),
+                    );
+                    return;
+                }
+
+                if self.session_bar.selected_is_new() {
+                    self.app_event_tx.send(AppEvent::NewSession);
+                } else if let Some(session) = self.session_bar.selected_session() {
+                    self.app_event_tx
+                        .send(AppEvent::ResumeSession(session.path.clone()));
+                } else {
+                    self.chat_widget
+                        .add_error_message("No session selected.".to_string());
+                    return;
+                }
+
+                self.panel_focus = PanelFocus::Chat;
+                self.session_bar.set_focus(false);
+                tui.frame_requester().schedule_frame();
+            }
+            KeyEvent {
+                code: KeyCode::Char('n'),
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                if self.chat_widget.is_task_running() {
+                    self.chat_widget.add_error_message(
+                        "Cannot start a new session while a task is running.".to_string(),
+                    );
+                    return;
+                }
+                self.app_event_tx.send(AppEvent::NewSession);
+                self.panel_focus = PanelFocus::Chat;
+                self.session_bar.set_focus(false);
+                tui.frame_requester().schedule_frame();
+            }
+            KeyEvent {
+                code: KeyCode::Char('r'),
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                if self.chat_widget.is_task_running() {
+                    self.chat_widget.add_error_message(
+                        "Cannot rename a session while a task is running.".to_string(),
+                    );
+                    return;
+                }
+
+                let Some(session) = self.session_bar.selected_session() else {
+                    self.chat_widget
+                        .add_error_message("No session selected to rename.".to_string());
+                    return;
+                };
+
+                let session_id = session.id.clone();
+                let app_tx = self.app_event_tx.clone();
+                self.chat_widget.show_session_alias_input_for_rename(
+                    session_id,
+                    Box::new(move |sid, alias| {
+                        app_tx.send(AppEvent::SaveSessionAlias {
+                            session_id: sid,
+                            alias,
+                        });
+                    }),
+                );
+
+                self.panel_focus = PanelFocus::Chat;
+                self.session_bar.set_focus(false);
+                tui.frame_requester().schedule_frame();
+            }
+            KeyEvent {
+                code: KeyCode::Char('c'),
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                if self.chat_widget.is_task_running() {
+                    self.chat_widget.add_error_message(
+                        "Cannot clone a session while a task is running.".to_string(),
+                    );
+                    return;
+                }
+
+                let Some(session) = self.session_bar.selected_session() else {
+                    self.chat_widget
+                        .add_error_message("No session selected to clone.".to_string());
+                    return;
+                };
+
+                self.app_event_tx
+                    .send(AppEvent::CloneSession(session.path.clone()));
+
+                self.panel_focus = PanelFocus::Chat;
+                self.session_bar.set_focus(false);
+                tui.frame_requester().schedule_frame();
+            }
+            KeyEvent {
+                code: KeyCode::Char('x'),
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                if self.chat_widget.is_task_running() {
+                    self.chat_widget.add_error_message(
+                        "Cannot delete a session while a task is running.".to_string(),
+                    );
+                    return;
+                }
+
+                if !self.session_bar.selected_is_new()
+                    && let Some(session) = self.session_bar.selected_session()
+                {
+                    let session_path = session.path.clone();
+                    let session_id = session.id.clone();
+                    let _ = std::fs::remove_file(&session_path);
+                    self.session_bar.remove_session_alias(&session_id);
+                    self.session_bar.refresh_sessions();
+                    tui.frame_requester().schedule_frame();
+                }
+            }
+            _ => {}
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -2110,6 +2591,108 @@ impl App {
     }
 }
 
+struct CxresumeIdleLoader {
+    idle_after: Duration,
+    last_activity: Instant,
+    job_in_flight: bool,
+    cooldown_until: Option<Instant>,
+    pending_check: Option<JoinHandle<()>>,
+}
+
+impl CxresumeIdleLoader {
+    fn new(idle_after: Duration) -> Self {
+        Self {
+            idle_after,
+            last_activity: Instant::now(),
+            job_in_flight: false,
+            cooldown_until: None,
+            pending_check: None,
+        }
+    }
+
+    fn on_user_activity(&mut self, tx: &AppEventSender) {
+        self.last_activity = Instant::now();
+        if !self.job_in_flight {
+            self.schedule_after(tx, self.idle_after);
+        }
+    }
+
+    fn handle_idle_check(&mut self, overlay_active: bool, tx: &AppEventSender) -> bool {
+        if self.job_in_flight {
+            return false;
+        }
+        if overlay_active {
+            self.schedule_after(tx, self.idle_after);
+            return false;
+        }
+
+        let now = Instant::now();
+        if let Some(deadline) = self.cooldown_until
+            && now < deadline
+        {
+            let remaining = deadline.saturating_duration_since(now);
+            self.schedule_after(tx, remaining);
+            return false;
+        }
+
+        let since_activity = now.saturating_duration_since(self.last_activity);
+        if since_activity < self.idle_after {
+            let remaining = self.idle_after - since_activity;
+            self.schedule_after(tx, remaining);
+            return false;
+        }
+
+        self.job_in_flight = true;
+        self.cancel_pending();
+        true
+    }
+
+    fn job_complete(&mut self, tx: &AppEventSender, success: bool) {
+        self.job_in_flight = false;
+        self.last_activity = Instant::now();
+        let cooldown = if success {
+            Duration::from_secs(300)
+        } else {
+            Duration::from_secs(60)
+        };
+        self.cooldown_until = Some(self.last_activity + cooldown);
+        self.schedule_after(tx, cooldown);
+    }
+
+    fn cancel_pending(&mut self) {
+        if let Some(handle) = self.pending_check.take() {
+            handle.abort();
+        }
+    }
+
+    fn schedule_after(&mut self, tx: &AppEventSender, delay: Duration) {
+        if self.job_in_flight {
+            return;
+        }
+        self.cancel_pending();
+        let tx = tx.clone();
+        self.pending_check = Some(tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            tx.send(AppEvent::CxresumeIdleCheck);
+        }));
+    }
+
+    fn trigger_immediate(&mut self, tx: &AppEventSender) {
+        if self.job_in_flight {
+            return;
+        }
+        self.last_activity = Instant::now()
+            .checked_sub(self.idle_after)
+            .unwrap_or_else(Instant::now);
+        self.schedule_after(tx, Duration::ZERO);
+    }
+}
+
+impl Drop for CxresumeIdleLoader {
+    fn drop(&mut self) {
+        self.cancel_pending();
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2147,6 +2730,7 @@ mod tests {
         let auth_manager =
             AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
         let file_search = FileSearchManager::new(config.cwd.clone(), app_event_tx.clone());
+        let session_bar = SessionBar::new(config.codex_home.clone(), config.cwd.clone());
 
         App {
             server,
@@ -2168,10 +2752,14 @@ mod tests {
             enhanced_keys_supported: false,
             commit_anim_running: Arc::new(AtomicBool::new(false)),
             backtrack: BacktrackState::default(),
+            cxresume_cache: None,
+            cxresume_idle: CxresumeIdleLoader::new(Duration::from_secs(2)),
             feedback: codex_feedback::CodexFeedback::new(),
             pending_update_action: None,
             suppress_shutdown_complete: false,
             skip_world_writable_scan_once: false,
+            session_bar,
+            panel_focus: PanelFocus::Chat,
         }
     }
 
@@ -2190,6 +2778,7 @@ mod tests {
         let auth_manager =
             AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
         let file_search = FileSearchManager::new(config.cwd.clone(), app_event_tx.clone());
+        let session_bar = SessionBar::new(config.codex_home.clone(), config.cwd.clone());
 
         (
             App {
@@ -2212,10 +2801,14 @@ mod tests {
                 enhanced_keys_supported: false,
                 commit_anim_running: Arc::new(AtomicBool::new(false)),
                 backtrack: BacktrackState::default(),
+                cxresume_cache: None,
+                cxresume_idle: CxresumeIdleLoader::new(Duration::from_secs(2)),
                 feedback: codex_feedback::CodexFeedback::new(),
                 pending_update_action: None,
                 suppress_shutdown_complete: false,
                 skip_world_writable_scan_once: false,
+                session_bar,
+                panel_focus: PanelFocus::Chat,
             },
             rx,
             op_rx,
@@ -2326,6 +2919,7 @@ mod tests {
                 history_log_id: 0,
                 history_entry_count: 0,
                 initial_messages: None,
+                skill_load_outcome: None,
                 rollout_path: PathBuf::new(),
             };
             Arc::new(new_session_info(
@@ -2443,6 +3037,7 @@ mod tests {
             history_log_id: 0,
             history_entry_count: 0,
             initial_messages: None,
+            skill_load_outcome: None,
             rollout_path: PathBuf::new(),
         };
 
