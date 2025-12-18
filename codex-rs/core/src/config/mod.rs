@@ -27,7 +27,6 @@ use crate::project_doc::DEFAULT_PROJECT_DOC_FILENAME;
 use crate::project_doc::LOCAL_PROJECT_DOC_FILENAME;
 use crate::protocol::AskForApproval;
 use crate::protocol::SandboxPolicy;
-use crate::util::resolve_path;
 use codex_app_server_protocol::Tools;
 use codex_app_server_protocol::UserSavedConfig;
 use codex_protocol::config_types::ForcedLoginMethod;
@@ -330,25 +329,35 @@ pub struct Config {
 }
 
 impl Config {
+    /// This is the preferred way to create an instance of [Config].
     pub async fn load_with_cli_overrides(
         cli_overrides: Vec<(String, TomlValue)>,
-        overrides: ConfigOverrides,
     ) -> std::io::Result<Self> {
         let codex_home = find_codex_home()?;
-
-        let root_value = load_resolved_config(
-            &codex_home,
-            cli_overrides,
-            crate::config_loader::LoaderOverrides::default(),
+        let config_toml =
+            load_config_as_toml_with_cli_overrides(&codex_home, cli_overrides).await?;
+        Self::load_from_base_config_with_overrides(
+            config_toml,
+            ConfigOverrides::default(),
+            codex_home,
         )
-        .await?;
+    }
 
-        let cfg = deserialize_config_toml_with_base(root_value, &codex_home).map_err(|e| {
-            tracing::error!("Failed to deserialize overridden config: {e}");
-            e
-        })?;
-
-        Self::load_from_base_config_with_overrides(cfg, overrides, codex_home)
+    /// This is a secondary way of creating [Config], which is appropriate when
+    /// the harness is meant to be used with a specific configuration that
+    /// ignores user settings. For example, the `codex exec` subcommand is
+    /// designed to use [AskForApproval::Never] exclusively.
+    ///
+    /// Further, [ConfigOverrides] contains some options that are not supported
+    /// in [ConfigToml], such as `cwd` and `codex_linux_sandbox_exe`.
+    pub async fn load_with_cli_overrides_and_harness_overrides(
+        cli_overrides: Vec<(String, TomlValue)>,
+        harness_overrides: ConfigOverrides,
+    ) -> std::io::Result<Self> {
+        let codex_home = find_codex_home()?;
+        let config_toml =
+            load_config_as_toml_with_cli_overrides(&codex_home, cli_overrides).await?;
+        Self::load_from_base_config_with_overrides(config_toml, harness_overrides, codex_home)
     }
 
     /// Determine if switching to a different model should also switch the
@@ -439,6 +448,8 @@ impl Config {
     }
 }
 
+/// DEPRECATED: Use [Config::load_with_cli_overrides()] instead because this
+/// codepath is not guaranteed to honor [ConfigRequirements].
 pub async fn load_config_as_toml_with_cli_overrides(
     codex_home: &Path,
     cli_overrides: Vec<(String, TomlValue)>,
@@ -806,8 +817,8 @@ pub struct ConfigToml {
     pub notice: Option<Notice>,
 
     /// Legacy, now use features
-    pub experimental_instructions_file: Option<PathBuf>,
-    pub experimental_compact_prompt_file: Option<PathBuf>,
+    pub experimental_instructions_file: Option<AbsolutePathBuf>,
+    pub experimental_compact_prompt_file: Option<AbsolutePathBuf>,
     pub experimental_use_unified_exec_tool: Option<bool>,
     pub experimental_use_rmcp_client: Option<bool>,
     pub experimental_use_freeform_apply_patch: Option<bool>,
@@ -888,9 +899,11 @@ pub struct GhostSnapshotToml {
     #[serde(alias = "ignore_untracked_files_over_bytes")]
     pub ignore_large_untracked_files: Option<i64>,
     /// Ignore untracked directories that contain this many files or more.
-    /// (Still emits a warning.)
+    /// (Still emits a warning unless warnings are disabled.)
     #[serde(alias = "large_untracked_dir_warning_threshold")]
     pub ignore_large_untracked_dirs: Option<i64>,
+    /// Disable all ghost snapshot warning events.
+    pub disable_warnings: Option<bool>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1110,8 +1123,8 @@ impl Config {
         mcp_servers
     }
 
-    /// Meant to be used exclusively for tests: `load_with_overrides()` should
-    /// be used in all other cases.
+    /// Meant to be used exclusively for tests:
+    /// [Config::load_with_cli_overrides()] should be used in all other cases.
     pub fn load_from_base_config_with_overrides(
         cfg: ConfigToml,
         overrides: ConfigOverrides,
@@ -1318,6 +1331,11 @@ impl Config {
                 config.ignore_large_untracked_dirs =
                     if threshold > 0 { Some(threshold) } else { None };
             }
+            if let Some(ghost_snapshot) = cfg.ghost_snapshot.as_ref()
+                && let Some(disable_warnings) = ghost_snapshot.disable_warnings
+            {
+                config.disable_warnings = disable_warnings;
+            }
             config
         };
 
@@ -1396,9 +1414,8 @@ impl Config {
             .experimental_instructions_file
             .as_ref()
             .or(cfg.experimental_instructions_file.as_ref());
-        let file_base_instructions = Self::load_override_from_file(
+        let file_base_instructions = Self::try_read_non_empty_file(
             experimental_instructions_path,
-            &resolved_cwd,
             "experimental instructions file",
         )?;
         let base_instructions = base_instructions.or(file_base_instructions);
@@ -1408,9 +1425,8 @@ impl Config {
             .experimental_compact_prompt_file
             .as_ref()
             .or(cfg.experimental_compact_prompt_file.as_ref());
-        let file_compact_prompt = Self::load_override_from_file(
+        let file_compact_prompt = Self::try_read_non_empty_file(
             experimental_compact_prompt_path,
-            &resolved_cwd,
             "experimental compact prompt file",
         )?;
         let compact_prompt = compact_prompt.or(file_compact_prompt);
@@ -1544,21 +1560,21 @@ impl Config {
         None
     }
 
-    fn load_override_from_file(
-        path: Option<&PathBuf>,
-        cwd: &Path,
-        description: &str,
+    /// If `path` is `Some`, attempts to read the file at the given path and
+    /// returns its contents as a trimmed `String`. If the file is empty, or
+    /// is `Some` but cannot be read, returns an `Err`.
+    fn try_read_non_empty_file(
+        path: Option<&AbsolutePathBuf>,
+        context: &str,
     ) -> std::io::Result<Option<String>> {
-        let Some(p) = path else {
+        let Some(path) = path else {
             return Ok(None);
         };
 
-        let full_path = resolve_path(cwd, p);
-
-        let contents = std::fs::read_to_string(&full_path).map_err(|e| {
+        let contents = std::fs::read_to_string(path).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
-                format!("failed to read {description} {}: {e}", full_path.display()),
+                format!("failed to read {context} {}: {e}", path.display()),
             )
         })?;
 
@@ -1566,7 +1582,7 @@ impl Config {
         if s.is_empty() {
             Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("{description} is empty: {}", full_path.display()),
+                format!("{context} is empty: {}", path.display()),
             ))
         } else {
             Ok(Some(s))
@@ -3089,7 +3105,9 @@ model = "gpt-5.1-codex"
         std::fs::write(&prompt_path, "  summarize differently  ")?;
 
         let cfg = ConfigToml {
-            experimental_compact_prompt_file: Some(PathBuf::from("compact_prompt.txt")),
+            experimental_compact_prompt_file: Some(AbsolutePathBuf::from_absolute_path(
+                prompt_path,
+            )?),
             ..Default::default()
         };
 
