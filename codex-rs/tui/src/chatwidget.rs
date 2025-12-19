@@ -558,6 +558,7 @@ impl ChatWidget {
     fn on_task_complete(&mut self, last_agent_message: Option<String>) {
         // If a stream is currently active, finalize it.
         self.flush_answer_stream_with_separator();
+        self.flush_wait_cell();
         // Mark task stopped and request redraw now that all content is in history.
         self.bottom_pane.set_task_running(false);
         self.running_commands.clear();
@@ -880,10 +881,54 @@ impl ChatWidget {
             .iter()
             .find(|session| session.key == ev.process_id)
             .map(|session| session.command_display.clone());
-        self.add_to_history(history_cell::new_unified_exec_interaction(
-            command_display,
-            ev.stdin,
-        ));
+        if ev.stdin.is_empty() {
+            // Empty stdin means we are still waiting on background output; keep a live shimmer cell.
+            if let Some(wait_cell) = self.active_cell.as_mut().and_then(|cell| {
+                cell.as_any_mut()
+                    .downcast_mut::<history_cell::UnifiedExecWaitCell>()
+            }) && wait_cell.matches(command_display.as_deref())
+            {
+                // Same session still waiting; update command display if it shows up late.
+                wait_cell.update_command_display(command_display);
+                self.request_redraw();
+                return;
+            }
+            let has_non_wait_active = matches!(
+                self.active_cell.as_ref(),
+                Some(active)
+                    if active
+                        .as_any()
+                        .downcast_ref::<history_cell::UnifiedExecWaitCell>()
+                        .is_none()
+            );
+            if has_non_wait_active {
+                // Do not preempt non-wait active cells with a wait entry.
+                return;
+            }
+            self.flush_wait_cell();
+            self.active_cell = Some(Box::new(history_cell::new_unified_exec_wait_live(
+                command_display,
+                self.config.animations,
+            )));
+            self.request_redraw();
+        } else {
+            if let Some(wait_cell) = self.active_cell.as_ref().and_then(|cell| {
+                cell.as_any()
+                    .downcast_ref::<history_cell::UnifiedExecWaitCell>()
+            }) {
+                // Convert the live wait cell into a static "(waited)" entry before logging stdin.
+                let waited_command = wait_cell.command_display().or(command_display.clone());
+                self.active_cell = None;
+                self.add_to_history(history_cell::new_unified_exec_interaction(
+                    waited_command,
+                    String::new(),
+                ));
+            }
+            self.add_to_history(history_cell::new_unified_exec_interaction(
+                command_display,
+                ev.stdin,
+            ));
+        }
     }
 
     fn on_patch_apply_begin(&mut self, event: PatchApplyBeginEvent) {
@@ -977,10 +1022,7 @@ impl ChatWidget {
 
     fn on_web_search_end(&mut self, ev: WebSearchEndEvent) {
         self.flush_answer_stream_with_separator();
-        self.add_to_history(history_cell::new_web_search_call(format!(
-            "Searched: {}",
-            ev.query
-        )));
+        self.add_to_history(history_cell::new_web_search_call(ev.query));
     }
 
     fn on_get_history_entry_response(
@@ -1703,6 +1745,9 @@ impl ChatWidget {
             SlashCommand::Status => {
                 self.add_status_output();
             }
+            SlashCommand::Ps => {
+                self.add_ps_output();
+            }
             SlashCommand::Mcp => {
                 self.add_mcp_output();
             }
@@ -1780,10 +1825,32 @@ impl ChatWidget {
     }
 
     fn flush_active_cell(&mut self) {
+        self.flush_wait_cell();
         if let Some(active) = self.active_cell.take() {
             self.needs_final_message_separator = true;
             self.app_event_tx.send(AppEvent::InsertHistoryCell(active));
         }
+    }
+
+    // Only flush a live wait cell here; other active cells must finalize via their end events.
+    fn flush_wait_cell(&mut self) {
+        // Wait cells are transient: convert them into "(waited)" history entries if present.
+        // Leave non-wait active cells intact so their end events can finalize them.
+        let Some(active) = self.active_cell.take() else {
+            return;
+        };
+        let Some(wait_cell) = active
+            .as_any()
+            .downcast_ref::<history_cell::UnifiedExecWaitCell>()
+        else {
+            self.active_cell = Some(active);
+            return;
+        };
+        self.needs_final_message_separator = true;
+        let cell =
+            history_cell::new_unified_exec_interaction(wait_cell.command_display(), String::new());
+        self.app_event_tx
+            .send(AppEvent::InsertHistoryCell(Box::new(cell)));
     }
 
     fn add_to_history(&mut self, cell: impl HistoryCell + 'static) {
@@ -2157,6 +2224,16 @@ impl ChatWidget {
             self.model_family.get_model_slug(),
         ));
     }
+
+    pub(crate) fn add_ps_output(&mut self) {
+        let sessions = self
+            .unified_exec_sessions
+            .iter()
+            .map(|session| session.command_display.clone())
+            .collect();
+        self.add_to_history(history_cell::new_unified_exec_sessions_output(sessions));
+    }
+
     fn stop_rate_limit_poller(&mut self) {
         if let Some(handle) = self.rate_limit_poller.take() {
             handle.abort();
@@ -2730,10 +2807,11 @@ impl ChatWidget {
         let features: Vec<BetaFeatureItem> = FEATURES
             .iter()
             .filter_map(|spec| {
+                let name = spec.stage.beta_menu_name()?;
                 let description = spec.stage.beta_menu_description()?;
                 Some(BetaFeatureItem {
                     feature: spec.id,
-                    name: feature_label_from_key(spec.key),
+                    name: name.to_string(),
                     description: description.to_string(),
                     enabled: self.config.features.enabled(spec.id),
                 })
@@ -3427,23 +3505,6 @@ impl ChatWidget {
     }
 }
 
-fn feature_label_from_key(key: &str) -> String {
-    let mut out = String::with_capacity(key.len());
-    let mut capitalize = true;
-    for ch in key.chars() {
-        if ch == '_' || ch == '-' {
-            out.push(' ');
-            capitalize = true;
-        } else if capitalize {
-            out.push(ch.to_ascii_uppercase());
-            capitalize = false;
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
-
 impl Drop for ChatWidget {
     fn drop(&mut self) {
         self.stop_rate_limit_poller();
@@ -3640,6 +3701,7 @@ fn skills_for_cwd(cwd: &Path, skills_entries: &[SkillsListEntry]) -> Vec<SkillMe
                 .map(|skill| SkillMetadata {
                     name: skill.name.clone(),
                     description: skill.description.clone(),
+                    short_description: skill.short_description.clone(),
                     path: skill.path.clone(),
                     scope: skill.scope,
                 })

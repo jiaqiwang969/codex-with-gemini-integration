@@ -295,10 +295,27 @@ impl AgentConfigLoader {
                 .context("Failed to deserialize merged config into ConfigToml")?
         };
 
-        let config = Config::load_from_base_config_with_overrides(
+        let empty_cli_overrides: Vec<(String, TomlValue)> = Vec::new();
+        let requirements = config_loader::load_config_layers_state(
+            self.registry.global_codex_home(),
+            &empty_cli_overrides,
+            config_loader::LoaderOverrides::default(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to load config requirements from {}",
+                self.registry.global_codex_home().to_string_lossy()
+            )
+        })?
+        .requirements()
+        .clone();
+
+        let config = Config::load_from_config_toml_with_overrides_and_requirements(
             config_toml.clone(),
             config_overrides,
             agent_codex_home.clone(),
+            requirements,
         )
         .with_context(|| {
             format!(

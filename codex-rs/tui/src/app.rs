@@ -14,8 +14,6 @@ use crate::pager_overlay::Overlay;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::Renderable;
 use crate::resume_picker::ResumeSelection;
-use crate::skill_error_prompt::SkillErrorPromptOutcome;
-use crate::skill_error_prompt::run_skill_error_prompt;
 use crate::tui;
 use crate::tui::TuiEvent;
 use crate::update_action::UpdateAction;
@@ -37,7 +35,6 @@ use codex_core::protocol::Op;
 use codex_core::protocol::SessionSource;
 use codex_core::protocol::SkillErrorInfo;
 use codex_core::protocol::TokenUsage;
-use codex_core::skills::SkillError;
 use codex_protocol::ConversationId;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelUpgrade;
@@ -89,16 +86,6 @@ fn session_summary(
     })
 }
 
-fn skill_errors_from_info(errors: &[SkillErrorInfo]) -> Vec<SkillError> {
-    errors
-        .iter()
-        .map(|err| SkillError {
-            path: err.path.clone(),
-            message: err.message.clone(),
-        })
-        .collect()
-}
-
 fn errors_for_cwd(cwd: &Path, response: &ListSkillsResponseEvent) -> Vec<SkillErrorInfo> {
     response
         .skills
@@ -106,6 +93,27 @@ fn errors_for_cwd(cwd: &Path, response: &ListSkillsResponseEvent) -> Vec<SkillEr
         .find(|entry| entry.cwd.as_path() == cwd)
         .map(|entry| entry.errors.clone())
         .unwrap_or_default()
+}
+
+fn emit_skill_load_warnings(app_event_tx: &AppEventSender, errors: &[SkillErrorInfo]) {
+    if errors.is_empty() {
+        return;
+    }
+
+    let error_count = errors.len();
+    app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+        crate::history_cell::new_warning_event(format!(
+            "Skipped loading {error_count} skill(s) due to invalid SKILL.md files."
+        )),
+    )));
+
+    for error in errors {
+        let path = error.path.display();
+        let message = error.message.as_str();
+        app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+            crate::history_cell::new_warning_event(format!("{path}: {message}")),
+        )));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,6 +195,7 @@ async fn handle_model_migration_prompt_if_needed(
         reasoning_effort_mapping,
         migration_config_key,
         model_link,
+        upgrade_copy,
     }) = upgrade
     {
         if migration_prompt_hidden(config, migration_config_key.as_str()) {
@@ -219,6 +228,7 @@ async fn handle_model_migration_prompt_if_needed(
             model,
             &target_model,
             model_link.clone(),
+            upgrade_copy.clone(),
             heading_label,
             target_description,
             can_opt_out,
@@ -705,18 +715,7 @@ impl App {
                 if let EventMsg::ListSkillsResponse(response) = &event.msg {
                     let cwd = self.chat_widget.config_ref().cwd.clone();
                     let errors = errors_for_cwd(&cwd, response);
-                    if errors.is_empty() {
-                        self.chat_widget.handle_codex_event(event);
-                        return Ok(true);
-                    }
-                    let errors = skill_errors_from_info(&errors);
-                    match run_skill_error_prompt(tui, &errors).await {
-                        SkillErrorPromptOutcome::Exit => {
-                            self.chat_widget.submit_op(Op::Shutdown);
-                            return Ok(false);
-                        }
-                        SkillErrorPromptOutcome::Continue => {}
-                    }
+                    emit_skill_load_warnings(&self.app_event_tx, &errors);
                 }
                 self.chat_widget.handle_codex_event(event);
             }
@@ -1253,8 +1252,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
-    fn make_test_app() -> App {
-        let (chat_widget, app_event_tx, _rx, _op_rx) = make_chatwidget_manual_with_sender();
+    async fn make_test_app() -> App {
+        let (chat_widget, app_event_tx, _rx, _op_rx) = make_chatwidget_manual_with_sender().await;
         let config = chat_widget.config_ref().clone();
         let current_model = chat_widget.get_model_family().get_model_slug().to_string();
         let server = Arc::new(ConversationManager::with_models_provider(
@@ -1288,12 +1287,12 @@ mod tests {
         }
     }
 
-    fn make_test_app_with_channels() -> (
+    async fn make_test_app_with_channels() -> (
         App,
         tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
         tokio::sync::mpsc::UnboundedReceiver<Op>,
     ) {
-        let (chat_widget, app_event_tx, rx, op_rx) = make_chatwidget_manual_with_sender();
+        let (chat_widget, app_event_tx, rx, op_rx) = make_chatwidget_manual_with_sender().await;
         let config = chat_widget.config_ref().clone();
         let current_model = chat_widget.get_model_family().get_model_slug().to_string();
         let server = Arc::new(ConversationManager::with_models_provider(
@@ -1335,8 +1334,8 @@ mod tests {
         codex_core::openai_models::model_presets::all_model_presets().clone()
     }
 
-    #[test]
-    fn model_migration_prompt_only_shows_for_deprecated_models() {
+    #[tokio::test]
+    async fn model_migration_prompt_only_shows_for_deprecated_models() {
         let seen = BTreeMap::new();
         assert!(should_show_model_migration_prompt(
             "gpt-5",
@@ -1370,8 +1369,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn model_migration_prompt_respects_hide_flag_and_self_target() {
+    #[tokio::test]
+    async fn model_migration_prompt_respects_hide_flag_and_self_target() {
         let mut seen = BTreeMap::new();
         seen.insert("gpt-5".to_string(), "gpt-5.1".to_string());
         assert!(!should_show_model_migration_prompt(
@@ -1388,8 +1387,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn model_migration_prompt_skips_when_target_missing() {
+    #[tokio::test]
+    async fn model_migration_prompt_skips_when_target_missing() {
         let mut available = all_model_presets();
         let mut current = available
             .iter()
@@ -1401,6 +1400,7 @@ mod tests {
             reasoning_effort_mapping: None,
             migration_config_key: HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG.to_string(),
             model_link: None,
+            upgrade_copy: None,
         });
         available.retain(|preset| preset.model != "gpt-5-codex");
         available.push(current.clone());
@@ -1415,9 +1415,9 @@ mod tests {
         assert!(target_preset_for_upgrade(&available, "missing-target").is_none());
     }
 
-    #[test]
-    fn update_reasoning_effort_updates_config() {
-        let mut app = make_test_app();
+    #[tokio::test]
+    async fn update_reasoning_effort_updates_config() {
+        let mut app = make_test_app().await;
         app.config.model_reasoning_effort = Some(ReasoningEffortConfig::Medium);
         app.chat_widget
             .set_reasoning_effort(Some(ReasoningEffortConfig::Medium));
@@ -1434,9 +1434,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn backtrack_selection_with_duplicate_history_targets_unique_turn() {
-        let mut app = make_test_app();
+    #[tokio::test]
+    async fn backtrack_selection_with_duplicate_history_targets_unique_turn() {
+        let mut app = make_test_app().await;
 
         let user_cell = |text: &str| -> Arc<dyn HistoryCell> {
             Arc::new(UserHistoryCell {
@@ -1504,7 +1504,7 @@ mod tests {
 
     #[tokio::test]
     async fn new_session_requests_shutdown_for_previous_conversation() {
-        let (mut app, mut app_event_rx, mut op_rx) = make_test_app_with_channels();
+        let (mut app, mut app_event_rx, mut op_rx) = make_test_app_with_channels().await;
 
         let conversation_id = ConversationId::new();
         let event = SessionConfiguredEvent {
@@ -1539,13 +1539,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn session_summary_skip_zero_usage() {
+    #[tokio::test]
+    async fn session_summary_skip_zero_usage() {
         assert!(session_summary(TokenUsage::default(), None).is_none());
     }
 
-    #[test]
-    fn session_summary_includes_resume_hint() {
+    #[tokio::test]
+    async fn session_summary_includes_resume_hint() {
         let usage = TokenUsage {
             input_tokens: 10,
             output_tokens: 2,
