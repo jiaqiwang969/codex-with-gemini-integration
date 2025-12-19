@@ -398,6 +398,7 @@ async fn make_chatwidget_manual(
         frame_requester: FrameRequester::test_dummy(),
         show_welcome_banner: true,
         queued_user_messages: VecDeque::new(),
+        queued_turn_pending_start: false,
         suppress_session_configured_redraw: false,
         pending_notification: None,
         is_review_mode: false,
@@ -1038,6 +1039,33 @@ async fn streaming_final_answer_keeps_task_running_state() {
         other => panic!("expected Op::Interrupt, got {other:?}"),
     }
     assert!(chat.bottom_pane.ctrl_c_quit_hint_visible());
+}
+
+#[tokio::test]
+async fn sidebar_status_stays_running_between_auto_queued_turns() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+
+    chat.on_task_started();
+
+    chat.bottom_pane
+        .set_composer_text("queued submission".to_string());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(chat.queued_user_messages.len(), 1);
+
+    chat.on_task_complete(None);
+
+    let mut saw_user_input = false;
+    for _ in 0..2 {
+        match op_rx.try_recv() {
+            Ok(Op::UserInput { .. }) => saw_user_input = true,
+            Ok(Op::AddToHistory { .. }) => {}
+            other => panic!("expected Op::UserInput/AddToHistory, got {other:?}"),
+        }
+    }
+    assert!(saw_user_input);
+    assert!(chat.queued_user_messages.is_empty());
+    assert!(!chat.bottom_pane.is_task_running());
+    assert_eq!(chat.sidebar_status(), "运行中");
 }
 
 #[tokio::test]

@@ -328,6 +328,10 @@ pub(crate) struct ChatWidget {
     suppress_session_configured_redraw: bool,
     // User messages queued while a turn is in progress
     queued_user_messages: VecDeque<UserMessage>,
+    /// True when we have submitted the next queued message but haven't yet
+    /// observed the corresponding `TaskStarted` event. This prevents the session
+    /// status from briefly flipping to "ready" between auto-queued turns.
+    queued_turn_pending_start: bool,
     // Pending notification to show when unfocused on next Draw
     pending_notification: Option<Notification>,
     // Simple review mode flag; used to adjust layout and banners.
@@ -694,6 +698,7 @@ impl ChatWidget {
 
     fn on_task_started(&mut self) {
         self.bottom_pane.clear_ctrl_c_quit_hint();
+        self.queued_turn_pending_start = false;
         self.bottom_pane.set_task_running(true);
         self.retry_status_header = None;
         self.bottom_pane.set_interrupt_hint_visible(true);
@@ -707,6 +712,7 @@ impl ChatWidget {
         // If a stream is currently active, finalize it.
         self.flush_answer_stream_with_separator();
         // Mark task stopped and request redraw now that all content is in history.
+        self.queued_turn_pending_start = false;
         self.bottom_pane.set_task_running(false);
         self.running_commands.clear();
         self.suppressed_exec_calls.clear();
@@ -841,6 +847,7 @@ impl ChatWidget {
         // Ensure any spinner is replaced by a red ✗ and flushed into history.
         self.finalize_active_cell_as_failed();
         // Reset running state and clear streaming buffers.
+        self.queued_turn_pending_start = false;
         self.bottom_pane.set_task_running(false);
         self.running_commands.clear();
         self.suppressed_exec_calls.clear();
@@ -1501,6 +1508,7 @@ impl ChatWidget {
             retry_status_header: None,
             conversation_id: None,
             queued_user_messages: VecDeque::new(),
+            queued_turn_pending_start: false,
             show_welcome_banner: is_first_run,
             suppress_session_configured_redraw: false,
             pending_notification: None,
@@ -1590,6 +1598,7 @@ impl ChatWidget {
             retry_status_header: None,
             conversation_id: None,
             queued_user_messages: VecDeque::new(),
+            queued_turn_pending_start: false,
             show_welcome_banner: false,
             suppress_session_configured_redraw: true,
             pending_notification: None,
@@ -2324,6 +2333,9 @@ impl ChatWidget {
             return;
         }
         if let Some(user_message) = self.queued_user_messages.pop_front() {
+            if !(user_message.text.is_empty() && user_message.image_paths.is_empty()) {
+                self.queued_turn_pending_start = true;
+            }
             self.submit_user_message(user_message);
         }
         // Update the list to reflect the remaining queued messages (if any).
@@ -3861,6 +3873,10 @@ impl ChatWidget {
 
     pub(crate) fn sidebar_status(&self) -> String {
         if self.bottom_pane.is_task_running() {
+            return "运行中".to_string();
+        }
+
+        if self.queued_turn_pending_start {
             return "运行中".to_string();
         }
 
