@@ -1069,7 +1069,7 @@ private:
         let temp = tempdir()?;
         tokio::fs::write(temp.path().join("hello.txt"), "hello\n").await?;
 
-        let (session, mut turn_context) = make_session_and_context();
+        let (session, mut turn_context) = make_session_and_context().await;
         turn_context.cwd = temp.path().to_path_buf();
 
         let invocation = ToolInvocation {
@@ -1106,7 +1106,7 @@ private:
         let temp = tempdir()?;
         tokio::fs::write(temp.path().join("hello.txt"), "zero\none\ntwo\n").await?;
 
-        let (session, mut turn_context) = make_session_and_context();
+        let (session, mut turn_context) = make_session_and_context().await;
         turn_context.cwd = temp.path().to_path_buf();
 
         let invocation = ToolInvocation {

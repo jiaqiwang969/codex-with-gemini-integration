@@ -3662,7 +3662,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_settings_clears_history_images_when_switching_away_from_gemini() {
-        let (session, turn_context) = make_session_and_context();
+        let (session, turn_context) = make_session_and_context().await;
 
         session
             .update_settings(SessionSettingsUpdate {
@@ -3708,7 +3708,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_settings_preserves_history_images_when_staying_on_gemini() {
-        let (session, turn_context) = make_session_and_context();
+        let (session, turn_context) = make_session_and_context().await;
 
         session
             .update_settings(SessionSettingsUpdate {

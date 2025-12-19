@@ -50,7 +50,12 @@ fn expected_models_for_api_key() -> Vec<ModelPreset> {
 fn expected_models_for_chatgpt() -> Vec<ModelPreset> {
     let mut gpt_5_1_codex_max = gpt_5_1_codex_max();
     gpt_5_1_codex_max.is_default = false;
-    let mut models = vec![gpt_52_codex(), gpt_5_1_codex_max, gpt_5_1_codex_mini(), gpt_5_2()];
+    let mut models = vec![
+        gpt_52_codex(),
+        gpt_5_1_codex_max,
+        gpt_5_1_codex_mini(),
+        gpt_5_2(),
+    ];
     models.extend(gemini_models());
     models
 }

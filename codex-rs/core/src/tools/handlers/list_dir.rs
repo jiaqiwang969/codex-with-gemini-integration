@@ -347,7 +347,7 @@ mod tests {
         let temp = tempdir()?;
         tokio::fs::write(temp.path().join("entry.txt"), b"content").await?;
 
-        let (session, mut turn_context) = make_session_and_context();
+        let (session, mut turn_context) = make_session_and_context().await;
         turn_context.cwd = temp.path().to_path_buf();
 
         let invocation = ToolInvocation {
