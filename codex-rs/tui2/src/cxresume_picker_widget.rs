@@ -880,16 +880,6 @@ impl PickerState {
             self.animation_tick = 0;
         }
     }
-
-    pub fn has_running_tumix(&self) -> bool {
-        self.has_running_tumix
-    }
-
-    pub fn inherit_animation(&mut self, other: &PickerState) {
-        if self.has_running_tumix && other.has_running_tumix() {
-            self.animation_tick = other.animation_frame();
-        }
-    }
 }
 
 /// Event type enum for picker keyboard input
