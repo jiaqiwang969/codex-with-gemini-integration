@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
@@ -26,6 +27,8 @@ use codex_otel::otel_manager::OtelManager;
 use codex_protocol::ConversationId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::SessionSource;
@@ -87,6 +90,7 @@ const GEMINI_READ_ONLY_TOOL_NAMES: [&str; 9] = [
     "shell",
     "shell_command",
 ];
+const DEFAULT_GEMINI_THINKING_BUDGET: i32 = 8192;
 
 fn parse_bool_env(key: &str) -> Option<bool> {
     std::env::var(key).ok().and_then(|value| {
@@ -322,6 +326,7 @@ impl ModelClient {
         let base_url = self.provider.base_url.as_ref().ok_or_else(|| {
             CodexErr::UnsupportedOperation("Gemini providers must define a base_url".to_string())
         })?;
+        let base_url = Self::normalize_gemini_base_url(base_url);
 
         let model = self.get_model();
         let api_model = model.strip_suffix("-codex").unwrap_or(&model);
@@ -331,13 +336,13 @@ impl ModelClient {
         // Use streamGenerateContent endpoint with alt=sse for streaming
         let url = format!(
             "{}/models/{api_model}:streamGenerateContent?alt=sse",
-            base_url.trim_end_matches('/'),
+            base_url.as_ref().trim_end_matches('/'),
         );
 
         let model_family = self.get_model_family();
         let instructions = prompt.get_full_instructions(&model_family).into_owned();
         let formatted_input = prompt.get_formatted_input();
-        let contents = build_gemini_contents(&formatted_input, &prompt.reference_images);
+        let contents = build_gemini_contents(&formatted_input, &prompt.reference_images, api_model);
         if contents.is_empty() {
             return Err(CodexErr::UnsupportedOperation(
                 "Gemini requests require at least one message".to_string(),
@@ -365,7 +370,8 @@ impl ModelClient {
         // preview models accept the request without 400/429 errors.
         let contents = ensure_active_loop_has_thought_signatures(&contents);
 
-        let thinking_config = Self::build_gemini_thinking_config(api_model);
+        let reasoning_effort = self.effort.or(model_family.default_reasoning_effort);
+        let thinking_config = Self::build_gemini_thinking_config(api_model, reasoning_effort);
 
         // Build generationConfig with thinkingConfig nested properly.
         // Gemini defaults to temperature=1.0; Codex uses a slightly
@@ -556,14 +562,15 @@ instead (for example: `codex -p codex`), or execute the command manually in your
         Ok(spawn_gemini_sse_stream(byte_stream, idle_timeout))
     }
 
-    fn build_gemini_thinking_config(api_model: &str) -> Option<GeminiThinkingConfig> {
-        let is_thinking_model = api_model.contains("thinking");
-
+    fn build_gemini_thinking_config(
+        api_model: &str,
+        reasoning_effort: Option<ReasoningEffortConfig>,
+    ) -> Option<GeminiThinkingConfig> {
         if api_model.contains("image") {
             return None;
         }
 
-        if is_thinking_model {
+        if is_gemini_3_model(api_model) {
             return Some(GeminiThinkingConfig {
                 thinking_level: Some("high".to_string()),
                 include_thoughts: Some(true),
@@ -573,9 +580,22 @@ instead (for example: `codex -p codex`), or execute the command manually in your
 
         Some(GeminiThinkingConfig {
             thinking_level: None,
-            include_thoughts: None,
-            thinking_budget: Some(32768),
+            include_thoughts: matches!(
+                reasoning_effort,
+                Some(ReasoningEffortConfig::High | ReasoningEffortConfig::XHigh)
+            )
+            .then_some(true),
+            thinking_budget: Some(DEFAULT_GEMINI_THINKING_BUDGET),
         })
+    }
+
+    fn normalize_gemini_base_url(base_url: &str) -> Cow<'_, str> {
+        let trimmed = base_url.trim_end_matches('/');
+        if let Some(prefix) = trimmed.strip_suffix("/v1") {
+            Cow::Owned(format!("{prefix}/v1beta"))
+        } else {
+            Cow::Borrowed(trimmed)
+        }
     }
 
     /// Streams a turn via the OpenAI Responses API.
@@ -894,9 +914,11 @@ async fn process_gemini_sse<S>(
                         if let Some(sig) = &part.thought_signature {
                             last_thought_signature = Some(sig.clone());
                         }
+                        let is_thought = part.thought.is_some();
 
                         // Handle text content
                         if let Some(text) = part.text
+                            && !is_thought
                             && !text.is_empty()
                         {
                             // Send OutputItemAdded on first text
@@ -1053,6 +1075,7 @@ fn candidate_to_response_item(candidate: GeminiCandidate) -> Option<ResponseItem
         if let Some(sig) = &part.thought_signature {
             last_part_thought_signature = Some(sig.clone());
         }
+        let is_thought = part.thought.is_some();
 
         if function_call.is_none()
             && let Some(call) = part.function_call
@@ -1064,6 +1087,9 @@ fn candidate_to_response_item(candidate: GeminiCandidate) -> Option<ResponseItem
 
         if let Some(text) = part.text {
             if text.trim().is_empty() {
+                continue;
+            }
+            if is_thought {
                 continue;
             }
             response_parts.push(ContentItem::OutputText { text });
@@ -1108,6 +1134,7 @@ fn candidate_to_response_item(candidate: GeminiCandidate) -> Option<ResponseItem
 fn build_gemini_contents(
     items: &[ResponseItem],
     reference_images: &[String],
+    api_model: &str,
 ) -> Vec<GeminiContentRequest> {
     let mut contents = Vec::new();
     // Record function calls emitted by the model so we can pair subsequent
@@ -1169,26 +1196,41 @@ fn build_gemini_contents(
                     .map(|(name, sig)| (name.clone(), sig.clone()))
                     .unwrap_or_else(|| ("unknown_function".to_string(), None));
 
-                // Build the response object with the output content
+                let (output_text, mut inline_parts) =
+                    build_gemini_function_response_payload(output);
                 let response_value = serde_json::json!({
-                    "output": output.content.clone(),
+                    "output": output_text,
                     "success": output.success.unwrap_or(true)
                 });
                 let part_thought_signature = thought_signature.clone();
+                let supports_multimodal = is_gemini_3_model(api_model);
+                let nested_parts = if supports_multimodal && !inline_parts.is_empty() {
+                    Some(std::mem::take(&mut inline_parts))
+                } else {
+                    None
+                };
+
+                let mut parts = vec![GeminiPartRequest {
+                    text: None,
+                    inline_data: None,
+                    function_call: None,
+                    function_response: Some(GeminiFunctionResponsePart {
+                        id: Some(call_id.clone()),
+                        name: function_name,
+                        response: response_value,
+                        parts: nested_parts,
+                    }),
+                    thought_signature: part_thought_signature.clone(),
+                    compat_thought_signature: part_thought_signature,
+                }];
+
+                if !supports_multimodal {
+                    parts.append(&mut inline_parts);
+                }
 
                 contents.push(GeminiContentRequest {
                     role: Some("function".to_string()),
-                    parts: vec![GeminiPartRequest {
-                        text: None,
-                        inline_data: None,
-                        function_call: None,
-                        function_response: Some(GeminiFunctionResponsePart {
-                            name: function_name,
-                            response: response_value,
-                        }),
-                        thought_signature: part_thought_signature.clone(),
-                        compat_thought_signature: part_thought_signature,
-                    }],
+                    parts,
                 });
             }
             _ => {}
@@ -1198,6 +1240,76 @@ fn build_gemini_contents(
     append_reference_images_to_contents(&mut contents, reference_images);
 
     contents
+}
+
+fn is_gemini_3_model(api_model: &str) -> bool {
+    api_model.starts_with("gemini-3")
+}
+
+fn gemini_inline_data_part(mime_type: String, data: String) -> GeminiPartRequest {
+    GeminiPartRequest {
+        text: None,
+        inline_data: Some(GeminiInlineData { mime_type, data }),
+        function_call: None,
+        function_response: None,
+        thought_signature: None,
+        compat_thought_signature: None,
+    }
+}
+
+fn split_function_output_content(
+    items: &[FunctionCallOutputContentItem],
+) -> (Vec<String>, Vec<GeminiPartRequest>) {
+    let mut text_parts = Vec::new();
+    let mut inline_parts = Vec::new();
+
+    for item in items {
+        match item {
+            FunctionCallOutputContentItem::InputText { text } => {
+                if !text.trim().is_empty() {
+                    text_parts.push(text.clone());
+                }
+            }
+            FunctionCallOutputContentItem::InputImage { image_url } => {
+                if let Some((mime, data)) = parse_data_url(image_url) {
+                    inline_parts.push(gemini_inline_data_part(mime, data));
+                } else if !image_url.trim().is_empty() {
+                    text_parts.push(format!("Image reference: {image_url}"));
+                }
+            }
+        }
+    }
+
+    (text_parts, inline_parts)
+}
+
+fn build_gemini_function_response_payload(
+    output: &FunctionCallOutputPayload,
+) -> (String, Vec<GeminiPartRequest>) {
+    let (text_parts, inline_parts) = if let Some(items) = output
+        .content_items
+        .as_ref()
+        .filter(|items| !items.is_empty())
+    {
+        split_function_output_content(items)
+    } else {
+        let mut text_parts = Vec::new();
+        if !output.content.trim().is_empty() {
+            text_parts.push(output.content.clone());
+        }
+        (text_parts, Vec::new())
+    };
+
+    let mut output_text = if text_parts.is_empty() {
+        String::new()
+    } else {
+        text_parts.join("\n")
+    };
+    if output_text.is_empty() && !inline_parts.is_empty() {
+        output_text = format!("Binary content provided ({} item(s)).", inline_parts.len());
+    }
+
+    (output_text, inline_parts)
 }
 
 fn map_gemini_role(role: &str) -> String {
@@ -1292,7 +1404,16 @@ fn ensure_active_loop_has_thought_signatures(
             if part.function_call.is_some() && !patched_first_call {
                 patched_first_call = true;
                 if part.thought_signature.is_none() {
-                    part.thought_signature = Some(SYNTHETIC_THOUGHT_SIGNATURE.to_string());
+                    let signature = part
+                        .compat_thought_signature
+                        .clone()
+                        .unwrap_or_else(|| SYNTHETIC_THOUGHT_SIGNATURE.to_string());
+                    part.thought_signature = Some(signature.clone());
+                    if part.compat_thought_signature.is_none() {
+                        part.compat_thought_signature = Some(signature);
+                    }
+                } else if part.compat_thought_signature.is_none() {
+                    part.compat_thought_signature = part.thought_signature.clone();
                 }
             }
         }
@@ -1543,8 +1664,8 @@ struct GeminiThinkingConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     include_thoughts: Option<bool>,
     /// Token budget for thinking. Use -1 for no limit, 0 to disable.
-    /// Codex caps this at 32768 tokens to better support long, multi-step
-    /// reasoning while still bounding worst-case cost.
+    /// Codex caps this at 8192 tokens to keep Gemini 2.x loops bounded while
+    /// still allowing multi-step reasoning.
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking_budget: Option<i32>,
 }
@@ -1584,7 +1705,7 @@ struct GeminiContentRequest {
     parts: Vec<GeminiPartRequest>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct GeminiPartRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1607,7 +1728,7 @@ struct GeminiPartRequest {
     compat_thought_signature: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct GeminiInlineData {
     mime_type: String,
@@ -1648,6 +1769,9 @@ struct GeminiPartResponse {
     /// Gemini 3 thought signature - must be preserved and returned in subsequent requests
     #[serde(rename = "thoughtSignature", default)]
     thought_signature: Option<String>,
+
+    #[serde(default)]
+    thought: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1659,7 +1783,7 @@ struct GeminiFunctionCall {
 }
 
 /// Used in request parts to represent a function call from the model (for history replay).
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct GeminiFunctionCallPart {
     name: String,
@@ -1667,11 +1791,15 @@ struct GeminiFunctionCallPart {
 }
 
 /// Used in request parts to represent a function response back to the model.
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct GeminiFunctionResponsePart {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
     name: String,
     response: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parts: Option<Vec<GeminiPartRequest>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1880,6 +2008,7 @@ impl SseTelemetry for ApiTelemetry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_protocol::models::FunctionCallOutputContentItem;
     use codex_protocol::models::FunctionCallOutputPayload;
     use pretty_assertions::assert_eq;
     use serde_json::json;
@@ -1949,6 +2078,10 @@ mod tests {
             processed[1].parts[0].thought_signature.is_none(),
             "Earlier model turn outside active loop should remain unchanged"
         );
+        assert!(
+            processed[1].parts[0].compat_thought_signature.is_none(),
+            "Earlier model turn outside active loop should remain unchanged"
+        );
 
         // Turn 2 Model (Index 3) - Should be fixed
         assert_eq!(processed[3].role.as_deref(), Some("model"));
@@ -1956,6 +2089,28 @@ mod tests {
             processed[3].parts[0].thought_signature.as_deref(),
             Some("skip_thought_signature_validator"),
             "Latest model turn in active loop should have thought signature"
+        );
+        assert_eq!(
+            processed[3].parts[0].compat_thought_signature.as_deref(),
+            Some("skip_thought_signature_validator"),
+            "Latest model turn in active loop should have thought signature"
+        );
+    }
+
+    #[test]
+    fn normalize_gemini_base_url_promotes_v1_to_v1beta() {
+        assert_eq!(
+            ModelClient::normalize_gemini_base_url("https://api.ppaicode.com/v1").as_ref(),
+            "https://api.ppaicode.com/v1beta"
+        );
+        assert_eq!(
+            ModelClient::normalize_gemini_base_url("https://generativelanguage.googleapis.com/v1/")
+                .as_ref(),
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+        assert_eq!(
+            ModelClient::normalize_gemini_base_url("https://api.ppchat.vip/v1beta").as_ref(),
+            "https://api.ppchat.vip/v1beta"
         );
     }
 
@@ -2079,7 +2234,7 @@ mod tests {
             },
         ];
 
-        let contents = build_gemini_contents(&items, &[]);
+        let contents = build_gemini_contents(&items, &[], "gemini-3-pro-preview");
 
         assert_eq!(contents.len(), 5);
 
@@ -2112,6 +2267,135 @@ mod tests {
             contents[4].parts[0].compat_thought_signature.as_deref(),
             Some("sig-2")
         );
+    }
+
+    #[test]
+    fn build_gemini_contents_nests_inline_data_for_gemini_3_function_responses() {
+        let items = vec![
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "hi".to_string(),
+                }],
+                thought_signature: None,
+            },
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "view_image".to_string(),
+                arguments: serde_json::to_string(&json!({ "path": "image.png" })).unwrap(),
+                call_id: "call-1".to_string(),
+                thought_signature: Some("sig-1".to_string()),
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: "call-1".to_string(),
+                output: FunctionCallOutputPayload {
+                    content_items: Some(vec![FunctionCallOutputContentItem::InputImage {
+                        image_url: "data:image/png;base64,AAAA".to_string(),
+                    }]),
+                    ..Default::default()
+                },
+            },
+        ];
+
+        let contents = build_gemini_contents(&items, &[], "gemini-3-pro-preview");
+
+        let expected_inline = GeminiPartRequest {
+            text: None,
+            inline_data: Some(GeminiInlineData {
+                mime_type: "image/png".to_string(),
+                data: "AAAA".to_string(),
+            }),
+            function_call: None,
+            function_response: None,
+            thought_signature: None,
+            compat_thought_signature: None,
+        };
+
+        let expected_parts = vec![GeminiPartRequest {
+            text: None,
+            inline_data: None,
+            function_call: None,
+            function_response: Some(GeminiFunctionResponsePart {
+                id: Some("call-1".to_string()),
+                name: "view_image".to_string(),
+                response: json!({
+                    "output": "Binary content provided (1 item(s)).",
+                    "success": true
+                }),
+                parts: Some(vec![expected_inline]),
+            }),
+            thought_signature: Some("sig-1".to_string()),
+            compat_thought_signature: Some("sig-1".to_string()),
+        }];
+
+        assert_eq!(contents[2].parts, expected_parts);
+    }
+
+    #[test]
+    fn build_gemini_contents_sends_inline_data_as_siblings_for_non_gemini_3() {
+        let items = vec![
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "hi".to_string(),
+                }],
+                thought_signature: None,
+            },
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "view_image".to_string(),
+                arguments: serde_json::to_string(&json!({ "path": "image.png" })).unwrap(),
+                call_id: "call-1".to_string(),
+                thought_signature: Some("sig-1".to_string()),
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: "call-1".to_string(),
+                output: FunctionCallOutputPayload {
+                    content_items: Some(vec![FunctionCallOutputContentItem::InputImage {
+                        image_url: "data:image/png;base64,AAAA".to_string(),
+                    }]),
+                    ..Default::default()
+                },
+            },
+        ];
+
+        let contents = build_gemini_contents(&items, &[], "gemini-2.5-pro");
+
+        let expected_inline = GeminiPartRequest {
+            text: None,
+            inline_data: Some(GeminiInlineData {
+                mime_type: "image/png".to_string(),
+                data: "AAAA".to_string(),
+            }),
+            function_call: None,
+            function_response: None,
+            thought_signature: None,
+            compat_thought_signature: None,
+        };
+
+        let expected_parts = vec![
+            GeminiPartRequest {
+                text: None,
+                inline_data: None,
+                function_call: None,
+                function_response: Some(GeminiFunctionResponsePart {
+                    id: Some("call-1".to_string()),
+                    name: "view_image".to_string(),
+                    response: json!({
+                        "output": "Binary content provided (1 item(s)).",
+                        "success": true
+                    }),
+                    parts: None,
+                }),
+                thought_signature: Some("sig-1".to_string()),
+                compat_thought_signature: Some("sig-1".to_string()),
+            },
+            expected_inline,
+        ];
+
+        assert_eq!(contents[2].parts, expected_parts);
     }
 
     fn make_function_tool(name: &str) -> ToolSpec {
@@ -2212,7 +2496,24 @@ mod tests {
 
     #[test]
     fn build_gemini_thinking_config_sets_high_level_for_thinking_models() {
-        let config = ModelClient::build_gemini_thinking_config("gemini-3-pro-preview-thinking");
+        let config = ModelClient::build_gemini_thinking_config(
+            "gemini-3-pro-preview-codex",
+            Some(ReasoningEffortConfig::High),
+        );
+
+        assert_eq!(
+            config,
+            Some(GeminiThinkingConfig {
+                thinking_level: Some("high".to_string()),
+                include_thoughts: Some(true),
+                thinking_budget: None,
+            })
+        );
+    }
+
+    #[test]
+    fn build_gemini_thinking_config_defaults_to_high_for_gemini_3() {
+        let config = ModelClient::build_gemini_thinking_config("gemini-3-flash-preview", None);
 
         assert_eq!(
             config,
@@ -2226,21 +2527,24 @@ mod tests {
 
     #[test]
     fn build_gemini_thinking_config_uses_budget_for_text_models() {
-        let config = ModelClient::build_gemini_thinking_config("gemini-3-pro-preview");
+        let config = ModelClient::build_gemini_thinking_config("gemini-2.5-pro", None);
 
         assert_eq!(
             config,
             Some(GeminiThinkingConfig {
                 thinking_level: None,
                 include_thoughts: None,
-                thinking_budget: Some(32768),
+                thinking_budget: Some(DEFAULT_GEMINI_THINKING_BUDGET),
             })
         );
     }
 
     #[test]
     fn build_gemini_thinking_config_skips_image_models() {
-        let config = ModelClient::build_gemini_thinking_config("gemini-3-pro-image-preview");
+        let config = ModelClient::build_gemini_thinking_config(
+            "gemini-3-pro-image-preview",
+            Some(ReasoningEffortConfig::High),
+        );
 
         assert_eq!(config, None);
     }

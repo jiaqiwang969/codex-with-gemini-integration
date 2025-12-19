@@ -60,30 +60,20 @@
 
 \subsection{使用的 Gemini 模型}
 
-当前 Codex 集成的是 Gemini 3 Pro Preview 模型族，具体包括：
+当前 Codex 集成的 Gemini 3 Pro Preview 模型如下：
 
 \begin{itemize}
-  \item \texttt{gemini-3-pro-preview}：基础版（低思考，默认不输出 thoughts）；
-  \item \texttt{gemini-3-pro-preview-codex}：为 Codex 行为微调 Prompt 的低思考变体；
-  \item \texttt{gemini-3-pro-preview-thinking}：高思考版本，支持输出 thoughts；
-  \item \texttt{gemini-3-pro-preview-thinking-codex}：高思考 + Codex 优化 Prompt。
+  \item \texttt{gemini-3-pro-preview-codex}：使用 Germini 风格 Prompt，并配合 Codex 工具调用行为；
   \item \texttt{gemini-3-pro-image-preview}：图像版，支持图像理解与图像生成（返回 \verb|inlineData| 图片数据）。
 \end{itemize}
 
-也就是说，Codex 侧实际支持的是“Gemini 3 Pro Preview 3.0”的两个思考档位：
-
-\begin{itemize}
-  \item \textbf{Low thinking}：\texttt{gemini-3-pro-preview(-codex)}；
-  \item \textbf{High thinking}：\texttt{gemini-3-pro-preview-thinking(-codex)}。
-\end{itemize}
-
 在请求的 \verb|generationConfig| 中，我们用 \verb|thinkingConfig| 来区分
-低思考和高思考模型，同时遵循 Gemini “\verb|thinkingLevel| 与
-\verb|thinkingBudget| 只能二选一”的校验：
+Gemini 3 与 Gemini 2.x 的 thinking 行为，同时遵循 Gemini
+“\verb|thinkingLevel| 与 \verb|thinkingBudget| 只能二选一”的校验：
 
 \begin{itemize}
-  \item thinking 模型：\verb|thinkingLevel = "high"|，且 \verb|includeThoughts = true|，不再显式设置 \verb|thinkingBudget|；
-  \item 非 thinking 文本模型：仅设置 \verb|thinkingBudget = 32768|，不给 \verb|thinkingLevel|，让长链路工具调用有足够预算的同时避免冲突；
+  \item Gemini 3：固定使用 \verb|thinkingLevel = "high"|，并设置 \verb|includeThoughts = true|，不再显式设置 \verb|thinkingBudget|；
+  \item Gemini 2.x：设置 \verb|thinkingBudget = 8192|，不给 \verb|thinkingLevel|，必要时（高 reasoning effort）才附带 \verb|includeThoughts = true|；
   \item 图像模型（例如 \verb|gemini-3-pro-image-preview|）：直接省略 \verb|thinkingConfig|，避免图片模型在看到 level/budget 组合时返回 400。
 \end{itemize}
 
@@ -151,7 +141,8 @@ Gemini 的默认 provider 在 \verb|built_in_model_providers()| 中定义，大�
   \item \textbf{Base URL 可切换代理}：
   \verb|GEMINI_BASE_URL| 可以指向官方 GCP，也可以指向
   \verb|https://api.vectorengine.ai/v1beta| 等代理。
-  Codex 不关心具体是哪家服务，只要遵守 Gemini 3 Pro 的协议即可。
+  Codex 不关心具体是哪家服务，只要遵守 Gemini 3 Pro 的协议即可；
+  对于以 \verb|/v1| 结尾的地址，Codex 会自动切换到 \verb|/v1beta|。
   \item \textbf{Key 读取顺序}：
   优先从环境变量 \verb|GEMINI_API_KEY| 读取；如果缺失，再从
   \verb|auth.json| 中读取同名 key。对于部分代理，也支持从
@@ -192,7 +183,7 @@ Gemini 的默认 provider 在 \verb|built_in_model_providers()| 中定义，大�
   \begin{itemize}
     \item \verb|temperature = 0.8|（比官方默认 1.0 略低，鼓励更稳定但仍有探索的推理）；
     \item \verb|topK = 64|、\verb|topP = 0.95|；
-    \item \verb|thinkingConfig| 如前所述（low/high + 统一的 \verb|32768| 预算）。
+    \item \verb|thinkingConfig| 如前所述（Gemini 3 使用 \verb|thinkingLevel=high|，Gemini 2.x 使用 \verb|thinkingBudget=8192|）。
   \end{itemize}
   \item 从环境变量或 \verb|auth.json| 中读取 Gemini key，放到
   \verb|X-Goog-Api-Key| 请求头。
@@ -389,43 +380,56 @@ ResponseItem::FunctionCall { name, arguments, thought_signature, .. } => {
   \item role 设为 \verb|"model"|，表示这是模型上一次发出的函数调用；
   \item \verb|thoughtSignature| 原样放在这个 part 上，同时在
   \verb|compat_thought_signature| 上再打一份，以兼容某些只认 snake\_case 的代理；
-  \item \verb|last_function_call_name| 和
-  \verb|last_function_call_thought_signature| 被保存下来，供下一条 functionResponse 使用。
+  \item 用 \verb|call_id| 作为键，把 \verb|name| 和 \verb|thoughtSignature| 保存到 map，
+  供之后的 functionResponse 逐条配对（支持同一轮多个工具调用）。
 \end{itemize}
 
 \paragraph{FunctionCallOutput 部分}
 
 \begin{lstlisting}[language=Rust]
-ResponseItem::FunctionCallOutput { output, .. } => {
-    let function_name = last_function_call_name
-        .take()
-        .unwrap_or_else(|| "unknown_function".to_string());
-    let thought_signature = last_function_call_thought_signature.take();
-
+ResponseItem::FunctionCallOutput { call_id, output } => {
+    let (function_name, thought_signature) = function_calls_by_id
+        .get(call_id)
+        .cloned()
+        .unwrap_or_else(|| ("unknown_function".to_string(), None));
+    let (output_text, mut inline_parts) = build_gemini_function_response_payload(output);
     let response_value = serde_json::json!({
-        "output": output.content.clone(),
+        "output": output_text,
         "success": output.success.unwrap_or(true)
     });
     let part_thought_signature = thought_signature.clone();
+    let nested_parts = if is_gemini_3 && !inline_parts.is_empty() {
+        Some(std::mem::take(&mut inline_parts))
+    } else {
+        None
+    };
 
+    let mut parts = vec![GeminiPartRequest {
+        text: None,
+        inline_data: None,
+        function_call: None,
+        function_response: Some(GeminiFunctionResponsePart {
+            id: Some(call_id.clone()),
+            name: function_name,
+            response: response_value,
+            parts: nested_parts,
+        }),
+        thought_signature: part_thought_signature.clone(),
+        compat_thought_signature: part_thought_signature,
+    }];
+    if !is_gemini_3 {
+        parts.extend(inline_parts);
+    }
     contents.push(GeminiContentRequest {
         role: Some("function".to_string()),
-        parts: vec![GeminiPartRequest {
-            text: None,
-            inline_data: None,
-            function_call: None,
-            function_response: Some(GeminiFunctionResponsePart {
-                name: function_name,
-                response: response_value,
-            }),
-            thought_signature: part_thought_signature.clone(),
-            compat_thought_signature: part_thought_signature,
-        }],
+        parts,
     });
 }
 \end{lstlisting}
 
-也就是说：\textbf{同一个工具调用的 functionCall 和 functionResponse，共用同一个 thoughtSignature}。
+也就是说：\textbf{同一个工具调用的 functionCall 和 functionResponse，共用同一个 thoughtSignature}；
+同时，Gemini 3 会把 \verb|inlineData| 内嵌到 \verb|functionResponse.parts|，
+而 Gemini 2.x 则把它们作为 siblings 发送。
 这正是 Gemini 3 Pro 文档所要求的行为。
 
 \subsection{部分三：缺失签名时的兜底}
@@ -561,7 +565,7 @@ pub(crate) fn sidebar_status(&self) -> String {
   \item 引入 Gemini provider 与基本模型预设；
   \item 实现 \verb|stream_gemini|，打通 SSE 流式通路；
   \item 把 \verb|thinkingLevel| / \verb|thinkingConfig| 接到 generationConfig 上；
-  \item 调整 \verb|thinkingConfig| 构造：thinking 模型发送 \verb|thinkingLevel|，非 thinking 文本模型发送较大的 \verb|thinkingBudget|，图片模型省略该字段以满足 level/budget 互斥校验；
+  \item 调整 \verb|thinkingConfig| 构造：Gemini 3 固定发送 \verb|thinkingLevel|，Gemini 2.x 使用 \verb|thinkingBudget|，图片模型省略该字段以满足 level/budget 互斥校验；
   \item 实现 thoughtSignature 的完整传递：解析、存储、回放，并在缺失时兜底；
   \item 增加针对 Gemini 的工具调用 loop 检测，阈值从 5 提升到 100；
   \item 为“分析/读仓库”类任务增加首轮 \verb|toolConfig| 策略（\verb|any| + \verb|allowedFunctionNames|），并为 Gemini 家族默认开放 \verb|read_file|/\verb|grep_files|/\verb|list_dir|；

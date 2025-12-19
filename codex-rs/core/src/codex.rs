@@ -3732,7 +3732,7 @@ mod tests {
 
         session
             .update_settings(SessionSettingsUpdate {
-                model: Some("gemini-3-pro-preview".to_string()),
+                model: Some("gemini-3-pro-preview-codex".to_string()),
                 ..Default::default()
             })
             .await

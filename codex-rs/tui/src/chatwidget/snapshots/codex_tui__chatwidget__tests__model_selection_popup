@@ -13,14 +13,8 @@ expression: popup
                                             faster, but less capable.
   4. gpt-5.1                                Broad world knowledge with strong
                                             general reasoning.
-  5. gemini-3-pro-preview                   Google Gemini 3 Pro preview.
-  6. gemini-3-pro-preview-codex             Gemini 3 Pro preview with Codex-
-                                            optimized behaviour for code and
-                                            tools.
-  7. gemini-3-pro-preview-thinking          Google Gemini 3 Pro preview with
-                                            thinking capability.
-  8. gemini-3-pro-preview-thinking-codex    Gemini 3 Pro preview with thinking
-                                            capability and Codex-optimized
-                                            behaviour.
+  5. gemini-3-pro-preview-codex             Gemini 3 Pro preview with Germini-
+                                            style system prompt and Codex
+                                            tooling.
 
   Press enter to select reasoning effort, or esc to dismiss.

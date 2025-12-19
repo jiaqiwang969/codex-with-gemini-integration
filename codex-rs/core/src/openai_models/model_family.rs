@@ -251,14 +251,27 @@ pub(super) fn find_family_for_model(slug: &str) -> ModelFamily {
             needs_special_apply_patch_instructions: true,
             context_window: Some(16_385),
         )
-    } else if slug.starts_with("gemini-") && slug.ends_with("-thinking-germini") {
-        // Germini-style Gemini thinking model: use a specialised prompt that mirrors
-        // the Gemini CLI core system prompt while still obeying Codex's function
-        // calling and tooling conventions.
+    } else if slug == "gemini-3-flash-preview-gemini" {
         model_family!(
             slug, "gemini",
             needs_special_apply_patch_instructions: true,
             base_instructions: GEMINI_GERMINI_INSTRUCTIONS.to_string(),
+            default_reasoning_effort: Some(ReasoningEffort::Low),
+            experimental_supported_tools: vec![
+                "grep_files".to_string(),
+                "list_dir".to_string(),
+                "read_file".to_string(),
+            ],
+            supports_parallel_tool_calls: true,
+            shell_type: ConfigShellToolType::ShellCommand,
+            context_window: Some(CONTEXT_WINDOW_1M),
+        )
+    } else if slug == "gemini-3-pro-preview-codex" {
+        model_family!(
+            slug, "gemini",
+            needs_special_apply_patch_instructions: true,
+            base_instructions: GEMINI_GERMINI_INSTRUCTIONS.to_string(),
+            default_reasoning_effort: Some(ReasoningEffort::Low),
             experimental_supported_tools: vec![
                 "grep_files".to_string(),
                 "list_dir".to_string(),
@@ -273,6 +286,7 @@ pub(super) fn find_family_for_model(slug: &str) -> ModelFamily {
             slug, "gemini",
             needs_special_apply_patch_instructions: true,
             base_instructions: GEMINI_CODEX_INSTRUCTIONS.to_string(),
+            default_reasoning_effort: Some(ReasoningEffort::Low),
             experimental_supported_tools: vec![
                 "grep_files".to_string(),
                 "list_dir".to_string(),
@@ -287,6 +301,7 @@ pub(super) fn find_family_for_model(slug: &str) -> ModelFamily {
             slug, "gemini",
             needs_special_apply_patch_instructions: true,
             base_instructions: GEMINI_INSTRUCTIONS.to_string(),
+            default_reasoning_effort: Some(ReasoningEffort::Low),
             experimental_supported_tools: vec![
                 "grep_files".to_string(),
                 "list_dir".to_string(),

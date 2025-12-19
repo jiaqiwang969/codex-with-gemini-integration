@@ -3685,8 +3685,8 @@ model_verbosity = "high"
 
         // When selecting a Gemini model from a non‑Gemini provider, prefer the
         // built‑in `gemini` provider.
-        let provider_for_gemini =
-            config.preferred_model_provider_id_for_model(Some("openai"), "gemini-3-pro-preview");
+        let provider_for_gemini = config
+            .preferred_model_provider_id_for_model(Some("openai"), "gemini-3-pro-preview-codex");
         assert_eq!(provider_for_gemini.as_deref(), Some("gemini"));
 
         // When starting from Gemini and selecting a non‑Gemini model, prefer
@@ -3697,10 +3697,8 @@ model_verbosity = "high"
 
         // Selecting a Gemini model while already on the Gemini provider should
         // not propose a change.
-        let no_change = config.preferred_model_provider_id_for_model(
-            Some("gemini"),
-            "gemini-3-pro-preview-thinking-codex",
-        );
+        let no_change = config
+            .preferred_model_provider_id_for_model(Some("gemini"), "gemini-3-pro-preview-codex");
         assert_eq!(no_change, None);
 
         // Similarly, selecting a non‑Gemini model while already on OpenAI
@@ -3769,7 +3767,7 @@ model_verbosity = "high"
         // OpenAI proxy. On startup we should automatically switch the provider
         // to `gemini` so the model and provider remain compatible.
         let mut cfg = ConfigToml {
-            model: Some("gemini-3-pro-preview-thinking-codex".to_string()),
+            model: Some("gemini-3-pro-preview-codex".to_string()),
             model_provider: Some("openai-proxy".to_string()),
             ..Default::default()
         };
@@ -3799,10 +3797,7 @@ model_verbosity = "high"
             codex_home.path().to_path_buf(),
         )?;
 
-        assert_eq!(
-            config.model.as_deref(),
-            Some("gemini-3-pro-preview-thinking-codex")
-        );
+        assert_eq!(config.model.as_deref(), Some("gemini-3-pro-preview-codex"));
         assert_eq!(config.model_provider_id, "gemini");
 
         Ok(())

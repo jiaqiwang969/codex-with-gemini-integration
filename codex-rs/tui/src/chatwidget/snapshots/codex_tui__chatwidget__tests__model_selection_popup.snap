@@ -15,8 +15,8 @@ expression: popup
                                              improvements across knowledge,
                                              reasoning and coding
   5. gemini-3-flash-preview-gemini           Google Gemini 3 Flash preview.
-  6. gemini-3-pro-preview                    Google Gemini 3 Pro preview.
-  7. gemini-3-pro-preview-codex              Gemini 3 Pro preview with Codex-
-                                             optimized behaviour for code and
+  6. gemini-3-pro-preview-codex              Gemini 3 Pro preview with Germini-
+                                             style system prompt and Codex
+                                             tooling.
 
   Press enter to select reasoning effort, or esc to dismiss.
