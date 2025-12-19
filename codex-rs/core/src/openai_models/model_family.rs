@@ -251,7 +251,7 @@ pub(super) fn find_family_for_model(slug: &str) -> ModelFamily {
             needs_special_apply_patch_instructions: true,
             context_window: Some(16_385),
         )
-    } else if slug == "gemini-3-pro-preview-thinking-germini" {
+    } else if slug.starts_with("gemini-") && slug.ends_with("-thinking-germini") {
         // Germini-style Gemini thinking model: use a specialised prompt that mirrors
         // the Gemini CLI core system prompt while still obeying Codex's function
         // calling and tooling conventions.
