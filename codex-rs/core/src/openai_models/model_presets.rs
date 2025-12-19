@@ -300,6 +300,7 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
             is_default: false,
             upgrade: None,
             show_in_picker: true,
+            supported_in_api: true,
         },
         ModelPreset {
             id: "gemini-3-pro-preview-codex".to_string(),
@@ -315,6 +316,7 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
             is_default: false,
             upgrade: None,
             show_in_picker: true,
+            supported_in_api: true,
         },
         ModelPreset {
             id: "gemini-3-pro-preview-thinking".to_string(),
@@ -329,6 +331,7 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
             is_default: false,
             upgrade: None,
             show_in_picker: true,
+            supported_in_api: true,
         },
         ModelPreset {
             id: "gemini-3-pro-preview-thinking-codex".to_string(),
@@ -345,6 +348,7 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
             is_default: false,
             upgrade: None,
             show_in_picker: true,
+            supported_in_api: true,
         },
         ModelPreset {
             id: "gemini-3-pro-preview-thinking-germini".to_string(),
@@ -362,6 +366,7 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
             is_default: false,
             upgrade: None,
             show_in_picker: true,
+            supported_in_api: true,
         },
         ModelPreset {
             id: "gemini-3-pro-image-preview".to_string(),
@@ -379,6 +384,7 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
             is_default: false,
             upgrade: None,
             show_in_picker: true,
+            supported_in_api: true,
         },
     ]
 });

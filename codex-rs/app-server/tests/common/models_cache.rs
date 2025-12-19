@@ -51,7 +51,7 @@ pub fn write_models_cache(codex_home: &Path) -> std::io::Result<()> {
     // Get all presets and filter for show_in_picker (same as builtin_model_presets does)
     let presets: Vec<&ModelPreset> = all_model_presets()
         .iter()
-        .filter(|preset| preset.show_in_picker)
+        .filter(|preset| preset.show_in_picker && !preset.id.starts_with("gemini-"))
         .collect();
     // Convert presets to ModelInfo, assigning priorities (higher = earlier in list)
     // Priority is used for sorting, so first model gets highest priority

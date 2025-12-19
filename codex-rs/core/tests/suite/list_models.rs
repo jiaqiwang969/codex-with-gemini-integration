@@ -42,26 +42,30 @@ async fn list_models_returns_chatgpt_models() -> Result<()> {
 }
 
 fn expected_models_for_api_key() -> Vec<ModelPreset> {
-    vec![
+    let mut models = vec![
         gpt_5_1_codex_max(),
         gpt_5_1_codex(),
         gpt_5_1_codex_mini(),
         gpt_5_2(),
         gpt_5_1(),
-    ]
+    ];
+    models.extend(gemini_models());
+    models
 }
 
 fn expected_models_for_chatgpt() -> Vec<ModelPreset> {
     let mut gpt_5_1_codex_max = gpt_5_1_codex_max();
     gpt_5_1_codex_max.is_default = false;
-    vec![
+    let mut models = vec![
         caribou(),
         gpt_5_1_codex_max,
         gpt_5_1_codex(),
         gpt_5_1_codex_mini(),
         gpt_5_2(),
         gpt_5_1(),
-    ]
+    ];
+    models.extend(gemini_models());
+    models
 }
 
 fn caribou() -> ModelPreset {
@@ -72,7 +76,10 @@ fn caribou() -> ModelPreset {
         description: "Latest Codex-optimized flagship for deep and fast reasoning.".to_string(),
         default_reasoning_effort: ReasoningEffort::Medium,
         supported_reasoning_efforts: vec![
-            effort(ReasoningEffort::Low, "Fast responses with lighter reasoning"),
+            effort(
+                ReasoningEffort::Low,
+                "Fast responses with lighter reasoning",
+            ),
             effort(
                 ReasoningEffort::Medium,
                 "Balances speed and reasoning depth for everyday tasks",
@@ -101,7 +108,10 @@ fn gpt_5_1_codex_max() -> ModelPreset {
         description: "Latest Codex-optimized flagship for deep and fast reasoning.".to_string(),
         default_reasoning_effort: ReasoningEffort::Medium,
         supported_reasoning_efforts: vec![
-            effort(ReasoningEffort::Low, "Fast responses with lighter reasoning"),
+            effort(
+                ReasoningEffort::Low,
+                "Fast responses with lighter reasoning",
+            ),
             effort(
                 ReasoningEffort::Medium,
                 "Balances speed and reasoning depth for everyday tasks",
@@ -130,7 +140,10 @@ fn gpt_5_1_codex() -> ModelPreset {
         description: "Optimized for codex.".to_string(),
         default_reasoning_effort: ReasoningEffort::Medium,
         supported_reasoning_efforts: vec![
-            effort(ReasoningEffort::Low, "Fastest responses with limited reasoning"),
+            effort(
+                ReasoningEffort::Low,
+                "Fastest responses with limited reasoning",
+            ),
             effort(
                 ReasoningEffort::Medium,
                 "Dynamically adjusts reasoning based on the task",
@@ -246,5 +259,130 @@ fn effort(reasoning_effort: ReasoningEffort, description: &str) -> ReasoningEffo
     ReasoningEffortPreset {
         effort: reasoning_effort,
         description: description.to_string(),
+    }
+}
+
+fn gemini_models() -> Vec<ModelPreset> {
+    vec![
+        gemini_3_pro_preview(),
+        gemini_3_pro_preview_codex(),
+        gemini_3_pro_preview_thinking(),
+        gemini_3_pro_preview_thinking_codex(),
+        gemini_3_pro_preview_thinking_germini(),
+        gemini_3_pro_image_preview(),
+    ]
+}
+
+fn gemini_3_pro_preview() -> ModelPreset {
+    ModelPreset {
+        id: "gemini-3-pro-preview".to_string(),
+        model: "gemini-3-pro-preview".to_string(),
+        display_name: "gemini-3-pro-preview".to_string(),
+        description: "Google Gemini 3 Pro preview.".to_string(),
+        default_reasoning_effort: ReasoningEffort::Medium,
+        supported_reasoning_efforts: vec![effort(
+            ReasoningEffort::Medium,
+            "Default Gemini reasoning behaviour.",
+        )],
+        is_default: false,
+        upgrade: None,
+        show_in_picker: true,
+        supported_in_api: true,
+    }
+}
+
+fn gemini_3_pro_preview_codex() -> ModelPreset {
+    ModelPreset {
+        id: "gemini-3-pro-preview-codex".to_string(),
+        model: "gemini-3-pro-preview-codex".to_string(),
+        display_name: "gemini-3-pro-preview-codex".to_string(),
+        description: "Gemini 3 Pro preview with Codex-optimized behaviour for code and tools."
+            .to_string(),
+        default_reasoning_effort: ReasoningEffort::Medium,
+        supported_reasoning_efforts: vec![effort(
+            ReasoningEffort::Medium,
+            "Default Gemini reasoning behaviour tuned for Codex CLI.",
+        )],
+        is_default: false,
+        upgrade: None,
+        show_in_picker: true,
+        supported_in_api: true,
+    }
+}
+
+fn gemini_3_pro_preview_thinking() -> ModelPreset {
+    ModelPreset {
+        id: "gemini-3-pro-preview-thinking".to_string(),
+        model: "gemini-3-pro-preview-thinking".to_string(),
+        display_name: "gemini-3-pro-preview-thinking".to_string(),
+        description: "Google Gemini 3 Pro preview with thinking capability.".to_string(),
+        default_reasoning_effort: ReasoningEffort::Medium,
+        supported_reasoning_efforts: vec![effort(
+            ReasoningEffort::Medium,
+            "Default Gemini reasoning behaviour.",
+        )],
+        is_default: false,
+        upgrade: None,
+        show_in_picker: true,
+        supported_in_api: true,
+    }
+}
+
+fn gemini_3_pro_preview_thinking_codex() -> ModelPreset {
+    ModelPreset {
+        id: "gemini-3-pro-preview-thinking-codex".to_string(),
+        model: "gemini-3-pro-preview-thinking-codex".to_string(),
+        display_name: "gemini-3-pro-preview-thinking-codex".to_string(),
+        description: "Gemini 3 Pro preview with thinking capability and Codex-optimized behaviour."
+            .to_string(),
+        default_reasoning_effort: ReasoningEffort::Medium,
+        supported_reasoning_efforts: vec![effort(
+            ReasoningEffort::Medium,
+            "Default Gemini reasoning behaviour tuned for Codex CLI.",
+        )],
+        is_default: false,
+        upgrade: None,
+        show_in_picker: true,
+        supported_in_api: true,
+    }
+}
+
+fn gemini_3_pro_preview_thinking_germini() -> ModelPreset {
+    ModelPreset {
+        id: "gemini-3-pro-preview-thinking-germini".to_string(),
+        model: "gemini-3-pro-preview-thinking-germini".to_string(),
+        display_name: "gemini-3-pro-preview-thinking-germini".to_string(),
+        description:
+            "Gemini 3 Pro preview with thinking capability and Germini-style system prompt."
+                .to_string(),
+        default_reasoning_effort: ReasoningEffort::Medium,
+        supported_reasoning_efforts: vec![effort(
+            ReasoningEffort::Medium,
+            "Gemini reasoning behaviour tuned for Germini-style workflows.",
+        )],
+        is_default: false,
+        upgrade: None,
+        show_in_picker: true,
+        supported_in_api: true,
+    }
+}
+
+fn gemini_3_pro_image_preview() -> ModelPreset {
+    ModelPreset {
+        id: "gemini-3-pro-image-preview".to_string(),
+        model: "gemini-3-pro-image-preview".to_string(),
+        display_name: "gemini-3-pro-image-preview".to_string(),
+        description:
+            "Gemini 3 Pro image preview for text, image understanding, and image generation."
+                .to_string(),
+        default_reasoning_effort: ReasoningEffort::Medium,
+        supported_reasoning_efforts: vec![effort(
+            ReasoningEffort::Medium,
+            "Default Gemini reasoning behaviour for image workflows.",
+        )],
+        is_default: false,
+        upgrade: None,
+        show_in_picker: true,
+        supported_in_api: true,
     }
 }

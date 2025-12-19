@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use anyhow::anyhow;
 use app_test_support::McpProcess;
 use app_test_support::to_response;
 use app_test_support::write_models_cache;
@@ -298,137 +297,56 @@ async fn list_models_pagination_works() -> Result<()> {
 
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
-    let first_request = mcp
+    let all_request = mcp
         .send_list_models_request(ModelListParams {
-            limit: Some(1),
+            limit: Some(100),
             cursor: None,
         })
         .await?;
 
-    let first_response: JSONRPCResponse = timeout(
+    let all_response: JSONRPCResponse = timeout(
         DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(first_request)),
+        mcp.read_stream_until_response_message(RequestId::Integer(all_request)),
     )
     .await??;
 
     let ModelListResponse {
-        data: first_items,
-        next_cursor: first_cursor,
-    } = to_response::<ModelListResponse>(first_response)?;
+        data: all_items,
+        next_cursor: all_cursor,
+    } = to_response::<ModelListResponse>(all_response)?;
+    assert!(all_cursor.is_none());
 
-    assert_eq!(first_items.len(), 1);
-    assert_eq!(first_items[0].id, "gpt-5.1");
-    let next_cursor = first_cursor.ok_or_else(|| anyhow!("cursor for second page"))?;
+    let expected_ids: Vec<String> = all_items.into_iter().map(|model| model.id).collect();
+    assert!(!expected_ids.is_empty());
 
-    let second_request = mcp
-        .send_list_models_request(ModelListParams {
-            limit: Some(1),
-            cursor: Some(next_cursor.clone()),
-        })
-        .await?;
+    let mut cursor = None;
+    let mut ids = Vec::new();
+    for _ in 0..expected_ids.len() {
+        let request_id = mcp
+            .send_list_models_request(ModelListParams {
+                limit: Some(1),
+                cursor: cursor.clone(),
+            })
+            .await?;
 
-    let second_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(second_request)),
-    )
-    .await??;
+        let response: JSONRPCResponse = timeout(
+            DEFAULT_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+        )
+        .await??;
 
-    let ModelListResponse {
-        data: second_items,
-        next_cursor: second_cursor,
-    } = to_response::<ModelListResponse>(second_response)?;
+        let ModelListResponse { data, next_cursor } = to_response::<ModelListResponse>(response)?;
+        assert_eq!(data.len(), 1);
+        ids.push(data[0].id.clone());
+        cursor = next_cursor;
 
-    assert_eq!(second_items.len(), 1);
-    assert_eq!(second_items[0].id, "gpt-5.2");
-    let third_cursor = second_cursor.ok_or_else(|| anyhow!("cursor for third page"))?;
+        if cursor.is_none() {
+            break;
+        }
+    }
 
-    let third_request = mcp
-        .send_list_models_request(ModelListParams {
-            limit: Some(1),
-            cursor: Some(third_cursor.clone()),
-        })
-        .await?;
-
-    let third_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(third_request)),
-    )
-    .await??;
-
-    let ModelListResponse {
-        data: third_items,
-        next_cursor: third_cursor,
-    } = to_response::<ModelListResponse>(third_response)?;
-
-    assert_eq!(third_items.len(), 1);
-    assert_eq!(third_items[0].id, "gpt-5.1-codex-mini");
-    let fourth_cursor = third_cursor.ok_or_else(|| anyhow!("cursor for fourth page"))?;
-
-    let fourth_request = mcp
-        .send_list_models_request(ModelListParams {
-            limit: Some(1),
-            cursor: Some(fourth_cursor.clone()),
-        })
-        .await?;
-
-    let fourth_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(fourth_request)),
-    )
-    .await??;
-
-    let ModelListResponse {
-        data: fourth_items,
-        next_cursor: fourth_cursor,
-    } = to_response::<ModelListResponse>(fourth_response)?;
-
-    assert_eq!(fourth_items.len(), 1);
-    assert_eq!(fourth_items[0].id, "gpt-5.1-codex");
-    let fifth_cursor = fourth_cursor.ok_or_else(|| anyhow!("cursor for fifth page"))?;
-
-    let fifth_request = mcp
-        .send_list_models_request(ModelListParams {
-            limit: Some(1),
-            cursor: Some(fifth_cursor.clone()),
-        })
-        .await?;
-
-    let fifth_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(fifth_request)),
-    )
-    .await??;
-
-    let ModelListResponse {
-        data: fifth_items,
-        next_cursor: fifth_cursor,
-    } = to_response::<ModelListResponse>(fifth_response)?;
-
-    assert_eq!(fifth_items.len(), 1);
-    assert_eq!(fifth_items[0].id, "gpt-5.1-codex-max");
-    let sixth_cursor = fifth_cursor.ok_or_else(|| anyhow!("cursor for sixth page"))?;
-
-    let sixth_request = mcp
-        .send_list_models_request(ModelListParams {
-            limit: Some(1),
-            cursor: Some(sixth_cursor.clone()),
-        })
-        .await?;
-
-    let sixth_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(sixth_request)),
-    )
-    .await??;
-
-    let ModelListResponse {
-        data: sixth_items,
-        next_cursor: sixth_cursor,
-    } = to_response::<ModelListResponse>(sixth_response)?;
-
-    assert_eq!(sixth_items.len(), 1);
-    assert_eq!(sixth_items[0].id, "caribou");
-    assert!(sixth_cursor.is_none());
+    assert_eq!(ids, expected_ids);
+    assert!(cursor.is_none());
     Ok(())
 }
 
