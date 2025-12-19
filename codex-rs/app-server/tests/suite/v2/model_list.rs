@@ -153,68 +153,13 @@ async fn list_models_returns_all_models_with_large_limit() -> Result<()> {
             is_default: false,
         },
         Model {
-            id: "gemini-3-flash-preview".to_string(),
-            model: "gemini-3-flash-preview".to_string(),
-            display_name: "gemini-3-flash-preview".to_string(),
+            id: "gemini-3-flash-preview-gemini".to_string(),
+            model: "gemini-3-flash-preview-gemini".to_string(),
+            display_name: "gemini-3-flash-preview-gemini".to_string(),
             description: "Google Gemini 3 Flash preview.".to_string(),
             supported_reasoning_efforts: vec![ReasoningEffortOption {
                 reasoning_effort: ReasoningEffort::Medium,
                 description: "Default Gemini reasoning behaviour.".to_string(),
-            }],
-            default_reasoning_effort: ReasoningEffort::Medium,
-            is_default: false,
-        },
-        Model {
-            id: "gemini-3-flash-preview-codex".to_string(),
-            model: "gemini-3-flash-preview-codex".to_string(),
-            display_name: "gemini-3-flash-preview-codex".to_string(),
-            description:
-                "Gemini 3 Flash preview with Codex-optimized behaviour for code and tools."
-                    .to_string(),
-            supported_reasoning_efforts: vec![ReasoningEffortOption {
-                reasoning_effort: ReasoningEffort::Medium,
-                description: "Default Gemini reasoning behaviour tuned for Codex CLI.".to_string(),
-            }],
-            default_reasoning_effort: ReasoningEffort::Medium,
-            is_default: false,
-        },
-        Model {
-            id: "gemini-3-flash-preview-thinking".to_string(),
-            model: "gemini-3-flash-preview-thinking".to_string(),
-            display_name: "gemini-3-flash-preview-thinking".to_string(),
-            description: "Google Gemini 3 Flash preview with thinking capability.".to_string(),
-            supported_reasoning_efforts: vec![ReasoningEffortOption {
-                reasoning_effort: ReasoningEffort::Medium,
-                description: "Default Gemini reasoning behaviour.".to_string(),
-            }],
-            default_reasoning_effort: ReasoningEffort::Medium,
-            is_default: false,
-        },
-        Model {
-            id: "gemini-3-flash-preview-thinking-codex".to_string(),
-            model: "gemini-3-flash-preview-thinking-codex".to_string(),
-            display_name: "gemini-3-flash-preview-thinking-codex".to_string(),
-            description:
-                "Gemini 3 Flash preview with thinking capability and Codex-optimized behaviour."
-                    .to_string(),
-            supported_reasoning_efforts: vec![ReasoningEffortOption {
-                reasoning_effort: ReasoningEffort::Medium,
-                description: "Default Gemini reasoning behaviour tuned for Codex CLI.".to_string(),
-            }],
-            default_reasoning_effort: ReasoningEffort::Medium,
-            is_default: false,
-        },
-        Model {
-            id: "gemini-3-flash-preview-thinking-germini".to_string(),
-            model: "gemini-3-flash-preview-thinking-germini".to_string(),
-            display_name: "gemini-3-flash-preview-thinking-germini".to_string(),
-            description:
-                "Gemini 3 Flash preview with thinking capability and Germini-style system prompt."
-                    .to_string(),
-            supported_reasoning_efforts: vec![ReasoningEffortOption {
-                reasoning_effort: ReasoningEffort::Medium,
-                description: "Gemini reasoning behaviour tuned for Germini-style workflows."
-                    .to_string(),
             }],
             default_reasoning_effort: ReasoningEffort::Medium,
             is_default: false,

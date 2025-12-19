@@ -326,6 +326,7 @@ impl ModelClient {
         let model = self.get_model();
         let api_model = model.strip_suffix("-codex").unwrap_or(&model);
         let api_model = api_model.strip_suffix("-germini").unwrap_or(api_model);
+        let api_model = api_model.strip_suffix("-gemini").unwrap_or(api_model);
 
         // Use streamGenerateContent endpoint with alt=sse for streaming
         let url = format!(
