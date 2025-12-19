@@ -180,6 +180,12 @@ impl Tui {
     /// Emit a desktop notification now if the terminal is unfocused.
     /// Returns true if a notification was posted.
     pub fn notify(&mut self, message: impl AsRef<str>) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("/usr/bin/afplay")
+                .arg("/System/Library/Sounds/Glass.aiff")
+                .spawn();
+        }
         if self.terminal_focused.load(Ordering::Relaxed) {
             return false;
         }
