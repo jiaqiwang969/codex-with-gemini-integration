@@ -310,15 +310,23 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
             model: "gemini-3-flash-preview-gemini".to_string(),
             display_name: "gemini-3-flash-preview-gemini".to_string(),
             description: "Google Gemini 3 Flash preview.".to_string(),
-            default_reasoning_effort: ReasoningEffort::Low,
+            default_reasoning_effort: ReasoningEffort::High,
             supported_reasoning_efforts: vec![
                 ReasoningEffortPreset {
+                    effort: ReasoningEffort::Minimal,
+                    description: "Fastest responses with minimal reasoning (Flash-exclusive)".to_string(),
+                },
+                ReasoningEffortPreset {
                     effort: ReasoningEffort::Low,
-                    description: "Lower-cost Gemini thinking.".to_string(),
+                    description: "Lower-cost Gemini thinking".to_string(),
+                },
+                ReasoningEffortPreset {
+                    effort: ReasoningEffort::Medium,
+                    description: "Balanced reasoning depth for general tasks".to_string(),
                 },
                 ReasoningEffortPreset {
                     effort: ReasoningEffort::High,
-                    description: "Higher-quality Gemini thinking.".to_string(),
+                    description: "Higher-quality Gemini thinking for complex problems".to_string(),
                 },
             ],
             is_default: false,
@@ -332,15 +340,19 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
             display_name: "gemini-3-pro-preview-codex".to_string(),
             description: "Gemini 3 Pro preview with Germini-style system prompt and Codex tooling."
                 .to_string(),
-            default_reasoning_effort: ReasoningEffort::Low,
+            default_reasoning_effort: ReasoningEffort::High,
             supported_reasoning_efforts: vec![
                 ReasoningEffortPreset {
                     effort: ReasoningEffort::Low,
-                    description: "Lower-cost Gemini thinking.".to_string(),
+                    description: "Lower-cost Gemini thinking".to_string(),
+                },
+                ReasoningEffortPreset {
+                    effort: ReasoningEffort::Medium,
+                    description: "Balanced reasoning depth for general tasks".to_string(),
                 },
                 ReasoningEffortPreset {
                     effort: ReasoningEffort::High,
-                    description: "Higher-quality Gemini thinking.".to_string(),
+                    description: "Higher-quality Gemini thinking for complex problems".to_string(),
                 },
             ],
             is_default: false,

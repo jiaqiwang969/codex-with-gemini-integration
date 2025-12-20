@@ -17,9 +17,7 @@ const GPT_5_1_INSTRUCTIONS: &str = include_str!("../../gpt_5_1_prompt.md");
 const GPT_5_2_INSTRUCTIONS: &str = include_str!("../../gpt_5_2_prompt.md");
 const GPT_5_1_CODEX_MAX_INSTRUCTIONS: &str = include_str!("../../gpt-5.1-codex-max_prompt.md");
 const GPT_5_2_CODEX_INSTRUCTIONS: &str = include_str!("../../gpt-5.2-codex_prompt.md");
-const GEMINI_CODEX_INSTRUCTIONS: &str = include_str!("../../gemini_codex_prompt.md");
 const GEMINI_INSTRUCTIONS: &str = include_str!("../../gemini_prompt.md");
-const GEMINI_GERMINI_INSTRUCTIONS: &str = include_str!("../../gemini_germini_prompt.md");
 pub(crate) const CONTEXT_WINDOW_272K: i64 = 272_000;
 pub(crate) const CONTEXT_WINDOW_1M: i64 = 1_000_000;
 
@@ -255,8 +253,8 @@ pub(super) fn find_family_for_model(slug: &str) -> ModelFamily {
         model_family!(
             slug, "gemini",
             needs_special_apply_patch_instructions: true,
-            base_instructions: GEMINI_GERMINI_INSTRUCTIONS.to_string(),
-            default_reasoning_effort: Some(ReasoningEffort::Low),
+            base_instructions: GEMINI_INSTRUCTIONS.to_string(),
+            default_reasoning_effort: Some(ReasoningEffort::High),
             experimental_supported_tools: vec![
                 "grep_files".to_string(),
                 "list_dir".to_string(),
@@ -270,8 +268,8 @@ pub(super) fn find_family_for_model(slug: &str) -> ModelFamily {
         model_family!(
             slug, "gemini",
             needs_special_apply_patch_instructions: true,
-            base_instructions: GEMINI_GERMINI_INSTRUCTIONS.to_string(),
-            default_reasoning_effort: Some(ReasoningEffort::Low),
+            base_instructions: GEMINI_INSTRUCTIONS.to_string(),
+            default_reasoning_effort: Some(ReasoningEffort::High),
             experimental_supported_tools: vec![
                 "grep_files".to_string(),
                 "list_dir".to_string(),
@@ -285,8 +283,8 @@ pub(super) fn find_family_for_model(slug: &str) -> ModelFamily {
         model_family!(
             slug, "gemini",
             needs_special_apply_patch_instructions: true,
-            base_instructions: GEMINI_CODEX_INSTRUCTIONS.to_string(),
-            default_reasoning_effort: Some(ReasoningEffort::Low),
+            base_instructions: GEMINI_INSTRUCTIONS.to_string(),
+            default_reasoning_effort: Some(ReasoningEffort::High),
             experimental_supported_tools: vec![
                 "grep_files".to_string(),
                 "list_dir".to_string(),
@@ -301,7 +299,7 @@ pub(super) fn find_family_for_model(slug: &str) -> ModelFamily {
             slug, "gemini",
             needs_special_apply_patch_instructions: true,
             base_instructions: GEMINI_INSTRUCTIONS.to_string(),
-            default_reasoning_effort: Some(ReasoningEffort::Low),
+            default_reasoning_effort: Some(ReasoningEffort::High),
             experimental_supported_tools: vec![
                 "grep_files".to_string(),
                 "list_dir".to_string(),

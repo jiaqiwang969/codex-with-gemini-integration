@@ -17,6 +17,7 @@ use crate::tools::context::ToolPayload;
 use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
+use crate::tools::handlers::plan::intercept_update_plan;
 use crate::tools::orchestrator::ToolOrchestrator;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
@@ -234,6 +235,19 @@ impl ShellHandler {
             turn.as_ref(),
             Some(&tracker),
             &call_id,
+            tool_name,
+        )
+        .await?
+        {
+            return Ok(output);
+        }
+
+        // Intercept update_plan shell commands (some models like Gemini
+        // sometimes output tool calls as shell commands)
+        if let Some(output) = intercept_update_plan(
+            &exec_params.command,
+            session.as_ref(),
+            turn.as_ref(),
             tool_name,
         )
         .await?

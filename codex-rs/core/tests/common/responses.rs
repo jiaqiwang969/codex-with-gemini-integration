@@ -169,6 +169,26 @@ impl ResponsesRequest {
                     .map(str::to_string),
                 obj.get("success").and_then(Value::as_bool),
             )),
+            // Handle multimodal function response (array of content items)
+            Value::Array(items) => {
+                // Extract text from input_text items in the array
+                let text_content: Vec<String> = items
+                    .iter()
+                    .filter_map(|item| {
+                        if item.get("type").and_then(Value::as_str) == Some("input_text") {
+                            item.get("text").and_then(Value::as_str).map(str::to_string)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let combined_text = if text_content.is_empty() {
+                    None
+                } else {
+                    Some(text_content.join("\n"))
+                };
+                Some((combined_text, None))
+            }
             _ => Some((None, None)),
         }
     }

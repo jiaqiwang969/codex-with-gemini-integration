@@ -13,6 +13,7 @@ use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::events::ToolEventStage;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
+use crate::tools::handlers::plan::intercept_update_plan;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
 use crate::unified_exec::ExecCommandRequest;
@@ -164,6 +165,20 @@ impl ToolHandler for UnifiedExecHandler {
                     context.turn.as_ref(),
                     Some(&tracker),
                     &context.call_id,
+                    tool_name.as_str(),
+                )
+                .await?
+                {
+                    manager.release_process_id(&process_id).await;
+                    return Ok(output);
+                }
+
+                // Intercept update_plan shell commands (some models like Gemini
+                // sometimes output tool calls as shell commands)
+                if let Some(output) = intercept_update_plan(
+                    &command,
+                    context.session.as_ref(),
+                    context.turn.as_ref(),
                     tool_name.as_str(),
                 )
                 .await?

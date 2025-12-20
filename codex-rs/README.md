@@ -1,108 +1,229 @@
-# Codex CLI (Rust Implementation)
+# Codex CLI + Gemini API Integration
 
-We provide Codex CLI as a standalone, native executable to ensure a zero-dependency install.
+<div align="center">
 
-## Installing Codex
+[English](#english) | [中文](#中文)
 
-Today, the easiest way to install Codex is via `npm`:
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org/)
+[![Gemini](https://img.shields.io/badge/Gemini%203-supported-green.svg)](https://ai.google.dev/gemini-api)
+
+**An enhanced Codex CLI with native Gemini 3 API support and advanced customization features**
+
+</div>
+
+---
+
+<a name="english"></a>
+## English
+
+### Overview
+
+This project is a fork of [OpenAI Codex CLI](https://github.com/openai/codex) with **native Google Gemini 3 API integration**. It combines the powerful agentic coding capabilities of Codex with Google's latest Gemini 3 models (Pro, Flash, and Image variants).
+
+### Key Features
+
+#### Gemini 3 Integration
+- **Full Gemini 3 Support**: Native support for `gemini-3-pro-preview`, `gemini-3-flash-preview`, and `gemini-3-pro-image-preview` models
+- **Configurable Reasoning Levels**:
+  - Gemini 3 Flash: `minimal`, `low`, `medium`, `high`
+  - Gemini 3 Pro: `low`, `medium`, `high`
+- **Parallel Function Calls**: Efficient multi-tool execution for faster task completion
+- **Thought Signature Handling**: Proper management of Gemini's `thoughtSignature` for multi-turn conversations
+- **Image Analysis**: Support for multimodal inputs with automatic media resolution selection
+
+#### Enhanced Codex Features
+- **Dual Model Support**: Seamlessly switch between OpenAI GPT models and Google Gemini models
+- **MCP Protocol**: Full Model Context Protocol support for extensible tool integration
+- **Sandbox Modes**: Flexible security policies (`read-only`, `workspace-write`, `danger-full-access`)
+- **Reference Images**: `/ref-image` command for image-based workflows with Gemini image models
+
+### Installation
 
 ```shell
 npm i -g @jiaqiwang969/codex
 codex
 ```
 
-You can also install via Homebrew (`brew install --cask codex`) or download a platform-specific release directly from our [GitHub Releases](https://github.com/openai/codex/releases).
-
-## Documentation quickstart
-
-- First run with Codex? Follow the walkthrough in [`docs/getting-started.md`](../docs/getting-started.md) for prompts, keyboard shortcuts, and session management.
-- Already shipping with Codex and want deeper control? Jump to [`docs/advanced.md`](../docs/advanced.md) and the configuration reference at [`docs/config.md`](../docs/config.md).
-
-## What's new in the Rust CLI
-
-The Rust implementation is now the maintained Codex CLI and serves as the default experience. It includes a number of features that the legacy TypeScript CLI never supported.
-
-### Config
-
-Codex supports a rich set of configuration options. Note that the Rust CLI uses `config.toml` instead of `config.json`. See [`docs/config.md`](../docs/config.md) for details.
-
-### Model Context Protocol Support
-
-#### MCP client
-
-Codex CLI functions as an MCP client that allows the Codex CLI and IDE extension to connect to MCP servers on startup. See the [`configuration documentation`](../docs/config.md#mcp_servers) for details.
-
-#### MCP server (experimental)
-
-Codex can be launched as an MCP _server_ by running `codex mcp-server`. This allows _other_ MCP clients to use Codex as a tool for another agent.
-
-Use the [`@modelcontextprotocol/inspector`](https://github.com/modelcontextprotocol/inspector) to try it out:
+Or build from source:
 
 ```shell
-npx @modelcontextprotocol/inspector codex mcp-server
+git clone https://github.com/jiaqiwang969/codex.git
+cd codex/codex-rs
+cargo build --release
 ```
 
-Use `codex mcp` to add/list/get/remove MCP server launchers defined in `config.toml`, and `codex mcp-server` to run the MCP server directly.
+### Configuration
 
-### Notifications
+#### Using Gemini API
 
-You can enable notifications by configuring a script that is run whenever the agent finishes a turn. The [notify documentation](../docs/config.md#notify) includes a detailed example that explains how to get desktop notifications via [terminal-notifier](https://github.com/julienXX/terminal-notifier) on macOS. When Codex detects that it is running under WSL 2 inside Windows Terminal (`WT_SESSION` is set), the TUI automatically falls back to native Windows toast notifications so approval prompts and completed turns surface even though Windows Terminal does not implement OSC 9.
-
-### `codex exec` to run Codex programmatically/non-interactively
-
-To run Codex non-interactively, run `codex exec PROMPT` (you can also pass the prompt via `stdin`) and Codex will work on your task until it decides that it is done and exits. Output is printed to the terminal directly. You can set the `RUST_LOG` environment variable to see more about what's going on.
-
-### Image reference commands in the TUI
-
-When using the fullscreen TUI (`codex tui`), you can control image reference sets for Gemini-style image models via the `/ref-image` command:
-
-- `/ref-image <path1> <path2> ...` sets the current reference image set for the session.
-- `/ref-image <path1> <path2> ... -- <prompt>` sets the reference images and immediately sends a text prompt for editing or generation.
-- `/ref-image ls` shows the currently active reference images; `/ref-image clear` (or `/clear-ref`) clears them.
-
-See `docs/gemini_3_pro_image_user_guide.tex` for a deeper walkthrough of image workflows.
-
-### Experimenting with the Codex Sandbox
-
-To test to see what happens when a command is run under the sandbox provided by Codex, we provide the following subcommands in Codex CLI:
-
-```
-# macOS
-codex sandbox macos [--full-auto] [--log-denials] [COMMAND]...
-
-# Linux
-codex sandbox linux [--full-auto] [COMMAND]...
-
-# Windows
-codex sandbox windows [--full-auto] [COMMAND]...
-
-# Legacy aliases
-codex debug seatbelt [--full-auto] [--log-denials] [COMMAND]...
-codex debug landlock [--full-auto] [COMMAND]...
+1. Set your Gemini API key:
+```shell
+export GEMINI_API_KEY="your-api-key"
 ```
 
-### Selecting a sandbox policy via `--sandbox`
+2. Configure in `~/.codex/config.toml`:
+```toml
+model = "gemini-3-pro-preview-codex"
+# Or for Flash variant:
+# model = "gemini-3-flash-preview-gemini"
+```
 
-The Rust CLI exposes a dedicated `--sandbox` (`-s`) flag that lets you pick the sandbox policy **without** having to reach for the generic `-c/--config` option:
+3. Select reasoning level via `/model` command in TUI
+
+#### Supported Models
+
+| Model | Description | Reasoning Levels |
+|-------|-------------|------------------|
+| `gemini-3-pro-preview-codex` | Best quality reasoning | low, medium, high |
+| `gemini-3-flash-preview-gemini` | Fast and efficient | minimal, low, medium, high |
+| `gemini-3-pro-image-preview` | Image generation & analysis | medium |
+| `gpt-5.2-codex` | OpenAI flagship model | low, medium, high, xhigh |
+
+### Usage Examples
 
 ```shell
-# Run Codex with the default, read-only sandbox
-codex --sandbox read-only
+# Start interactive TUI
+codex
 
-# Allow the agent to write within the current workspace while still blocking network access
-codex --sandbox workspace-write
+# Non-interactive execution
+codex exec "Analyze this codebase and suggest improvements"
 
-# Danger! Disable sandboxing entirely (only do this if you are already running in a container or other isolated env)
-codex --sandbox danger-full-access
+# With specific model
+codex -m gemini-3-pro-preview-codex
+
+# Image workflow with Gemini
+codex
+> /ref-image screenshot.png -- Analyze this UI and suggest improvements
 ```
 
-The same setting can be persisted in `~/.codex/config.toml` via the top-level `sandbox_mode = "MODE"` key, e.g. `sandbox_mode = "workspace-write"`.
+### Architecture
 
-## Code Organization
+```
+codex-rs/
+├── core/           # Business logic, Gemini API client, model families
+├── tui/            # Fullscreen terminal UI (Ratatui)
+├── exec/           # Headless CLI for automation
+├── cli/            # CLI multitool entry point
+└── protocol/       # Wire protocols and types
+```
 
-This folder is the root of a Cargo workspace. It contains quite a bit of experimental code, but here are the key crates:
+### Contributing
 
-- [`core/`](./core) contains the business logic for Codex. Ultimately, we hope this to be a library crate that is generally useful for building other Rust/native applications that use Codex.
-- [`exec/`](./exec) "headless" CLI for use in automation.
-- [`tui/`](./tui) CLI that launches a fullscreen TUI built with [Ratatui](https://ratatui.rs/).
-- [`cli/`](./cli) CLI multitool that provides the aforementioned CLIs via subcommands.
+Contributions are welcome! Please feel free to submit issues and pull requests.
+
+### Acknowledgments
+
+- [OpenAI Codex](https://github.com/openai/codex) - The original Codex CLI
+- [Google Gemini API](https://ai.google.dev/) - Gemini 3 models
+
+---
+
+<a name="中文"></a>
+## 中文
+
+### 概述
+
+本项目是 [OpenAI Codex CLI](https://github.com/openai/codex) 的增强分支，**原生集成了 Google Gemini 3 API**。它将 Codex 强大的智能编程能力与 Google 最新的 Gemini 3 模型（Pro、Flash 和 Image 变体）相结合。
+
+### 核心特性
+
+#### Gemini 3 集成
+- **完整的 Gemini 3 支持**：原生支持 `gemini-3-pro-preview`、`gemini-3-flash-preview` 和 `gemini-3-pro-image-preview` 模型
+- **可配置的推理级别**：
+  - Gemini 3 Flash：`minimal`（最小）、`low`（低）、`medium`（中）、`high`（高）
+  - Gemini 3 Pro：`low`（低）、`medium`（中）、`high`（高）
+- **并行函数调用**：高效的多工具执行，加快任务完成速度
+- **思维签名处理**：正确管理 Gemini 的 `thoughtSignature`，支持多轮对话
+- **图像分析**：支持多模态输入，自动选择媒体分辨率
+
+#### 增强的 Codex 功能
+- **双模型支持**：在 OpenAI GPT 模型和 Google Gemini 模型之间无缝切换
+- **MCP 协议**：完整的模型上下文协议支持，可扩展工具集成
+- **沙箱模式**：灵活的安全策略（`read-only` 只读、`workspace-write` 工作区写入、`danger-full-access` 完全访问）
+- **参考图像**：使用 `/ref-image` 命令配合 Gemini 图像模型进行图像工作流
+
+### 安装
+
+```shell
+npm i -g @jiaqiwang969/codex
+codex
+```
+
+或从源码构建：
+
+```shell
+git clone https://github.com/jiaqiwang969/codex.git
+cd codex/codex-rs
+cargo build --release
+```
+
+### 配置
+
+#### 使用 Gemini API
+
+1. 设置 Gemini API 密钥：
+```shell
+export GEMINI_API_KEY="your-api-key"
+```
+
+2. 在 `~/.codex/config.toml` 中配置：
+```toml
+model = "gemini-3-pro-preview-codex"
+# 或使用 Flash 变体：
+# model = "gemini-3-flash-preview-gemini"
+```
+
+3. 在 TUI 中通过 `/model` 命令选择推理级别
+
+#### 支持的模型
+
+| 模型 | 描述 | 推理级别 |
+|------|------|----------|
+| `gemini-3-pro-preview-codex` | 最佳推理质量 | low, medium, high |
+| `gemini-3-flash-preview-gemini` | 快速高效 | minimal, low, medium, high |
+| `gemini-3-pro-image-preview` | 图像生成与分析 | medium |
+| `gpt-5.2-codex` | OpenAI 旗舰模型 | low, medium, high, xhigh |
+
+### 使用示例
+
+```shell
+# 启动交互式 TUI
+codex
+
+# 非交互式执行
+codex exec "分析这个代码库并提出改进建议"
+
+# 指定模型
+codex -m gemini-3-pro-preview-codex
+
+# Gemini 图像工作流
+codex
+> /ref-image screenshot.png -- 分析这个 UI 并提出改进建议
+```
+
+### 项目架构
+
+```
+codex-rs/
+├── core/           # 业务逻辑、Gemini API 客户端、模型家族
+├── tui/            # 全屏终端 UI（Ratatui）
+├── exec/           # 无头 CLI，用于自动化
+├── cli/            # CLI 多功能工具入口
+└── protocol/       # 通信协议和类型定义
+```
+
+### 贡献
+
+欢迎贡献！请随时提交 Issue 和 Pull Request。
+
+### 致谢
+
+- [OpenAI Codex](https://github.com/openai/codex) - 原始 Codex CLI
+- [Google Gemini API](https://ai.google.dev/) - Gemini 3 模型
+
+---
+
+## License
+
+Apache 2.0 - See [LICENSE](LICENSE) for details.

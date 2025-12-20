@@ -204,7 +204,12 @@ async fn view_image_tool_attaches_local_image() -> anyhow::Result<()> {
         .function_call_output_content_and_success(call_id)
         .and_then(|(content, _)| content)
         .expect("output text present");
-    assert_eq!(output_text, "attached local image path");
+    // Multimodal response returns array with InputText containing "Image file: {path} ({size} KB)"
+    // The text comes from content_items array, not the content field
+    assert!(
+        output_text.contains("Image file:") && output_text.contains(&abs_path.to_string_lossy().to_string()),
+        "expected output to contain 'Image file:' and path, got: {output_text}"
+    );
 
     let image_message =
         find_image_message(&body).expect("pending input image message not included in request");
@@ -370,36 +375,19 @@ async fn view_image_tool_placeholder_for_non_image_files() -> anyhow::Result<()>
         "non-image file should not produce an input_image message"
     );
 
-    let placeholder = request
-        .inputs_of_type("message")
-        .iter()
-        .find_map(|item| {
-            let content = item.get("content").and_then(Value::as_array)?;
-            content.iter().find_map(|span| {
-                if span.get("type").and_then(Value::as_str) == Some("input_text") {
-                    let text = span.get("text").and_then(Value::as_str)?;
-                    if text.contains("Codex could not read the local image at")
-                        && text.contains("unsupported MIME type `application/json`")
-                    {
-                        return Some(text.to_string());
-                    }
-                }
-                None
-            })
-        })
-        .expect("placeholder text found");
-
-    assert!(
-        placeholder.contains(&abs_path.display().to_string()),
-        "placeholder should mention path: {placeholder}"
-    );
+    // For unsupported formats, we no longer inject a placeholder message via inject_input.
+    // Instead, the function returns with content indicating unsupported format.
 
     let output_text = mock
         .single_request()
         .function_call_output_content_and_success(call_id)
         .and_then(|(content, _)| content)
         .expect("output text present");
-    assert_eq!(output_text, "attached local image path");
+    // Output format changed: "Viewed image: {path} ({size} KB) - unsupported format for inline display"
+    assert!(
+        output_text.contains("Viewed image:") && output_text.contains("unsupported format"),
+        "expected output to contain 'Viewed image:' and 'unsupported format', got: {output_text}"
+    );
 
     Ok(())
 }

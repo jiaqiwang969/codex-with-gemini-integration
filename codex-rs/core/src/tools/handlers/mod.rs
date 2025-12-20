@@ -4,7 +4,7 @@ mod grep_files;
 mod list_dir;
 mod mcp;
 mod mcp_resource;
-mod plan;
+pub(crate) mod plan;
 mod read_file;
 mod shell;
 mod test_sync;

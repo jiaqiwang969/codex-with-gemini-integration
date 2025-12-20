@@ -103,6 +103,34 @@ fn parse_bool_env(key: &str) -> Option<bool> {
     })
 }
 
+/// Checks if the given text is meaningful for display as reasoning content.
+/// Filters out garbage data like repeated characters (e.g., "000000...") that
+/// Gemini sometimes outputs when processing images.
+fn is_meaningful_thought_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // If text is very long (>100 chars) and consists mostly of the same character,
+    // it's likely garbage data from image processing
+    if trimmed.len() > 100 {
+        let first_char = trimmed.chars().next().unwrap();
+        let same_char_count = trimmed.chars().filter(|&c| c == first_char).count();
+        let ratio = same_char_count as f64 / trimmed.len() as f64;
+        if ratio > 0.9 {
+            return false;
+        }
+    }
+
+    // Check if text is just repeated digits (common garbage pattern)
+    if trimmed.len() > 50 && trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+
+    true
+}
+
 fn last_user_message_text(input: &[ResponseItem]) -> Option<String> {
     let Some(ResponseItem::Message { role, content, .. }) = input.last() else {
         return None;
@@ -159,10 +187,14 @@ fn build_gemini_tool_config_with_override(
     tools: &[ToolSpec],
     input: &[ResponseItem],
     force_override: Option<bool>,
+    api_model: &str,
 ) -> GeminiFunctionCallingConfig {
     let mut function_calling_config = GeminiFunctionCallingConfig {
         mode: GeminiFunctionCallingMode::Auto,
         allowed_function_names: None,
+        // Enable streaming function call arguments for Gemini 3 models.
+        // This reduces perceived latency when the model calls functions.
+        stream_function_call_arguments: is_gemini_3_model(api_model).then_some(true),
     };
 
     if should_force_gemini_read_tools_first_turn_with_override(input, force_override) {
@@ -179,11 +211,13 @@ fn build_gemini_tool_config_with_override(
 fn build_gemini_tool_config(
     tools: &[ToolSpec],
     input: &[ResponseItem],
+    api_model: &str,
 ) -> GeminiFunctionCallingConfig {
     build_gemini_tool_config_with_override(
         tools,
         input,
         parse_bool_env("CODEX_GEMINI_FORCE_READ_TOOLS_FIRST_TURN"),
+        api_model,
     )
 }
 
@@ -363,7 +397,7 @@ impl ModelClient {
 
         let tools = build_gemini_tools(&prompt.tools);
         let tool_config = tools.as_ref().map(|_| GeminiToolConfig {
-            function_calling_config: build_gemini_tool_config(&prompt.tools, &formatted_input),
+            function_calling_config: build_gemini_tool_config(&prompt.tools, &formatted_input, api_model),
         });
 
         // Ensure the active loop has thought signatures on function calls so
@@ -374,20 +408,25 @@ impl ModelClient {
         let thinking_config = Self::build_gemini_thinking_config(api_model, reasoning_effort);
 
         // Build generationConfig with thinkingConfig nested properly.
-        // Gemini defaults to temperature=1.0; Codex uses a slightly
-        // lower temperature (0.8) to encourage more stable, less
-        // speculative reasoning while still allowing exploration.
+        // Per Gemini 3 documentation: "We strongly recommend keeping the
+        // temperature parameter at its default value of 1.0. Lowering it
+        // may cause looping or degraded performance on reasoning tasks."
         // Gemini now enforces that only one of `thinkingLevel` or
         // `thinkingBudget` may be set. We pick the level for thinking
         // variants (to request high-quality thoughts) and budget for
         // non-thinking text models (to keep longer tool loops), while
         // omitting the field entirely for image models that reject it.
         let generation_config = Some(GeminiGenerationConfig {
-            temperature: Some(0.8),
+            temperature: Some(1.0), // Gemini 3 recommended default
             top_k: Some(64),
             top_p: Some(0.95),
             max_output_tokens: None, // Let the model decide
             thinking_config,
+            // TODO: Consider allowing user to specify media_resolution via MCP mechanism
+            // when they mention specific quality requirements (e.g., "high quality image analysis").
+            // Valid options: media_resolution_low (280 tokens), media_resolution_medium (560),
+            // media_resolution_high (1120), media_resolution_ultra_high (2240, per-part only).
+            media_resolution: None, // Let Gemini auto-select based on media type
         });
 
         // Default safety settings to allow code-related content
@@ -571,13 +610,59 @@ instead (for example: `codex -p codex`), or execute the command manually in your
         }
 
         if is_gemini_3_model(api_model) {
+            // For Gemini 3 models, use only thinkingLevel (not thinkingBudget).
+            // Per Gemini docs: thinkingLevel is the recommended approach for Gemini 3.
+            // thinkingBudget is for Gemini 2.5 series only.
+            //
+            // Gemini 3 Flash supports additional levels: minimal, low, medium, high
+            // Gemini 3 Pro supports: low, medium, high
+            // Default to "high" for best quality, but respect user's reasoning effort setting.
+            let thinking_level = match reasoning_effort {
+                Some(ReasoningEffortConfig::XHigh) => "high",
+                Some(ReasoningEffortConfig::High) => "high",
+                Some(ReasoningEffortConfig::Medium) => {
+                    // Flash supports "medium", Pro uses "medium" too
+                    if api_model.contains("flash") {
+                        "medium"
+                    } else {
+                        "medium"
+                    }
+                }
+                Some(ReasoningEffortConfig::Low) => {
+                    // Flash supports "minimal" for lowest, Pro uses "low"
+                    if api_model.contains("flash") {
+                        "minimal"
+                    } else {
+                        "low"
+                    }
+                }
+                Some(ReasoningEffortConfig::Minimal) => {
+                    // Minimal is Flash-exclusive, Pro falls back to "low"
+                    if api_model.contains("flash") {
+                        "minimal"
+                    } else {
+                        "low"
+                    }
+                }
+                Some(ReasoningEffortConfig::None) => {
+                    // No reasoning - use lowest available level
+                    if api_model.contains("flash") {
+                        "minimal"
+                    } else {
+                        "low"
+                    }
+                }
+                None => "high", // Default to high for best quality
+            };
+
             return Some(GeminiThinkingConfig {
-                thinking_level: Some("high".to_string()),
+                thinking_level: Some(thinking_level.to_string()),
                 include_thoughts: Some(true),
-                thinking_budget: None,
+                thinking_budget: None, // Do not mix with thinkingLevel for Gemini 3
             });
         }
 
+        // For Gemini 2.5 and other models, use thinkingBudget
         Some(GeminiThinkingConfig {
             thinking_level: None,
             include_thoughts: matches!(
@@ -851,6 +936,7 @@ async fn process_gemini_sse<S>(
     // State for accumulating response
     let mut accumulated_text = String::new();
     let mut assistant_item_sent = false;
+    let mut reasoning_item_sent = false;
     let mut function_calls: Vec<(String, String, Option<String>, String)> = Vec::new(); // (name, args, thought_signature, call_id)
     let mut last_response_id = "gemini-stream".to_string();
     let mut last_token_usage: Option<TokenUsage> = None;
@@ -915,6 +1001,52 @@ async fn process_gemini_sse<S>(
                             last_thought_signature = Some(sig.clone());
                         }
                         let is_thought = part.thought.is_some();
+
+                        // Handle thought content - emit as ReasoningContentDelta
+                        // This allows users to see what Gemini is thinking about
+                        // Filter out garbage data that Gemini sometimes outputs when processing images
+                        if is_thought
+                            && let Some(text) = &part.text
+                            && !text.is_empty()
+                            && is_meaningful_thought_text(text)
+                        {
+                            // Send reasoning item notification on first thought
+                            if !reasoning_item_sent {
+                                // Emit a reasoning item added notification
+                                let item = ResponseItem::Reasoning {
+                                    id: format!("gemini-thought-{}", last_response_id),
+                                    summary: vec![],
+                                    content: None,
+                                    encrypted_content: None,
+                                };
+                                if tx_event
+                                    .send(Ok(ResponseEvent::OutputItemAdded(item)))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                reasoning_item_sent = true;
+                            }
+
+                            // Send thought content as reasoning delta
+                            if tx_event
+                                .send(Ok(ResponseEvent::ReasoningContentDelta {
+                                    delta: text.clone(),
+                                    content_index: 0,
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        }
+
+                        // Skip garbage thought content without emitting
+                        if is_thought {
+                            continue;
+                        }
 
                         // Handle text content
                         if let Some(text) = part.text
@@ -1161,6 +1293,8 @@ fn build_gemini_contents(
                 });
             }
             // Handle FunctionCall from the model - add to history with role "model"
+            // Per Gemini 3 spec: parallel function calls should be in the same content,
+            // with only the FIRST part containing the thoughtSignature.
             ResponseItem::FunctionCall {
                 name,
                 arguments,
@@ -1172,10 +1306,26 @@ fn build_gemini_contents(
                     .insert(call_id.clone(), (name.clone(), thought_signature.clone()));
                 let args: serde_json::Value = serde_json::from_str(arguments)
                     .unwrap_or(serde_json::Value::Object(Default::default()));
-                let part_thought_signature = thought_signature.clone();
-                contents.push(GeminiContentRequest {
-                    role: Some("model".to_string()),
-                    parts: vec![GeminiPartRequest {
+
+                // Check if the last content is a "model" role with function calls
+                // If so, append to it (parallel function calls); otherwise create new
+                let should_merge = contents
+                    .last()
+                    .map(|c| {
+                        c.role.as_deref() == Some("model")
+                            && c.parts.iter().all(|p| p.function_call.is_some())
+                    })
+                    .unwrap_or(false);
+
+                if should_merge {
+                    // Parallel function call - append to existing model content
+                    // Per Gemini 3 spec: only the first functionCall has thoughtSignature
+                    debug!(
+                        "Gemini: merging parallel function call '{}' into existing model content (no thoughtSignature)",
+                        name
+                    );
+                    let last = contents.last_mut().unwrap();
+                    last.parts.push(GeminiPartRequest {
                         text: None,
                         inline_data: None,
                         function_call: Some(GeminiFunctionCallPart {
@@ -1183,15 +1333,42 @@ fn build_gemini_contents(
                             args,
                         }),
                         function_response: None,
-                        // Pass through the thought signature exactly as received.
-                        thought_signature: part_thought_signature.clone(),
-                        compat_thought_signature: part_thought_signature,
-                    }],
-                });
+                        // Subsequent parallel calls should NOT have thoughtSignature
+                        thought_signature: None,
+                        compat_thought_signature: None,
+                    });
+                } else {
+                    // First function call or after non-function-call content
+                    debug!(
+                        "Gemini: creating new model content for function call '{}' with thoughtSignature: {:?}",
+                        name,
+                        thought_signature.as_ref().map(|s| &s[..s.len().min(20)])
+                    );
+                    let part_thought_signature = thought_signature.clone();
+                    contents.push(GeminiContentRequest {
+                        role: Some("model".to_string()),
+                        parts: vec![GeminiPartRequest {
+                            text: None,
+                            inline_data: None,
+                            function_call: Some(GeminiFunctionCallPart {
+                                name: name.clone(),
+                                args,
+                            }),
+                            function_response: None,
+                            // First function call has the thoughtSignature
+                            thought_signature: part_thought_signature.clone(),
+                            compat_thought_signature: part_thought_signature,
+                        }],
+                    });
+                }
             }
-            // Handle FunctionCallOutput - send back to model with role "function"
+            // Handle FunctionCallOutput - send back to model with role "user"
+            // Per Gemini 3 spec:
+            // 1. Function responses use role "user", not "function"
+            // 2. thoughtSignature is ONLY on functionCall parts, NOT on functionResponse
+            // 3. Parallel function responses should be grouped together
             ResponseItem::FunctionCallOutput { call_id, output } => {
-                let (function_name, thought_signature) = function_calls_by_id
+                let (function_name, _thought_signature) = function_calls_by_id
                     .get(call_id)
                     .map(|(name, sig)| (name.clone(), sig.clone()))
                     .unwrap_or_else(|| ("unknown_function".to_string(), None));
@@ -1202,7 +1379,6 @@ fn build_gemini_contents(
                     "output": output_text,
                     "success": output.success.unwrap_or(true)
                 });
-                let part_thought_signature = thought_signature.clone();
                 let supports_multimodal = is_gemini_3_model(api_model);
                 let nested_parts = if supports_multimodal && !inline_parts.is_empty() {
                     Some(std::mem::take(&mut inline_parts))
@@ -1210,7 +1386,19 @@ fn build_gemini_contents(
                     None
                 };
 
-                let mut parts = vec![GeminiPartRequest {
+                // Check if the last content is a "user" role with function responses (parallel responses)
+                let should_merge = contents
+                    .last()
+                    .map(|c| {
+                        c.role.as_deref() == Some("user")
+                            && c.parts
+                                .iter()
+                                .all(|p| p.function_response.is_some() || p.inline_data.is_some())
+                    })
+                    .unwrap_or(false);
+
+                // Per Gemini 3 spec: functionResponse parts should NOT have thoughtSignature
+                let response_part = GeminiPartRequest {
                     text: None,
                     inline_data: None,
                     function_call: None,
@@ -1220,24 +1408,58 @@ fn build_gemini_contents(
                         response: response_value,
                         parts: nested_parts,
                     }),
-                    thought_signature: part_thought_signature.clone(),
-                    compat_thought_signature: part_thought_signature,
-                }];
+                    // Per Gemini 3 spec: NO thoughtSignature on functionResponse parts
+                    thought_signature: None,
+                    compat_thought_signature: None,
+                };
 
-                if !supports_multimodal {
-                    parts.append(&mut inline_parts);
+                if should_merge {
+                    // Parallel function response - append to existing user content
+                    let last = contents.last_mut().unwrap();
+                    last.parts.push(response_part);
+                    if !supports_multimodal {
+                        last.parts.append(&mut inline_parts);
+                    }
+                } else {
+                    // First function response or after non-function-response content
+                    let mut parts = vec![response_part];
+                    if !supports_multimodal {
+                        parts.append(&mut inline_parts);
+                    }
+                    // Per Gemini 3 spec: function responses use role "user"
+                    contents.push(GeminiContentRequest {
+                        role: Some("user".to_string()),
+                        parts,
+                    });
                 }
-
-                contents.push(GeminiContentRequest {
-                    role: Some("function".to_string()),
-                    parts,
-                });
             }
             _ => {}
         }
     }
 
     append_reference_images_to_contents(&mut contents, reference_images);
+
+    // Log summary of built contents for debugging
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let mut func_call_count = 0;
+        let mut func_resp_count = 0;
+        for content in &contents {
+            for part in &content.parts {
+                if part.function_call.is_some() {
+                    func_call_count += 1;
+                }
+                if part.function_response.is_some() {
+                    func_resp_count += 1;
+                }
+            }
+        }
+        debug!(
+            "Gemini: built {} contents with {} function calls and {} function responses",
+            contents.len(),
+            func_call_count,
+            func_resp_count
+        );
+    }
 
     contents
 }
@@ -1354,7 +1576,10 @@ fn content_to_gemini_parts(
 fn ensure_active_loop_has_thought_signatures(
     contents: &[GeminiContentRequest],
 ) -> Vec<GeminiContentRequest> {
-    const SYNTHETIC_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
+    /// Official Gemini 3 thought signature bypass string.
+    /// Per Gemini 3 documentation, this special value instructs the API
+    /// to skip thought signature validation for injected history.
+    const SYNTHETIC_THOUGHT_SIGNATURE: &str = "context_engineering_is_the_way_to_go";
 
     let mut new_contents = contents.to_vec();
     // Find the start of the "active loop" as the last `user` turn that
@@ -1629,6 +1854,10 @@ struct GeminiFunctionCallingConfig {
     mode: GeminiFunctionCallingMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     allowed_function_names: Option<Vec<String>>,
+    /// Gemini 3 Pro+ feature: stream function call arguments as they are generated.
+    /// This reduces perceived latency when functions need to be called.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_function_call_arguments: Option<bool>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -1638,6 +1867,27 @@ enum GeminiFunctionCallingMode {
     None,
     Auto,
     Any,
+}
+
+/// Media resolution for image/PDF processing.
+/// Per Gemini 3 docs: media_resolution_low=280 tokens, media_resolution_medium=560,
+/// media_resolution_high=1120, media_resolution_ultra_high=2240.
+#[derive(Debug, Serialize, Clone, Copy)]
+#[allow(dead_code)]
+enum GeminiMediaResolution {
+    /// Low resolution (280 tokens per image)
+    #[serde(rename = "media_resolution_low")]
+    Low,
+    /// Medium resolution (560 tokens per image)
+    #[serde(rename = "media_resolution_medium")]
+    Medium,
+    /// High resolution (1120 tokens per image) - recommended for image analysis
+    #[serde(rename = "media_resolution_high")]
+    High,
+    /// Ultra high resolution (2240 tokens per image) - maximum quality
+    /// Note: Cannot be set globally via generation_config, only per media part
+    #[serde(rename = "media_resolution_ultra_high")]
+    UltraHigh,
 }
 
 #[derive(Debug, Serialize)]
@@ -1653,6 +1903,10 @@ struct GeminiGenerationConfig {
     max_output_tokens: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking_config: Option<GeminiThinkingConfig>,
+    /// Media resolution for image/PDF processing.
+    /// Higher resolution provides better detail but uses more tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    media_resolution: Option<GeminiMediaResolution>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -2015,6 +2269,36 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn test_is_meaningful_thought_text_filters_garbage() {
+        // Empty text should be filtered
+        assert!(!is_meaningful_thought_text(""));
+        assert!(!is_meaningful_thought_text("   "));
+
+        // Normal text should pass
+        assert!(is_meaningful_thought_text("Let me think about this..."));
+        assert!(is_meaningful_thought_text("I need to analyze the image."));
+
+        // Repeated zeros (garbage from image processing) should be filtered
+        let zeros = "0".repeat(200);
+        assert!(!is_meaningful_thought_text(&zeros));
+
+        // Repeated digits should be filtered
+        let digits = "1234567890".repeat(20);
+        assert!(!is_meaningful_thought_text(&digits));
+
+        // Text with 90%+ same character should be filtered
+        let mostly_zeros = format!("{}abc", "0".repeat(150));
+        assert!(!is_meaningful_thought_text(&mostly_zeros));
+
+        // Short repeated text is OK (under threshold)
+        assert!(is_meaningful_thought_text("000"));
+        assert!(is_meaningful_thought_text("12345"));
+
+        // Mixed content should pass
+        assert!(is_meaningful_thought_text("The image shows 3 LEGO blocks arranged in a cross pattern."));
+    }
+
+    #[test]
     fn test_ensure_active_loop_fixes_all_turns() {
         let contents = vec![
             GeminiContentRequest {
@@ -2087,12 +2371,12 @@ mod tests {
         assert_eq!(processed[3].role.as_deref(), Some("model"));
         assert_eq!(
             processed[3].parts[0].thought_signature.as_deref(),
-            Some("skip_thought_signature_validator"),
+            Some("context_engineering_is_the_way_to_go"),
             "Latest model turn in active loop should have thought signature"
         );
         assert_eq!(
             processed[3].parts[0].compat_thought_signature.as_deref(),
-            Some("skip_thought_signature_validator"),
+            Some("context_engineering_is_the_way_to_go"),
             "Latest model turn in active loop should have thought signature"
         );
     }
@@ -2193,6 +2477,8 @@ mod tests {
 
     #[test]
     fn build_gemini_contents_pairs_function_call_outputs_by_call_id() {
+        // Test parallel function calls - per Gemini 3 spec, consecutive function calls
+        // should be merged into the same content, with only the first having thoughtSignature
         let items = vec![
             ResponseItem::Message {
                 id: None,
@@ -2236,36 +2522,70 @@ mod tests {
 
         let contents = build_gemini_contents(&items, &[], "gemini-3-pro-preview");
 
-        assert_eq!(contents.len(), 5);
+        // Per Gemini 3 spec: parallel calls are merged
+        // contents[0] = user message
+        // contents[1] = model with 2 function calls (merged)
+        // contents[2] = function with 2 responses (merged)
+        assert_eq!(contents.len(), 3);
 
-        assert_eq!(contents[3].role.as_deref(), Some("function"));
-        let response = contents[3].parts[0]
+        // Verify parallel function calls are in same model content
+        assert_eq!(contents[1].role.as_deref(), Some("model"));
+        assert_eq!(contents[1].parts.len(), 2);
+
+        // First function call has thoughtSignature
+        assert!(contents[1].parts[0].function_call.is_some());
+        assert_eq!(
+            contents[1].parts[0]
+                .function_call
+                .as_ref()
+                .unwrap()
+                .name,
+            "shell_command"
+        );
+        assert_eq!(
+            contents[1].parts[0].thought_signature.as_deref(),
+            Some("sig-1")
+        );
+
+        // Second function call should NOT have thoughtSignature (per Gemini 3 spec)
+        assert!(contents[1].parts[1].function_call.is_some());
+        assert_eq!(
+            contents[1].parts[1]
+                .function_call
+                .as_ref()
+                .unwrap()
+                .name,
+            "read_file"
+        );
+        assert!(
+            contents[1].parts[1].thought_signature.is_none(),
+            "Parallel function calls after the first should not have thoughtSignature"
+        );
+
+        // Verify parallel function responses are in same user content (per Gemini 3 spec)
+        assert_eq!(contents[2].role.as_deref(), Some("user"));
+        assert_eq!(contents[2].parts.len(), 2);
+
+        // Per Gemini 3 spec: functionResponse parts should NOT have thoughtSignature
+        let response1 = contents[2].parts[0]
             .function_response
             .as_ref()
             .expect("expected function response");
-        assert_eq!(response.name, "shell_command");
-        assert_eq!(
-            contents[3].parts[0].thought_signature.as_deref(),
-            Some("sig-1")
-        );
-        assert_eq!(
-            contents[3].parts[0].compat_thought_signature.as_deref(),
-            Some("sig-1")
+        assert_eq!(response1.name, "shell_command");
+        assert!(
+            contents[2].parts[0].thought_signature.is_none(),
+            "functionResponse parts should NOT have thoughtSignature per Gemini 3 spec"
         );
 
-        assert_eq!(contents[4].role.as_deref(), Some("function"));
-        let response = contents[4].parts[0]
+        // Second response also has no thoughtSignature
+        let response2 = contents[2].parts[1]
             .function_response
             .as_ref()
             .expect("expected function response");
-        assert_eq!(response.name, "read_file");
-        assert_eq!(
-            contents[4].parts[0].thought_signature.as_deref(),
-            Some("sig-2")
-        );
-        assert_eq!(
-            contents[4].parts[0].compat_thought_signature.as_deref(),
-            Some("sig-2")
+        assert_eq!(response2.name, "read_file");
+        assert!(
+            contents[2].parts[1].thought_signature.is_none(),
+            "functionResponse parts should NOT have thoughtSignature per Gemini 3 spec"
         );
     }
 
@@ -2312,6 +2632,7 @@ mod tests {
             compat_thought_signature: None,
         };
 
+        // Per Gemini 3 spec: functionResponse parts do NOT have thoughtSignature
         let expected_parts = vec![GeminiPartRequest {
             text: None,
             inline_data: None,
@@ -2325,10 +2646,12 @@ mod tests {
                 }),
                 parts: Some(vec![expected_inline]),
             }),
-            thought_signature: Some("sig-1".to_string()),
-            compat_thought_signature: Some("sig-1".to_string()),
+            thought_signature: None,
+            compat_thought_signature: None,
         }];
 
+        // Function response should have role "user" per Gemini 3 spec
+        assert_eq!(contents[2].role.as_deref(), Some("user"));
         assert_eq!(contents[2].parts, expected_parts);
     }
 
@@ -2375,6 +2698,7 @@ mod tests {
             compat_thought_signature: None,
         };
 
+        // Per Gemini spec: functionResponse parts do NOT have thoughtSignature
         let expected_parts = vec![
             GeminiPartRequest {
                 text: None,
@@ -2389,12 +2713,14 @@ mod tests {
                     }),
                     parts: None,
                 }),
-                thought_signature: Some("sig-1".to_string()),
-                compat_thought_signature: Some("sig-1".to_string()),
+                thought_signature: None,
+                compat_thought_signature: None,
             },
             expected_inline,
         ];
 
+        // Function response should have role "user" per Gemini spec
+        assert_eq!(contents[2].role.as_deref(), Some("user"));
         assert_eq!(contents[2].parts, expected_parts);
     }
 
@@ -2429,7 +2755,7 @@ mod tests {
             thought_signature: None,
         }];
 
-        let config = build_gemini_tool_config_with_override(&tools, &input, None);
+        let config = build_gemini_tool_config_with_override(&tools, &input, None, "gemini-2.5-pro");
 
         assert_eq!(config.mode, GeminiFunctionCallingMode::Any);
         assert_eq!(
@@ -2440,6 +2766,8 @@ mod tests {
                 "read_file".to_string()
             ])
         );
+        // Non-Gemini 3 model should not have stream_function_call_arguments
+        assert_eq!(config.stream_function_call_arguments, None);
     }
 
     #[test]
@@ -2464,7 +2792,7 @@ mod tests {
             },
         ];
 
-        let config = build_gemini_tool_config_with_override(&tools, &input, Some(true));
+        let config = build_gemini_tool_config_with_override(&tools, &input, Some(true), "gemini-2.5-pro");
 
         assert_eq!(config.mode, GeminiFunctionCallingMode::Auto);
         assert_eq!(config.allowed_function_names, None);
@@ -2482,16 +2810,20 @@ mod tests {
             thought_signature: None,
         }];
 
-        let config = build_gemini_tool_config_with_override(&tools, &input, Some(true));
+        // Test with Gemini 3 model - should have stream_function_call_arguments enabled
+        let config = build_gemini_tool_config_with_override(&tools, &input, Some(true), "gemini-3-pro-preview");
         assert_eq!(config.mode, GeminiFunctionCallingMode::Any);
         assert_eq!(
             config.allowed_function_names,
             Some(vec!["grep_files".to_string()])
         );
+        assert_eq!(config.stream_function_call_arguments, Some(true));
 
-        let config = build_gemini_tool_config_with_override(&tools, &input, Some(false));
+        // Test with Gemini 2.5 model - should not have stream_function_call_arguments
+        let config = build_gemini_tool_config_with_override(&tools, &input, Some(false), "gemini-2.5-pro");
         assert_eq!(config.mode, GeminiFunctionCallingMode::Auto);
         assert_eq!(config.allowed_function_names, None);
+        assert_eq!(config.stream_function_call_arguments, None);
     }
 
     #[test]
@@ -2506,7 +2838,7 @@ mod tests {
             Some(GeminiThinkingConfig {
                 thinking_level: Some("high".to_string()),
                 include_thoughts: Some(true),
-                thinking_budget: None,
+                thinking_budget: None, // Gemini 3 uses thinkingLevel only, not thinkingBudget
             })
         );
     }
@@ -2520,7 +2852,7 @@ mod tests {
             Some(GeminiThinkingConfig {
                 thinking_level: Some("high".to_string()),
                 include_thoughts: Some(true),
-                thinking_budget: None,
+                thinking_budget: None, // Gemini 3 uses thinkingLevel only, not thinkingBudget
             })
         );
     }
@@ -2547,5 +2879,71 @@ mod tests {
         );
 
         assert_eq!(config, None);
+    }
+
+    #[test]
+    fn build_gemini_thinking_config_flash_uses_minimal_for_low_effort() {
+        let config = ModelClient::build_gemini_thinking_config(
+            "gemini-3-flash-preview",
+            Some(ReasoningEffortConfig::Low),
+        );
+
+        assert_eq!(
+            config,
+            Some(GeminiThinkingConfig {
+                thinking_level: Some("minimal".to_string()),
+                include_thoughts: Some(true),
+                thinking_budget: None,
+            })
+        );
+    }
+
+    #[test]
+    fn build_gemini_thinking_config_pro_uses_low_for_low_effort() {
+        let config = ModelClient::build_gemini_thinking_config(
+            "gemini-3-pro-preview",
+            Some(ReasoningEffortConfig::Low),
+        );
+
+        assert_eq!(
+            config,
+            Some(GeminiThinkingConfig {
+                thinking_level: Some("low".to_string()),
+                include_thoughts: Some(true),
+                thinking_budget: None,
+            })
+        );
+    }
+
+    #[test]
+    fn build_gemini_thinking_config_medium_effort() {
+        // Both Flash and Pro should use "medium" for medium effort
+        let flash_config = ModelClient::build_gemini_thinking_config(
+            "gemini-3-flash-preview",
+            Some(ReasoningEffortConfig::Medium),
+        );
+
+        assert_eq!(
+            flash_config,
+            Some(GeminiThinkingConfig {
+                thinking_level: Some("medium".to_string()),
+                include_thoughts: Some(true),
+                thinking_budget: None,
+            })
+        );
+
+        let pro_config = ModelClient::build_gemini_thinking_config(
+            "gemini-3-pro-preview",
+            Some(ReasoningEffortConfig::Medium),
+        );
+
+        assert_eq!(
+            pro_config,
+            Some(GeminiThinkingConfig {
+                thinking_level: Some("medium".to_string()),
+                include_thoughts: Some(true),
+                thinking_budget: None,
+            })
+        );
     }
 }
