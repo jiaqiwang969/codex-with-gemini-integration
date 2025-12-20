@@ -37,6 +37,7 @@ This project is a fork of [OpenAI Codex CLI](https://github.com/openai/codex) wi
 - **MCP Protocol**: Full Model Context Protocol support for extensible tool integration
 - **Sandbox Modes**: Flexible security policies (`read-only`, `workspace-write`, `danger-full-access`)
 - **Reference Images**: `/ref-image` command for image-based workflows with Gemini image models
+- **Profiles**: Pre-configured profiles for different use cases
 
 ### Installation
 
@@ -55,46 +56,129 @@ cargo build --release
 
 ### Configuration
 
-#### Using Gemini API
+Configuration files are stored in `~/.codex/`:
+- `config.toml` - Main configuration file
+- `auth.json` - API keys storage
 
-1. Set your Gemini API key:
+#### API Keys Setup (`~/.codex/auth.json`)
+
+Create or edit `~/.codex/auth.json`:
+
+```json
+{
+  "OPENAI_API_KEY": "sk-your-openai-api-key",
+  "GEMINI_API_KEY": "AIzaSy-your-gemini-api-key"
+}
+```
+
+Alternatively, use environment variables:
 ```shell
-export GEMINI_API_KEY="your-api-key"
+export OPENAI_API_KEY="sk-your-openai-api-key"
+export GEMINI_API_KEY="AIzaSy-your-gemini-api-key"
 ```
 
-2. Configure in `~/.codex/config.toml`:
+#### Main Configuration (`~/.codex/config.toml`)
+
 ```toml
+# Default model and provider
+model = "gemini-3-flash-preview-gemini"
+model_provider = "openai-proxy"
+model_reasoning_effort = "high"
+
+# Disable response storage for privacy
+disable_response_storage = true
+
+# Feature flags
+[features]
+tui2 = false
+
+# Model Providers Configuration
+[model_providers.openai-proxy]
+name = "Codex OpenAI Proxy"
+base_url = "https://api.openai.com/v1"
+wire_api = "responses"
+requires_openai_auth = true
+
+[model_providers.gemini]
+name = "Codex Gemini Direct"
+base_url = "https://generativelanguage.googleapis.com/v1"
+wire_api = "gemini"
+requires_openai_auth = false
+auth_json_key = "GEMINI_API_KEY"
+
+# Profiles for different use cases
+[profiles.codex]
+model = "gemini-3-flash-preview-gemini"
+model_provider = "openai-proxy"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+model_reasoning_effort = "high"
+
+[profiles.gemini]
 model = "gemini-3-pro-preview-codex"
-# Or for Flash variant:
-# model = "gemini-3-flash-preview-gemini"
+model_provider = "gemini"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+model_reasoning_effort = "medium"
+
+[profiles.safe]
+model = "gpt-5.2-codex"
+model_provider = "openai-proxy"
+approval_policy = "on-failure"
+sandbox_mode = "workspace-write"
+model_reasoning_effort = "medium"
 ```
 
-3. Select reasoning level via `/model` command in TUI
+#### Provider Auto-Selection
+
+The provider is **automatically selected based on your configured model**. Simply run:
+
+```shell
+codex
+```
+
+The system will:
+- Use `openai-proxy` provider for models ending in `-gemini` (e.g., `gemini-3-flash-preview-gemini`)
+- Use `gemini` provider for models ending in `-codex` when configured with `model_provider = "gemini"`
+- Use the appropriate API key from `auth.json` based on the provider
+
+#### Optional: Using Profiles
+
+Profiles are optional shortcuts for switching between pre-configured settings:
+
+```shell
+# Use the safe profile (with sandbox restrictions)
+codex -p safe
+```
 
 #### Supported Models
 
-| Model | Description | Reasoning Levels |
-|-------|-------------|------------------|
-| `gemini-3-pro-preview-codex` | Best quality reasoning | low, medium, high |
-| `gemini-3-flash-preview-gemini` | Fast and efficient | minimal, low, medium, high |
-| `gemini-3-pro-image-preview` | Image generation & analysis | medium |
-| `gpt-5.2-codex` | OpenAI flagship model | low, medium, high, xhigh |
+| Model | Description | Reasoning Levels | Provider |
+|-------|-------------|------------------|----------|
+| `gemini-3-pro-preview-codex` | Best quality reasoning | low, medium, high | openai-proxy / gemini |
+| `gemini-3-flash-preview-gemini` | Fast and efficient | minimal, low, medium, high | openai-proxy / gemini |
+| `gemini-3-pro-image-preview` | Image generation & analysis | medium | openai-proxy / gemini |
+| `gpt-5.2-codex` | OpenAI flagship model | low, medium, high, xhigh | openai-proxy |
 
 ### Usage Examples
 
 ```shell
-# Start interactive TUI
+# Start interactive TUI (uses model from config.toml)
 codex
 
 # Non-interactive execution
 codex exec "Analyze this codebase and suggest improvements"
 
-# With specific model
+# Override model for this session
 codex -m gemini-3-pro-preview-codex
 
 # Image workflow with Gemini
 codex
 > /ref-image screenshot.png -- Analyze this UI and suggest improvements
+
+# Select reasoning level in TUI
+> /model
+# Then choose your preferred reasoning level
 ```
 
 ### Architecture
@@ -142,6 +226,7 @@ Contributions are welcome! Please feel free to submit issues and pull requests.
 - **MCP 协议**：完整的模型上下文协议支持，可扩展工具集成
 - **沙箱模式**：灵活的安全策略（`read-only` 只读、`workspace-write` 工作区写入、`danger-full-access` 完全访问）
 - **参考图像**：使用 `/ref-image` 命令配合 Gemini 图像模型进行图像工作流
+- **配置文件**：预配置的配置文件，适用于不同使用场景
 
 ### 安装
 
@@ -160,46 +245,129 @@ cargo build --release
 
 ### 配置
 
-#### 使用 Gemini API
+配置文件存储在 `~/.codex/` 目录下：
+- `config.toml` - 主配置文件
+- `auth.json` - API 密钥存储
 
-1. 设置 Gemini API 密钥：
+#### API 密钥设置 (`~/.codex/auth.json`)
+
+创建或编辑 `~/.codex/auth.json`：
+
+```json
+{
+  "OPENAI_API_KEY": "sk-your-openai-api-key",
+  "GEMINI_API_KEY": "AIzaSy-your-gemini-api-key"
+}
+```
+
+或者使用环境变量：
 ```shell
-export GEMINI_API_KEY="your-api-key"
+export OPENAI_API_KEY="sk-your-openai-api-key"
+export GEMINI_API_KEY="AIzaSy-your-gemini-api-key"
 ```
 
-2. 在 `~/.codex/config.toml` 中配置：
+#### 主配置文件 (`~/.codex/config.toml`)
+
 ```toml
+# 默认模型和提供者
+model = "gemini-3-flash-preview-gemini"
+model_provider = "openai-proxy"
+model_reasoning_effort = "high"
+
+# 禁用响应存储以保护隐私
+disable_response_storage = true
+
+# 功能开关
+[features]
+tui2 = false
+
+# 模型提供者配置
+[model_providers.openai-proxy]
+name = "Codex OpenAI Proxy"
+base_url = "https://api.openai.com/v1"
+wire_api = "responses"
+requires_openai_auth = true
+
+[model_providers.gemini]
+name = "Codex Gemini Direct"
+base_url = "https://generativelanguage.googleapis.com/v1"
+wire_api = "gemini"
+requires_openai_auth = false
+auth_json_key = "GEMINI_API_KEY"
+
+# 不同使用场景的配置文件
+[profiles.codex]
+model = "gemini-3-flash-preview-gemini"
+model_provider = "openai-proxy"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+model_reasoning_effort = "high"
+
+[profiles.gemini]
 model = "gemini-3-pro-preview-codex"
-# 或使用 Flash 变体：
-# model = "gemini-3-flash-preview-gemini"
+model_provider = "gemini"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+model_reasoning_effort = "medium"
+
+[profiles.safe]
+model = "gpt-5.2-codex"
+model_provider = "openai-proxy"
+approval_policy = "on-failure"
+sandbox_mode = "workspace-write"
+model_reasoning_effort = "medium"
 ```
 
-3. 在 TUI 中通过 `/model` 命令选择推理级别
+#### 提供者自动选择
+
+提供者**根据配置的模型自动选择**。只需运行：
+
+```shell
+codex
+```
+
+系统会：
+- 对于以 `-gemini` 结尾的模型（如 `gemini-3-flash-preview-gemini`），使用 `openai-proxy` 提供者
+- 对于以 `-codex` 结尾的模型，当配置 `model_provider = "gemini"` 时使用 `gemini` 提供者
+- 根据提供者自动使用 `auth.json` 中对应的 API 密钥
+
+#### 可选：使用配置文件
+
+配置文件是切换预设配置的可选快捷方式：
+
+```shell
+# 使用 safe 配置（带沙箱限制）
+codex -p safe
+```
 
 #### 支持的模型
 
-| 模型 | 描述 | 推理级别 |
-|------|------|----------|
-| `gemini-3-pro-preview-codex` | 最佳推理质量 | low, medium, high |
-| `gemini-3-flash-preview-gemini` | 快速高效 | minimal, low, medium, high |
-| `gemini-3-pro-image-preview` | 图像生成与分析 | medium |
-| `gpt-5.2-codex` | OpenAI 旗舰模型 | low, medium, high, xhigh |
+| 模型 | 描述 | 推理级别 | 提供者 |
+|------|------|----------|--------|
+| `gemini-3-pro-preview-codex` | 最佳推理质量 | low, medium, high | openai-proxy / gemini |
+| `gemini-3-flash-preview-gemini` | 快速高效 | minimal, low, medium, high | openai-proxy / gemini |
+| `gemini-3-pro-image-preview` | 图像生成与分析 | medium | openai-proxy / gemini |
+| `gpt-5.2-codex` | OpenAI 旗舰模型 | low, medium, high, xhigh | openai-proxy |
 
 ### 使用示例
 
 ```shell
-# 启动交互式 TUI
+# 启动交互式 TUI（使用 config.toml 中的模型）
 codex
 
 # 非交互式执行
 codex exec "分析这个代码库并提出改进建议"
 
-# 指定模型
+# 临时覆盖模型
 codex -m gemini-3-pro-preview-codex
 
 # Gemini 图像工作流
 codex
 > /ref-image screenshot.png -- 分析这个 UI 并提出改进建议
+
+# 在 TUI 中选择推理级别
+> /model
+# 然后选择你偏好的推理级别
 ```
 
 ### 项目架构
