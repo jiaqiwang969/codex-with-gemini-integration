@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::app::App;
+use crate::app_event::AppEvent;
+use crate::cxresume_picker_widget::SessionPickerOutcome;
 use crate::history_cell::SessionInfoCell;
 use crate::history_cell::UserHistoryCell;
 use crate::pager_overlay::Overlay;
@@ -14,6 +16,7 @@ use color_eyre::eyre::Result;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
+use crossterm::event::KeyModifiers;
 
 /// Aggregates all backtrack-related state used by the App.
 #[derive(Default)]
@@ -40,6 +43,23 @@ impl App {
         tui: &mut tui::Tui,
         event: TuiEvent,
     ) -> Result<bool> {
+        if let TuiEvent::Key(KeyEvent {
+            code: KeyCode::Char(c),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            ..
+        }) = event
+            && matches!(c, 'x' | 'q')
+        {
+            self.open_or_refresh_session_picker(tui);
+            return Ok(true);
+        }
+
+        if !matches!(self.overlay, Some(Overlay::Transcript(_))) {
+            self.overlay_forward_event(tui, event)?;
+            return Ok(true);
+        }
+
         if self.backtrack.overlay_preview_active {
             match event {
                 TuiEvent::Key(KeyEvent {
@@ -138,6 +158,81 @@ impl App {
         }
     }
 
+    pub(crate) fn close_session_picker(
+        &mut self,
+        tui: &mut tui::Tui,
+        outcome: Option<SessionPickerOutcome>,
+    ) -> Result<()> {
+        let _ = tui.leave_alt_screen();
+        if let Some(state) = self
+            .overlay
+            .as_ref()
+            .and_then(super::pager_overlay::Overlay::session_picker_state)
+        {
+            self.update_cxresume_cache(state);
+        }
+        if !self.deferred_history_lines.is_empty() {
+            let lines = std::mem::take(&mut self.deferred_history_lines);
+            tui.insert_history_lines(lines);
+        }
+        self.overlay = None;
+        self.reset_cxresume_idle();
+        self.backtrack.overlay_preview_active = false;
+        if let Some(outcome) = outcome {
+            match outcome {
+                SessionPickerOutcome::Exit => {}
+                SessionPickerOutcome::NewSession => {
+                    if self.chat_widget.is_task_running() {
+                        self.chat_widget.add_error_message(
+                            "Cannot start a new session while a task is running.".to_string(),
+                        );
+                    } else {
+                        self.app_event_tx.send(AppEvent::NewSession);
+                    }
+                }
+                SessionPickerOutcome::Resume(path) => {
+                    if self.chat_widget.is_task_running() {
+                        self.chat_widget.add_error_message(
+                            "Cannot switch sessions while a task is running.".to_string(),
+                        );
+                    } else {
+                        self.app_event_tx.send(AppEvent::ResumeSession(path));
+                    }
+                }
+                SessionPickerOutcome::Rename { session_id } => {
+                    if self.chat_widget.is_task_running() {
+                        self.chat_widget.add_error_message(
+                            "Cannot rename a session while a task is running.".to_string(),
+                        );
+                    } else {
+                        let app_tx = self.app_event_tx.clone();
+                        self.chat_widget.show_session_alias_input_for_rename(
+                            session_id,
+                            Box::new(move |sid, alias| {
+                                app_tx.send(AppEvent::SaveSessionAlias {
+                                    session_id: sid,
+                                    alias,
+                                });
+                            }),
+                        );
+                    }
+                }
+                SessionPickerOutcome::Clone { source_path } => {
+                    if self.chat_widget.is_task_running() {
+                        self.chat_widget.add_error_message(
+                            "Cannot clone a session while a task is running.".to_string(),
+                        );
+                    } else {
+                        self.app_event_tx.send(AppEvent::CloneSession(source_path));
+                    }
+                }
+                SessionPickerOutcome::Refresh => {}
+            }
+        }
+        self.refresh_session_bar();
+        Ok(())
+    }
+
     /// Re-render the full transcript into the terminal scrollback in one call.
     /// Useful when switching sessions to ensure prior history remains visible.
     pub(crate) fn render_transcript_once(&mut self, tui: &mut tui::Tui) {
@@ -218,12 +313,34 @@ impl App {
 
     /// Forward any event to the overlay and close it if done.
     fn overlay_forward_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()> {
-        if let Some(overlay) = &mut self.overlay {
+        enum OverlayCloseAction {
+            Session {
+                outcome: Option<SessionPickerOutcome>,
+            },
+            Other,
+        }
+
+        let mut close_action = None;
+        if let Some(overlay) = self.overlay.as_mut() {
             overlay.handle_event(tui, event)?;
             if overlay.is_done() {
-                self.close_transcript_overlay(tui);
-                tui.frame_requester().schedule_frame();
+                close_action = Some(match overlay {
+                    Overlay::SessionPicker(_) => OverlayCloseAction::Session {
+                        outcome: overlay.session_picker_outcome(),
+                    },
+                    _ => OverlayCloseAction::Other,
+                });
             }
+        }
+
+        if let Some(action) = close_action {
+            match action {
+                OverlayCloseAction::Session { outcome } => {
+                    self.close_session_picker(tui, outcome)?;
+                }
+                OverlayCloseAction::Other => self.close_transcript_overlay(tui),
+            }
+            tui.frame_requester().schedule_frame();
         }
         Ok(())
     }

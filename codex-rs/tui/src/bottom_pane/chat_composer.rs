@@ -73,6 +73,7 @@ const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
 pub enum InputResult {
     Submitted(String),
     Command(SlashCommand),
+    CommandWithArgs(SlashCommand, String),
     None,
 }
 
@@ -118,6 +119,9 @@ pub(crate) struct ChatComposer {
     footer_hint_override: Option<Vec<(String, String)>>,
     context_window_percent: Option<i64>,
     context_window_used_tokens: Option<i64>,
+    transcript_scrolled: bool,
+    transcript_selection_active: bool,
+    transcript_scroll_position: Option<(usize, usize)>,
     skills: Option<Vec<SkillMetadata>>,
     dismissed_skill_popup_token: Option<String>,
 }
@@ -166,6 +170,9 @@ impl ChatComposer {
             footer_hint_override: None,
             context_window_percent: None,
             context_window_used_tokens: None,
+            transcript_scrolled: false,
+            transcript_selection_active: false,
+            transcript_scroll_position: None,
             skills: None,
             dismissed_skill_popup_token: None,
         };
@@ -1084,13 +1091,20 @@ impl ChatComposer {
                 // literal text.
                 let first_line = self.textarea.text().lines().next().unwrap_or("");
                 if let Some((name, rest)) = parse_slash_name(first_line)
-                    && rest.is_empty()
                     && let Some((_n, cmd)) = built_in_slash_commands()
                         .into_iter()
                         .find(|(n, _)| *n == name)
                 {
-                    self.textarea.set_text("");
-                    return (InputResult::Command(cmd), true);
+                    let rest_str = rest.trim().to_string();
+                    let has_args = !rest_str.is_empty();
+                    if !has_args {
+                        self.textarea.set_text("");
+                        return (InputResult::Command(cmd), true);
+                    }
+                    if cmd.accepts_args() {
+                        self.textarea.set_text("");
+                        return (InputResult::CommandWithArgs(cmd, rest_str), true);
+                    }
                 }
                 // If we're in a paste-like burst capture, treat Enter as part of the burst
                 // and accumulate it rather than submitting or inserting immediately.
@@ -1511,8 +1525,7 @@ impl ChatComposer {
 
         let toggles = matches!(key_event.code, KeyCode::Char('?'))
             && !has_ctrl_or_alt(key_event.modifiers)
-            && self.is_empty()
-            && !self.is_in_paste_burst();
+            && self.is_empty();
 
         if !toggles {
             return false;
@@ -1532,6 +1545,9 @@ impl ChatComposer {
             is_task_running: self.is_task_running,
             context_window_percent: self.context_window_percent,
             context_window_used_tokens: self.context_window_used_tokens,
+            transcript_scrolled: self.transcript_scrolled,
+            transcript_selection_active: self.transcript_selection_active,
+            transcript_scroll_position: self.transcript_scroll_position,
         }
     }
 
@@ -1550,6 +1566,23 @@ impl ChatComposer {
         self.footer_hint_override
             .as_ref()
             .map(|items| if items.is_empty() { 0 } else { 1 })
+    }
+
+    /// Update the footer's view of transcript scroll state for the inline viewport.
+    ///
+    /// This state is derived from the main `App`'s transcript viewport and passed
+    /// through the bottom pane so the footer can indicate when the transcript is
+    /// scrolled away from the bottom, whether a selection is active, and the
+    /// current `(visible_top, total)` position.
+    pub(crate) fn set_transcript_ui_state(
+        &mut self,
+        scrolled: bool,
+        selection_active: bool,
+        scroll_position: Option<(usize, usize)>,
+    ) {
+        self.transcript_scrolled = scrolled;
+        self.transcript_selection_active = selection_active;
+        self.transcript_scroll_position = scroll_position;
     }
 
     fn sync_popups(&mut self) {
@@ -2173,35 +2206,6 @@ mod tests {
     }
 
     #[test]
-    fn question_mark_does_not_toggle_during_paste_burst() {
-        use crossterm::event::KeyCode;
-        use crossterm::event::KeyEvent;
-        use crossterm::event::KeyModifiers;
-
-        let (tx, _rx) = unbounded_channel::<AppEvent>();
-        let sender = AppEventSender::new(tx);
-        let mut composer = ChatComposer::new(
-            true,
-            sender,
-            false,
-            "Ask Codex to do anything".to_string(),
-            false,
-        );
-
-        for ch in ['h', 'i', '?', 't', 'h', 'e', 'r', 'e'] {
-            let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
-        }
-        assert!(composer.is_in_paste_burst());
-        assert_eq!(composer.textarea.text(), "");
-
-        std::thread::sleep(ChatComposer::recommended_paste_flush_delay());
-        let _ = composer.flush_paste_burst_if_due();
-
-        assert_eq!(composer.textarea.text(), "hi?there");
-        assert_ne!(composer.footer_mode, FooterMode::ShortcutOverlay);
-    }
-
-    #[test]
     fn shortcut_overlay_persists_while_task_running() {
         use crossterm::event::KeyCode;
         use crossterm::event::KeyEvent;
@@ -2735,6 +2739,12 @@ mod tests {
             InputResult::Command(cmd) => {
                 assert_eq!(cmd.command(), "init");
             }
+            InputResult::CommandWithArgs(cmd, args) => {
+                panic!(
+                    "expected '/init' with no args, got '/{} {args}'",
+                    cmd.command()
+                )
+            }
             InputResult::Submitted(text) => {
                 panic!("expected command dispatch, but composer submitted literal text: {text}")
             }
@@ -2775,7 +2785,7 @@ mod tests {
             false,
         );
 
-        type_chars_humanlike(&mut composer, &['/', 'c']);
+        type_chars_humanlike(&mut composer, &['/', 'c', 'o']);
 
         let (_result, _needs_redraw) =
             composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -2808,6 +2818,12 @@ mod tests {
             composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match result {
             InputResult::Command(cmd) => assert_eq!(cmd.command(), "diff"),
+            InputResult::CommandWithArgs(cmd, args) => {
+                panic!(
+                    "expected '/diff' with no args, got '/{} {args}'",
+                    cmd.command()
+                )
+            }
             InputResult::Submitted(text) => {
                 panic!("expected command dispatch after Tab completion, got literal submit: {text}")
             }
@@ -2840,6 +2856,12 @@ mod tests {
         match result {
             InputResult::Command(cmd) => {
                 assert_eq!(cmd.command(), "mention");
+            }
+            InputResult::CommandWithArgs(cmd, args) => {
+                panic!(
+                    "expected '/mention' with no args, got '/{} {args}'",
+                    cmd.command()
+                )
             }
             InputResult::Submitted(text) => {
                 panic!("expected command dispatch, but composer submitted literal text: {text}")

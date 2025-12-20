@@ -1,4 +1,3 @@
-use std::fmt;
 use std::io::IsTerminal;
 use std::io::Result;
 use std::io::Stdout;
@@ -10,12 +9,14 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
-use crossterm::Command;
 use crossterm::SynchronizedUpdate;
 use crossterm::event::DisableBracketedPaste;
 use crossterm::event::DisableFocusChange;
+use crossterm::event::DisableMouseCapture;
 use crossterm::event::EnableBracketedPaste;
 use crossterm::event::EnableFocusChange;
+use crossterm::event::EnableMouseCapture;
+use crossterm::event::Event;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyboardEnhancementFlags;
 use crossterm::event::PopKeyboardEnhancementFlags;
@@ -23,7 +24,6 @@ use crossterm::event::PushKeyboardEnhancementFlags;
 use crossterm::terminal::EnterAlternateScreen;
 use crossterm::terminal::LeaveAlternateScreen;
 use crossterm::terminal::supports_keyboard_enhancement;
-use ratatui::backend::Backend;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::disable_raw_mode;
@@ -31,6 +31,7 @@ use ratatui::crossterm::terminal::enable_raw_mode;
 use ratatui::layout::Offset;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
+use tokio::select;
 use tokio::sync::broadcast;
 use tokio_stream::Stream;
 
@@ -40,15 +41,15 @@ use crate::custom_terminal::Terminal as CustomTerminal;
 use crate::notifications::DesktopNotificationBackend;
 use crate::notifications::NotificationBackendKind;
 use crate::notifications::detect_backend;
-use crate::tui::event_stream::EventBroker;
-use crate::tui::event_stream::TuiEventStream;
+#[cfg(unix)]
+use crate::tui::job_control::SUSPEND_KEY;
 #[cfg(unix)]
 use crate::tui::job_control::SuspendContext;
 
-mod event_stream;
 mod frame_requester;
 #[cfg(unix)]
 mod job_control;
+pub(crate) mod scrolling;
 
 /// A type alias for the terminal type used in this application
 pub type Terminal = CustomTerminal<CrosstermBackend<Stdout>>;
@@ -73,49 +74,10 @@ pub fn set_modes() -> Result<()> {
     );
 
     let _ = execute!(stdout(), EnableFocusChange);
+    // Enable application mouse mode so scroll events are delivered as
+    // Mouse events instead of arrow keys.
+    let _ = execute!(stdout(), EnableMouseCapture);
     Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EnableAlternateScroll;
-
-impl Command for EnableAlternateScroll {
-    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        write!(f, "\x1b[?1007h")
-    }
-
-    #[cfg(windows)]
-    fn execute_winapi(&self) -> Result<()> {
-        Err(std::io::Error::other(
-            "tried to execute EnableAlternateScroll using WinAPI; use ANSI instead",
-        ))
-    }
-
-    #[cfg(windows)]
-    fn is_ansi_code_supported(&self) -> bool {
-        true
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DisableAlternateScroll;
-
-impl Command for DisableAlternateScroll {
-    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        write!(f, "\x1b[?1007l")
-    }
-
-    #[cfg(windows)]
-    fn execute_winapi(&self) -> Result<()> {
-        Err(std::io::Error::other(
-            "tried to execute DisableAlternateScroll using WinAPI; use ANSI instead",
-        ))
-    }
-
-    #[cfg(windows)]
-    fn is_ansi_code_supported(&self) -> bool {
-        true
-    }
 }
 
 /// Restore the terminal to its original state.
@@ -123,6 +85,7 @@ impl Command for DisableAlternateScroll {
 pub fn restore() -> Result<()> {
     // Pop may fail on platforms that didn't support the push; ignore errors.
     let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+    let _ = execute!(stdout(), DisableMouseCapture);
     execute!(stdout(), DisableBracketedPaste)?;
     let _ = execute!(stdout(), DisableFocusChange);
     disable_raw_mode()?;
@@ -155,17 +118,17 @@ fn set_panic_hook() {
     }));
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum TuiEvent {
     Key(KeyEvent),
     Paste(String),
     Draw,
+    Mouse(crossterm::event::MouseEvent),
 }
 
 pub struct Tui {
     frame_requester: FrameRequester,
     draw_tx: broadcast::Sender<()>,
-    event_broker: Arc<EventBroker>,
     pub(crate) terminal: Terminal,
     pending_history_lines: Vec<Line<'static>>,
     alt_saved_viewport: Option<ratatui::layout::Rect>,
@@ -194,7 +157,6 @@ impl Tui {
         Self {
             frame_requester,
             draw_tx,
-            event_broker: Arc::new(EventBroker::new()),
             terminal,
             pending_history_lines: vec![],
             alt_saved_viewport: None,
@@ -213,18 +175,6 @@ impl Tui {
 
     pub fn enhanced_keys_supported(&self) -> bool {
         self.enhanced_keys_supported
-    }
-
-    // todo(sayan) unused for now; intend to use to enable opening external editors
-    #[allow(unused)]
-    pub fn pause_events(&mut self) {
-        self.event_broker.pause_events();
-    }
-
-    // todo(sayan) unused for now; intend to use to enable opening external editors
-    #[allow(unused)]
-    pub fn resume_events(&mut self) {
-        self.event_broker.resume_events();
     }
 
     /// Emit a desktop notification now if the terminal is unfocused.
@@ -281,29 +231,87 @@ impl Tui {
     }
 
     pub fn event_stream(&self) -> Pin<Box<dyn Stream<Item = TuiEvent> + Send + 'static>> {
+        use tokio_stream::StreamExt;
+
+        let mut crossterm_events = crossterm::event::EventStream::new();
+        let mut draw_rx = self.draw_tx.subscribe();
+
+        // State for tracking how we should resume from ^Z suspend.
         #[cfg(unix)]
-        let stream = TuiEventStream::new(
-            self.event_broker.clone(),
-            self.draw_tx.subscribe(),
-            self.terminal_focused.clone(),
-            self.suspend_context.clone(),
-            self.alt_screen_active.clone(),
-        );
-        #[cfg(not(unix))]
-        let stream = TuiEventStream::new(
-            self.event_broker.clone(),
-            self.draw_tx.subscribe(),
-            self.terminal_focused.clone(),
-        );
-        Box::pin(stream)
+        let suspend_context = self.suspend_context.clone();
+        #[cfg(unix)]
+        let alt_screen_active = self.alt_screen_active.clone();
+
+        let terminal_focused = self.terminal_focused.clone();
+        let event_stream = async_stream::stream! {
+            loop {
+                select! {
+                    event_result = crossterm_events.next() => {
+                        match event_result {
+                            Some(Ok(event)) => {
+                                match event {
+                                    Event::Key(key_event) => {
+                                        #[cfg(unix)]
+                                        if SUSPEND_KEY.is_press(key_event) {
+                                            let _ = suspend_context.suspend(&alt_screen_active);
+                                            // We continue here after resume.
+                                            yield TuiEvent::Draw;
+                                            continue;
+                                        }
+                                        yield TuiEvent::Key(key_event);
+                                    }
+                                    Event::Resize(_, _) => {
+                                        yield TuiEvent::Draw;
+                                    }
+                                    Event::Paste(pasted) => {
+                                        yield TuiEvent::Paste(pasted);
+                                    }
+                                    Event::Mouse(mouse_event) => {
+                                        yield TuiEvent::Mouse(mouse_event);
+                                    }
+                                    Event::FocusGained => {
+                                        terminal_focused.store(true, Ordering::Relaxed);
+                                        crate::terminal_palette::requery_default_colors();
+                                        yield TuiEvent::Draw;
+                                    }
+                                    Event::FocusLost => {
+                                        terminal_focused.store(false, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                            Some(Err(_)) | None => {
+                                // Exit the loop in case of broken pipe as we will never
+                                // recover from it
+                                break;
+                            }
+                        }
+                    }
+                    result = draw_rx.recv() => {
+                        match result {
+                            Ok(_) => {
+                                yield TuiEvent::Draw;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                // We dropped one or more draw notifications; coalesce to a single draw.
+                                yield TuiEvent::Draw;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                // Sender dropped. This stream likely outlived its owning `Tui`;
+                                // exit to avoid spinning on a permanently-closed receiver.
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        Box::pin(event_stream)
     }
 
     /// Enter alternate screen and expand the viewport to full terminal size, saving the current
     /// inline viewport for restoration when leaving.
     pub fn enter_alt_screen(&mut self) -> Result<()> {
         let _ = execute!(self.terminal.backend_mut(), EnterAlternateScreen);
-        // Enable "alternate scroll" so terminals may translate wheel to arrows
-        let _ = execute!(self.terminal.backend_mut(), EnableAlternateScroll);
         if let Ok(size) = self.terminal.size() {
             self.alt_saved_viewport = Some(self.terminal.viewport_area);
             self.terminal.set_viewport_area(ratatui::layout::Rect::new(
@@ -320,12 +328,11 @@ impl Tui {
 
     /// Leave alternate screen and restore the previously saved inline viewport, if any.
     pub fn leave_alt_screen(&mut self) -> Result<()> {
-        // Disable alternate scroll when leaving alt-screen
-        let _ = execute!(self.terminal.backend_mut(), DisableAlternateScroll);
         let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
         if let Some(saved) = self.alt_saved_viewport.take() {
             self.terminal.set_viewport_area(saved);
         }
+        let _ = self.terminal.clear();
         self.alt_screen_active.store(false, Ordering::Relaxed);
         Ok(())
     }
@@ -365,28 +372,11 @@ impl Tui {
 
             let size = terminal.size()?;
 
-            let mut area = terminal.viewport_area;
-            area.height = height.min(size.height);
-            area.width = size.width;
-            // If the viewport has expanded, scroll everything else up to make room.
-            if area.bottom() > size.height {
-                terminal
-                    .backend_mut()
-                    .scroll_region_up(0..area.top(), area.bottom() - size.height)?;
-                area.y = size.height - area.height;
-            }
+            let area = Rect::new(0, 0, size.width, height.min(size.height));
             if area != terminal.viewport_area {
                 // TODO(nornagon): probably this could be collapsed with the clear + set_viewport_area above.
                 terminal.clear()?;
                 terminal.set_viewport_area(area);
-            }
-
-            if !self.pending_history_lines.is_empty() {
-                crate::insert_history::insert_history_lines(
-                    terminal,
-                    self.pending_history_lines.clone(),
-                )?;
-                self.pending_history_lines.clear();
             }
 
             // Update the y position for suspending so Ctrl-Z can place the cursor correctly.

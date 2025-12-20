@@ -97,6 +97,7 @@ impl From<AppExitInfo> for codex_tui::AppExitInfo {
             token_usage: info.token_usage,
             conversation_id: info.conversation_id,
             update_action: info.update_action.map(Into::into),
+            session_lines: info.session_lines,
         }
     }
 }
@@ -793,6 +794,10 @@ impl App {
                             .set_session_status(id, self.chat_widget.sidebar_status());
                     }
 
+                    // Clone is needed here due to borrow checker constraints:
+                    // the closure captures `self` mutably for render_transcript_cells,
+                    // but we also need to read transcript_cells. Using Arc means only
+                    // pointer counts are cloned, not the underlying HistoryCell data.
                     let cells = self.transcript_cells.clone();
                     tui.draw(tui.terminal.size()?.height, |frame| {
                         let session_height = 4u16.min(frame.area().height);
@@ -920,33 +925,27 @@ impl App {
             .iter()
             .map(|c| c.as_any().is::<UserHistoryCell>())
             .collect();
-        let base_opts: RtOptions<'_> = RtOptions::new(transcript_area.width.max(1) as usize);
-        let mut wrapped_is_user_row: Vec<bool> = Vec::with_capacity(wrapped.len());
-        let mut first = true;
-        for (idx, line) in lines.iter().enumerate() {
-            let opts = if first {
-                base_opts.clone()
-            } else {
-                base_opts
-                    .clone()
-                    .initial_indent(base_opts.subsequent_indent.clone())
-            };
-            let seg_count = word_wrap_line(line, opts).len();
-            let is_user_row = line_meta
-                .get(idx)
-                .and_then(TranscriptLineMeta::cell_index)
-                .map(|cell_index| is_user_cell.get(cell_index).copied().unwrap_or(false))
-                .unwrap_or(false);
-            wrapped_is_user_row.extend(std::iter::repeat_n(is_user_row, seg_count));
-            first = false;
-        }
+        let wrapped_line_meta =
+            Self::build_wrapped_line_meta(&lines, &line_meta, transcript_area.width);
+        debug_assert_eq!(wrapped.len(), wrapped_line_meta.len());
+        let wrapped_is_user_row: Vec<bool> = wrapped_line_meta
+            .iter()
+            .map(TranscriptLineMeta::cell_index)
+            .map(|cell_index| {
+                cell_index
+                    .and_then(|idx| is_user_cell.get(idx).copied())
+                    .unwrap_or(false)
+            })
+            .collect();
 
-        let total_lines = wrapped.len();
+        let total_lines = wrapped_line_meta.len();
         self.transcript_total_lines = total_lines;
         let max_visible = std::cmp::min(max_transcript_height as usize, total_lines);
         let max_start = total_lines.saturating_sub(max_visible);
 
-        let (scroll_state, top_offset) = self.transcript_scroll.resolve_top(&line_meta, max_start);
+        let (scroll_state, top_offset) = self
+            .transcript_scroll
+            .resolve_top(&wrapped_line_meta, max_start);
         self.transcript_scroll = scroll_state;
         self.transcript_view_top = top_offset;
 
@@ -1044,7 +1043,11 @@ impl App {
         }
 
         let session_height = 4u16.min(height);
-        let chat_height = self.chat_widget.desired_height(width);
+        let available_for_chat = height.saturating_sub(session_height);
+        let chat_height = self
+            .chat_widget
+            .desired_height(width)
+            .min(available_for_chat);
         let reserved = chat_height.saturating_add(session_height);
         if reserved >= height {
             return;
@@ -1155,10 +1158,11 @@ impl App {
             return;
         }
 
-        let (_, line_meta) = Self::build_transcript_lines(&self.transcript_cells, width);
+        let (lines, line_meta) = Self::build_transcript_lines(&self.transcript_cells, width);
+        let wrapped_line_meta = Self::build_wrapped_line_meta(&lines, &line_meta, width);
         self.transcript_scroll =
             self.transcript_scroll
-                .scrolled_by(delta_lines, &line_meta, visible_lines);
+                .scrolled_by(delta_lines, &wrapped_line_meta, visible_lines);
 
         tui.frame_requester().schedule_frame();
     }
@@ -1176,11 +1180,12 @@ impl App {
         }
 
         let (lines, line_meta) = Self::build_transcript_lines(&self.transcript_cells, width);
-        if lines.is_empty() || line_meta.is_empty() {
+        let wrapped_line_meta = Self::build_wrapped_line_meta(&lines, &line_meta, width);
+        if wrapped_line_meta.is_empty() {
             return;
         }
 
-        let total_lines = lines.len();
+        let total_lines = wrapped_line_meta.len();
         let max_visible = std::cmp::min(visible_lines, total_lines);
         if max_visible == 0 {
             return;
@@ -1195,7 +1200,7 @@ impl App {
             }
         };
 
-        if let Some(scroll_state) = TranscriptScroll::anchor_for(&line_meta, top_offset) {
+        if let Some(scroll_state) = TranscriptScroll::anchor_for(&wrapped_line_meta, top_offset) {
             self.transcript_scroll = scroll_state;
         }
     }
@@ -1242,6 +1247,56 @@ impl App {
         }
 
         (lines, line_meta)
+    }
+
+    fn build_wrapped_line_meta(
+        lines: &[Line<'static>],
+        line_meta: &[TranscriptLineMeta],
+        width: u16,
+    ) -> Vec<TranscriptLineMeta> {
+        let base_opts: RtOptions<'_> = RtOptions::new(width.max(1) as usize);
+        let mut wrapped_meta: Vec<TranscriptLineMeta> = Vec::new();
+        let mut first = true;
+        let mut current_cell = None;
+        let mut current_line_in_cell = 0usize;
+
+        for (idx, line) in lines.iter().enumerate() {
+            let opts = if first {
+                base_opts.clone()
+            } else {
+                base_opts
+                    .clone()
+                    .initial_indent(base_opts.subsequent_indent.clone())
+            };
+            let seg_count = word_wrap_line(line, opts).len();
+            let meta = line_meta
+                .get(idx)
+                .copied()
+                .unwrap_or(TranscriptLineMeta::Spacer);
+
+            match meta {
+                TranscriptLineMeta::CellLine { cell_index, .. } => {
+                    if current_cell != Some(cell_index) {
+                        current_cell = Some(cell_index);
+                        current_line_in_cell = 0;
+                    }
+                    for offset in 0..seg_count {
+                        wrapped_meta.push(TranscriptLineMeta::CellLine {
+                            cell_index,
+                            line_in_cell: current_line_in_cell + offset,
+                        });
+                    }
+                    current_line_in_cell += seg_count;
+                }
+                TranscriptLineMeta::Spacer => {
+                    wrapped_meta.extend(std::iter::repeat_n(TranscriptLineMeta::Spacer, seg_count));
+                    current_cell = None;
+                }
+            }
+            first = false;
+        }
+
+        wrapped_meta
     }
 
     /// Render flattened transcript lines into ANSI strings suitable for
@@ -1426,7 +1481,11 @@ impl App {
         }
 
         let session_height = 4u16.min(height);
-        let chat_height = self.chat_widget.desired_height(width);
+        let available_for_chat = height.saturating_sub(session_height);
+        let chat_height = self
+            .chat_widget
+            .desired_height(width)
+            .min(available_for_chat);
         let reserved = chat_height.saturating_add(session_height);
         if reserved >= height {
             return;
@@ -1444,6 +1503,7 @@ impl App {
             height: transcript_height,
         };
 
+        // Clone is needed here due to borrow checker constraints
         let cells = self.transcript_cells.clone();
         let (lines, _) = Self::build_transcript_lines(&cells, transcript_area.width);
         if lines.is_empty() {
@@ -2313,7 +2373,11 @@ impl App {
                 let height = size.height;
                 if width > 0 && height > 0 {
                     let session_height = 4u16.min(height);
-                    let chat_height = self.chat_widget.desired_height(width);
+                    let available_for_chat = height.saturating_sub(session_height);
+                    let chat_height = self
+                        .chat_widget
+                        .desired_height(width)
+                        .min(available_for_chat);
                     let reserved = chat_height.saturating_add(session_height);
                     if reserved < height {
                         let transcript_height = height.saturating_sub(reserved);
@@ -2339,7 +2403,11 @@ impl App {
                 let height = size.height;
                 if width > 0 && height > 0 {
                     let session_height = 4u16.min(height);
-                    let chat_height = self.chat_widget.desired_height(width);
+                    let available_for_chat = height.saturating_sub(session_height);
+                    let chat_height = self
+                        .chat_widget
+                        .desired_height(width)
+                        .min(available_for_chat);
                     let reserved = chat_height.saturating_add(session_height);
                     if reserved < height {
                         let transcript_height = height.saturating_sub(reserved);
@@ -3017,6 +3085,31 @@ mod tests {
             let cell = &buf_scrolled[(x, 1)];
             assert!(cell.style().add_modifier.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn wrapped_line_meta_tracks_visual_lines() {
+        let lines = vec![Line::from("abcd efgh")];
+        let line_meta = vec![TranscriptLineMeta::CellLine {
+            cell_index: 0,
+            line_in_cell: 0,
+        }];
+
+        let wrapped_meta = App::build_wrapped_line_meta(&lines, &line_meta, 4);
+
+        assert_eq!(
+            wrapped_meta,
+            vec![
+                TranscriptLineMeta::CellLine {
+                    cell_index: 0,
+                    line_in_cell: 0,
+                },
+                TranscriptLineMeta::CellLine {
+                    cell_index: 0,
+                    line_in_cell: 1,
+                },
+            ],
+        );
     }
 
     #[tokio::test]

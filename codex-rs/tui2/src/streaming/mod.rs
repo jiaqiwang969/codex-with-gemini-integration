@@ -5,6 +5,10 @@ use ratatui::text::Line;
 use crate::markdown_stream::MarkdownStreamCollector;
 pub(crate) mod controller;
 
+/// Maximum number of queued lines to prevent unbounded memory growth.
+/// This should be large enough to handle burst streaming but bounded.
+const MAX_QUEUED_LINES: usize = 10000;
+
 pub(crate) struct StreamState {
     pub(crate) collector: MarkdownStreamCollector,
     queued_lines: VecDeque<Line<'static>>,
@@ -34,6 +38,10 @@ impl StreamState {
         self.queued_lines.is_empty()
     }
     pub(crate) fn enqueue(&mut self, lines: Vec<Line<'static>>) {
-        self.queued_lines.extend(lines);
+        // Limit queue size to prevent unbounded memory growth
+        let available = MAX_QUEUED_LINES.saturating_sub(self.queued_lines.len());
+        if available > 0 {
+            self.queued_lines.extend(lines.into_iter().take(available));
+        }
     }
 }

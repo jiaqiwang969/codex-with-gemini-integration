@@ -8,9 +8,9 @@ use codex_file_search::FileMatch;
 use codex_protocol::openai_models::ModelPreset;
 
 use crate::bottom_pane::ApprovalRequest;
+use crate::cxresume_picker_widget::PickerState;
 use crate::history_cell::HistoryCell;
 
-use codex_core::features::Feature;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::SandboxPolicy;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -23,8 +23,29 @@ pub(crate) enum AppEvent {
     /// Start a new session.
     NewSession,
 
+    /// Resume an existing session from a saved rollout file.
+    ResumeSession(PathBuf),
+
+    /// Persist a user-defined alias for a session id.
+    SaveSessionAlias {
+        session_id: String,
+        alias: String,
+    },
+
+    /// Clone an existing session rollout into a new session.
+    CloneSession(PathBuf),
+
     /// Open the resume picker inside the running TUI session.
     OpenResumePicker,
+
+    /// Triggered after a period without user interaction to prewarm cxresume state.
+    CxresumeIdleCheck,
+
+    /// Result of background cxresume prewarm.
+    CxresumePrewarmReady(PickerState),
+
+    /// Background cxresume prewarm failed.
+    CxresumePrewarmFailed(String),
 
     /// Request to exit the application gracefully.
     ExitRequest,
@@ -117,11 +138,6 @@ pub(crate) enum AppEvent {
 
     /// Update the current sandbox policy in the running app and widget.
     UpdateSandboxPolicy(SandboxPolicy),
-
-    /// Update feature flags and persist them to the top-level config.
-    UpdateFeatureFlags {
-        updates: Vec<(Feature, bool)>,
-    },
 
     /// Update whether the full access warning prompt has been acknowledged.
     UpdateFullAccessWarningAcknowledged(bool),

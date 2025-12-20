@@ -263,8 +263,9 @@ impl AuthModeWidget {
         let mut spans = vec!["  ".into()];
         if self.animations_enabled {
             // Schedule a follow-up frame to keep the shimmer animation going.
+            // Use 150ms to reduce GPU load while still having visible animation.
             self.request_frame
-                .schedule_frame_in(std::time::Duration::from_millis(100));
+                .schedule_frame_in(std::time::Duration::from_millis(150));
             spans.extend(shimmer_spans("Finish signing in via your browser"));
         } else {
             spans.push("Finish signing in via your browser".into());

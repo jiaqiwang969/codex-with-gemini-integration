@@ -18,6 +18,9 @@ use std::time::Instant;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 
+// Cap redraws to reduce GPU usage while keeping the UI responsive.
+const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(33);
+
 /// A requester for scheduling future frame draws on the TUI event loop.
 ///
 /// This is the handler side of an actor/handler pair with `FrameScheduler`, which coalesces
@@ -71,12 +74,17 @@ impl FrameRequester {
 struct FrameScheduler {
     receiver: mpsc::UnboundedReceiver<Instant>,
     draw_tx: broadcast::Sender<()>,
+    last_draw_at: Option<Instant>,
 }
 
 impl FrameScheduler {
     /// Create a new FrameScheduler with the provided receiver and draw notification sender.
     fn new(receiver: mpsc::UnboundedReceiver<Instant>, draw_tx: broadcast::Sender<()>) -> Self {
-        Self { receiver, draw_tx }
+        Self {
+            receiver,
+            draw_tx,
+            last_draw_at: None,
+        }
     }
 
     /// Run the scheduling loop, coalescing frame requests and notifying the TUI event loop.
@@ -97,6 +105,14 @@ impl FrameScheduler {
                         // All senders dropped; exit the scheduler.
                         break
                     };
+                    let draw_at = if let Some(last_draw_at) = self.last_draw_at {
+                        let earliest = last_draw_at
+                            .checked_add(MIN_FRAME_INTERVAL)
+                            .unwrap_or(last_draw_at);
+                        draw_at.max(earliest)
+                    } else {
+                        draw_at
+                    };
                     next_deadline = Some(next_deadline.map_or(draw_at, |cur| cur.min(draw_at)));
 
                     // Do not send a draw immediately here. By continuing the loop,
@@ -107,6 +123,7 @@ impl FrameScheduler {
                 _ = &mut deadline => {
                     if next_deadline.is_some() {
                         next_deadline = None;
+                        self.last_draw_at = Some(Instant::now());
                         let _ = self.draw_tx.send(());
                     }
                 }

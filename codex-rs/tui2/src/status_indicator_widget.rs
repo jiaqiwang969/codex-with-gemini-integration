@@ -144,9 +144,14 @@ impl Renderable for StatusIndicatorWidget {
             return;
         }
 
-        // Schedule next animation frame.
-        self.frame_requester
-            .schedule_frame_in(Duration::from_millis(32));
+        // Only schedule next animation frame when actively running (not paused).
+        // This prevents continuous GPU usage when idle.
+        // Use 64ms (~15fps) instead of 32ms (~31fps) to reduce GPU load
+        // while still providing smooth visual feedback.
+        if !self.is_paused && self.animations_enabled {
+            self.frame_requester
+                .schedule_frame_in(Duration::from_millis(64));
+        }
         let now = Instant::now();
         let elapsed_duration = self.elapsed_duration_at(now);
         let pretty_elapsed = fmt_elapsed_compact(elapsed_duration.as_secs());

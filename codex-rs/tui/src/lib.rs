@@ -40,15 +40,18 @@ mod ascii_animation;
 mod bottom_pane;
 mod chatwidget;
 mod cli;
+mod clipboard_copy;
 mod clipboard_paste;
 mod color;
 pub mod custom_terminal;
+mod cxresume_picker_widget;
 mod diff_render;
 mod exec_cell;
 mod exec_command;
 mod file_search;
 mod frames;
 mod get_git_diff;
+mod git_graph_widget;
 mod history_cell;
 pub mod insert_history;
 mod key_hint;
@@ -65,6 +68,8 @@ pub mod public_widgets;
 mod render;
 mod resume_picker;
 mod selection_list;
+mod session_alias_manager;
+mod session_bar;
 mod session_log;
 mod shimmer;
 mod slash_command;
@@ -204,15 +209,21 @@ pub async fn run_main(
 
     let overrides = ConfigOverrides {
         model,
+        review_model: None,
         approval_policy,
         sandbox_mode,
         cwd,
         model_provider: model_provider_override.clone(),
         config_profile: cli.config_profile.clone(),
         codex_linux_sandbox_exe,
+        base_instructions: None,
+        developer_instructions: None,
+        compact_prompt: None,
+        include_delegate_tool: None,
+        include_apply_patch_tool: None,
         show_raw_agent_reasoning: cli.oss.then_some(true),
+        tools_web_search_request: None,
         additional_writable_roots: additional_dirs,
-        ..Default::default()
     };
 
     let config = load_config_or_exit(cli_kv_overrides.clone(), overrides.clone()).await;
@@ -264,7 +275,7 @@ pub async fn run_main(
         .with_writer(non_blocking)
         .with_target(false)
         .with_ansi(false)
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
         .with_filter(env_filter());
 
     let feedback = codex_feedback::CodexFeedback::new();
@@ -309,9 +320,12 @@ pub async fn run_main(
     let _ = tracing_subscriber::registry()
         .with(file_layer)
         .with(feedback_layer)
-        .with(otel_logger_layer)
         .with(otel_tracing_layer)
+        .with(otel_logger_layer)
         .try_init();
+
+    let terminal_info = codex_core::terminal::terminal_info();
+    tracing::info!(terminal = ?terminal_info, "Detected terminal info");
 
     run_ratatui_app(
         cli,
@@ -363,6 +377,7 @@ async fn run_ratatui_app(
                         token_usage: codex_core::protocol::TokenUsage::default(),
                         conversation_id: None,
                         update_action: Some(action),
+                        session_lines: Vec::new(),
                     });
                 }
             }
@@ -402,6 +417,7 @@ async fn run_ratatui_app(
                 token_usage: codex_core::protocol::TokenUsage::default(),
                 conversation_id: None,
                 update_action: None,
+                session_lines: Vec::new(),
             });
         }
         // if the user acknowledged windows or made an explicit decision ato trust the directory, reload the config accordingly
@@ -437,6 +453,7 @@ async fn run_ratatui_app(
                     token_usage: codex_core::protocol::TokenUsage::default(),
                     conversation_id: None,
                     update_action: None,
+                    session_lines: Vec::new(),
                 });
             }
         }
@@ -475,6 +492,7 @@ async fn run_ratatui_app(
                     token_usage: codex_core::protocol::TokenUsage::default(),
                     conversation_id: None,
                     update_action: None,
+                    session_lines: Vec::new(),
                 });
             }
             other => other,
@@ -484,6 +502,12 @@ async fn run_ratatui_app(
     };
 
     let Cli { prompt, images, .. } = cli;
+
+    // Run the main chat + transcript UI on the terminal's alternate screen so
+    // the entire viewport can be used without polluting normal scrollback. This
+    // mirrors the behavior of the legacy TUI but keeps inline mode available
+    // for smaller prompts like onboarding and model migration.
+    let _ = tui.enter_alt_screen();
 
     let app_result = App::run(
         &mut tui,
@@ -498,7 +522,17 @@ async fn run_ratatui_app(
     )
     .await;
 
+    let _ = tui.leave_alt_screen();
     restore();
+    if let Ok(exit_info) = &app_result {
+        let mut stdout = std::io::stdout();
+        for line in exit_info.session_lines.iter() {
+            let _ = writeln!(stdout, "{line}");
+        }
+        if !exit_info.session_lines.is_empty() {
+            let _ = writeln!(stdout);
+        }
+    }
     // Mark the end of the recorded session.
     session_log::log_session_end();
     // ignore error when collecting usage – report underlying error instead

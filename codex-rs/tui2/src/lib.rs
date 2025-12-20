@@ -100,6 +100,7 @@ pub use cli::Cli;
 pub use markdown_render::render_markdown_text;
 pub use public_widgets::composer_input::ComposerAction;
 pub use public_widgets::composer_input::ComposerInput;
+pub use shimmer::disable_shimmer;
 use std::io::Write as _;
 
 // (tests access modules directly within the crate)

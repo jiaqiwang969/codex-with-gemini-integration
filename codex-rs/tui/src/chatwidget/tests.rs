@@ -10,7 +10,6 @@ use codex_core::CodexAuth;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::Constrained;
-use codex_core::config::ConstraintError;
 use codex_core::openai_models::models_manager::ModelsManager;
 use codex_core::protocol::AgentMessageDeltaEvent;
 use codex_core::protocol::AgentMessageEvent;
@@ -39,7 +38,6 @@ use codex_core::protocol::ReviewTarget;
 use codex_core::protocol::StreamErrorEvent;
 use codex_core::protocol::TaskCompleteEvent;
 use codex_core::protocol::TaskStartedEvent;
-use codex_core::protocol::TerminalInteractionEvent;
 use codex_core::protocol::TokenCountEvent;
 use codex_core::protocol::TokenUsage;
 use codex_core::protocol::TokenUsageInfo;
@@ -378,6 +376,7 @@ async fn make_chatwidget_manual(
         models_manager: Arc::new(ModelsManager::new(auth_manager)),
         session_header: SessionHeader::new(resolved_model.clone()),
         initial_user_message: None,
+        defer_initial_message_for_alias_input: false,
         token_info: None,
         rate_limit_snapshot: None,
         plan_type: None,
@@ -389,7 +388,6 @@ async fn make_chatwidget_manual(
         suppressed_exec_calls: HashSet::new(),
         last_unified_wait: None,
         task_complete_pending: false,
-        unified_exec_sessions: Vec::new(),
         mcp_startup_status: None,
         interrupts: InterruptManager::new(),
         reasoning_buffer: String::new(),
@@ -400,6 +398,7 @@ async fn make_chatwidget_manual(
         frame_requester: FrameRequester::test_dummy(),
         show_welcome_banner: true,
         queued_user_messages: VecDeque::new(),
+        queued_turn_pending_start: false,
         suppress_session_configured_redraw: false,
         pending_notification: None,
         is_review_mode: false,
@@ -408,6 +407,9 @@ async fn make_chatwidget_manual(
         last_rendered_width: std::cell::Cell::new(None),
         feedback: codex_feedback::CodexFeedback::new(),
         current_rollout_path: None,
+        next_generated_image_index: 0,
+        last_generated_image_path: None,
+        ref_images: RefImageManager::new(),
     };
     (widget, rx, op_rx)
 }
@@ -868,42 +870,6 @@ fn begin_exec_with_source(
     event
 }
 
-fn begin_unified_exec_startup(
-    chat: &mut ChatWidget,
-    call_id: &str,
-    process_id: &str,
-    raw_cmd: &str,
-) -> ExecCommandBeginEvent {
-    let command = vec!["bash".to_string(), "-lc".to_string(), raw_cmd.to_string()];
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let event = ExecCommandBeginEvent {
-        call_id: call_id.to_string(),
-        process_id: Some(process_id.to_string()),
-        turn_id: "turn-1".to_string(),
-        command,
-        cwd,
-        parsed_cmd: Vec::new(),
-        source: ExecCommandSource::UnifiedExecStartup,
-        interaction_input: None,
-    };
-    chat.handle_codex_event(Event {
-        id: call_id.to_string(),
-        msg: EventMsg::ExecCommandBegin(event.clone()),
-    });
-    event
-}
-
-fn terminal_interaction(chat: &mut ChatWidget, call_id: &str, process_id: &str, stdin: &str) {
-    chat.handle_codex_event(Event {
-        id: call_id.to_string(),
-        msg: EventMsg::TerminalInteraction(TerminalInteractionEvent {
-            call_id: call_id.to_string(),
-            process_id: process_id.to_string(),
-            stdin: stdin.to_string(),
-        }),
-    });
-}
-
 fn begin_exec(chat: &mut ChatWidget, call_id: &str, raw_cmd: &str) -> ExecCommandBeginEvent {
     begin_exec_with_source(chat, call_id, raw_cmd, ExecCommandSource::Agent)
 }
@@ -1076,6 +1042,33 @@ async fn streaming_final_answer_keeps_task_running_state() {
 }
 
 #[tokio::test]
+async fn sidebar_status_stays_running_between_auto_queued_turns() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+
+    chat.on_task_started();
+
+    chat.bottom_pane
+        .set_composer_text("queued submission".to_string());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(chat.queued_user_messages.len(), 1);
+
+    chat.on_task_complete(None);
+
+    let mut saw_user_input = false;
+    for _ in 0..2 {
+        match op_rx.try_recv() {
+            Ok(Op::UserInput { .. }) => saw_user_input = true,
+            Ok(Op::AddToHistory { .. }) => {}
+            other => panic!("expected Op::UserInput/AddToHistory, got {other:?}"),
+        }
+    }
+    assert!(saw_user_input);
+    assert!(chat.queued_user_messages.is_empty());
+    assert!(!chat.bottom_pane.is_task_running());
+    assert_eq!(chat.sidebar_status(), "运行中");
+}
+
+#[tokio::test]
 async fn ctrl_c_shutdown_ignores_caps_lock() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
 
@@ -1221,7 +1214,6 @@ async fn exec_end_without_begin_uses_event_command() {
 #[tokio::test]
 async fn exec_history_shows_unified_exec_startup_commands() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
-    chat.on_task_started();
 
     let begin = begin_exec_with_source(
         &mut chat,
@@ -1243,130 +1235,6 @@ async fn exec_history_shows_unified_exec_startup_commands() {
         blob.contains("• Ran echo unified exec startup"),
         "expected startup command to render: {blob:?}"
     );
-}
-
-#[tokio::test]
-async fn exec_history_shows_unified_exec_tool_calls() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
-    chat.on_task_started();
-
-    let begin = begin_exec_with_source(
-        &mut chat,
-        "call-startup",
-        "ls",
-        ExecCommandSource::UnifiedExecStartup,
-    );
-    end_exec(&mut chat, begin, "", "", 0);
-
-    let blob = active_blob(&chat);
-    assert_eq!(blob, "• Explored\n  └ List ls\n");
-}
-
-#[tokio::test]
-async fn unified_exec_end_after_task_complete_is_suppressed() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
-    chat.on_task_started();
-
-    let begin = begin_exec_with_source(
-        &mut chat,
-        "call-startup",
-        "echo unified exec startup",
-        ExecCommandSource::UnifiedExecStartup,
-    );
-    drain_insert_history(&mut rx);
-
-    chat.on_task_complete(None);
-    end_exec(&mut chat, begin, "", "", 0);
-
-    let cells = drain_insert_history(&mut rx);
-    assert!(
-        cells.is_empty(),
-        "expected unified exec end after task complete to be suppressed"
-    );
-}
-
-#[tokio::test]
-async fn unified_exec_waiting_multiple_empty_snapshots() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
-    begin_unified_exec_startup(&mut chat, "call-wait-1", "proc-1", "just fix");
-
-    terminal_interaction(&mut chat, "call-wait-1a", "proc-1", "");
-    terminal_interaction(&mut chat, "call-wait-1b", "proc-1", "");
-    assert_snapshot!(
-        "unified_exec_waiting_multiple_empty_active",
-        active_blob(&chat)
-    );
-
-    chat.handle_codex_event(Event {
-        id: "turn-wait-1".into(),
-        msg: EventMsg::TaskComplete(TaskCompleteEvent {
-            last_agent_message: None,
-        }),
-    });
-
-    let cells = drain_insert_history(&mut rx);
-    let combined = cells
-        .iter()
-        .map(|lines| lines_to_single_string(lines))
-        .collect::<String>();
-    assert_snapshot!("unified_exec_waiting_multiple_empty_after", combined);
-}
-
-#[tokio::test]
-async fn unified_exec_empty_then_non_empty_snapshot() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
-    begin_unified_exec_startup(&mut chat, "call-wait-2", "proc-2", "just fix");
-
-    terminal_interaction(&mut chat, "call-wait-2a", "proc-2", "");
-    terminal_interaction(&mut chat, "call-wait-2b", "proc-2", "ls\n");
-
-    let cells = drain_insert_history(&mut rx);
-    let combined = cells
-        .iter()
-        .map(|lines| lines_to_single_string(lines))
-        .collect::<String>();
-    assert_snapshot!("unified_exec_empty_then_non_empty_after", combined);
-}
-
-#[tokio::test]
-async fn unified_exec_non_empty_then_empty_snapshots() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
-    begin_unified_exec_startup(&mut chat, "call-wait-3", "proc-3", "just fix");
-
-    terminal_interaction(&mut chat, "call-wait-3a", "proc-3", "pwd\n");
-    terminal_interaction(&mut chat, "call-wait-3b", "proc-3", "");
-    let pre_cells = drain_insert_history(&mut rx);
-    let mut active_combined = pre_cells
-        .iter()
-        .map(|lines| lines_to_single_string(lines))
-        .collect::<String>();
-    if !active_combined.is_empty() {
-        active_combined.push('\n');
-    }
-    active_combined.push_str(&active_blob(&chat));
-    assert_snapshot!("unified_exec_non_empty_then_empty_active", active_combined);
-
-    chat.handle_codex_event(Event {
-        id: "turn-wait-3".into(),
-        msg: EventMsg::TaskComplete(TaskCompleteEvent {
-            last_agent_message: None,
-        }),
-    });
-
-    let post_cells = drain_insert_history(&mut rx);
-    let mut combined = pre_cells
-        .iter()
-        .map(|lines| lines_to_single_string(lines))
-        .collect::<String>();
-    let post = post_cells
-        .iter()
-        .map(|lines| lines_to_single_string(lines))
-        .collect::<String>();
-    if !combined.is_empty() && !post.is_empty() {
-        combined.push('\n');
-    }
-    combined.push_str(&post);
-    assert_snapshot!("unified_exec_non_empty_then_empty_after", combined);
 }
 
 /// Selecting the custom prompt option from the review popup sends
@@ -1404,7 +1272,7 @@ async fn slash_init_skips_when_project_doc_exists() {
     std::fs::write(&existing_path, "existing instructions").unwrap();
     chat.config.cwd = tempdir.path().to_path_buf();
 
-    chat.dispatch_command(SlashCommand::Init);
+    chat.dispatch_command(SlashCommand::Init, None);
 
     match op_rx.try_recv() {
         Err(TryRecvError::Empty) => {}
@@ -1432,7 +1300,7 @@ async fn slash_init_skips_when_project_doc_exists() {
 async fn slash_quit_requests_exit() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
 
-    chat.dispatch_command(SlashCommand::Quit);
+    chat.dispatch_command(SlashCommand::Quit, None);
 
     assert_matches!(rx.try_recv(), Ok(AppEvent::ExitRequest));
 }
@@ -1441,7 +1309,7 @@ async fn slash_quit_requests_exit() {
 async fn slash_exit_requests_exit() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
 
-    chat.dispatch_command(SlashCommand::Exit);
+    chat.dispatch_command(SlashCommand::Exit, None);
 
     assert_matches!(rx.try_recv(), Ok(AppEvent::ExitRequest));
 }
@@ -1450,16 +1318,103 @@ async fn slash_exit_requests_exit() {
 async fn slash_resume_opens_picker() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
 
-    chat.dispatch_command(SlashCommand::Resume);
+    chat.dispatch_command(SlashCommand::Resume, None);
 
     assert_matches!(rx.try_recv(), Ok(AppEvent::OpenResumePicker));
+}
+
+#[tokio::test]
+async fn slash_open_image_without_saved_image_shows_info() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.dispatch_command(SlashCommand::OpenImage, None);
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one info message");
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(
+        rendered.contains("No generated image"),
+        "expected a helpful message: {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn slash_ref_image_sends_set_reference_images_op() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    let cwd = tempdir().unwrap();
+    chat.config.cwd = cwd.path().to_path_buf();
+
+    chat.dispatch_command(SlashCommand::RefImage, Some("a.png b.png".to_string()));
+
+    match op_rx.try_recv() {
+        Ok(Op::SetReferenceImages { paths }) => {
+            assert_eq!(
+                paths,
+                vec![cwd.path().join("a.png"), cwd.path().join("b.png")]
+            );
+        }
+        other => panic!("expected Op::SetReferenceImages, got {other:?}"),
+    }
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one info message");
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(
+        rendered.contains("Reference images set"),
+        "expected confirmation text: {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn raw_response_item_saves_generated_image() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let codex_home = tempdir().unwrap();
+    chat.config.codex_home = codex_home.path().to_path_buf();
+
+    let conversation_id = ConversationId::new();
+    let conversation_dir = conversation_id.to_string();
+    chat.conversation_id = Some(conversation_id);
+
+    const ONE_BY_ONE_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/6XwP3cAAAAASUVORK5CYII=";
+    let image_url = format!("data:image/png;base64,{ONE_BY_ONE_PNG}");
+    chat.handle_codex_event(Event {
+        id: "turn-1".to_string(),
+        msg: EventMsg::RawResponseItem(codex_core::protocol::RawResponseItemEvent {
+            item: codex_protocol::models::ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![codex_protocol::models::ContentItem::InputImage { image_url }],
+                thought_signature: None,
+            },
+        }),
+    });
+
+    let expected_path = codex_home
+        .path()
+        .join("images")
+        .join(conversation_dir)
+        .join("000000.png");
+    assert!(
+        expected_path.exists(),
+        "expected saved image at {}",
+        expected_path.display()
+    );
+    assert_eq!(chat.last_generated_image_path, Some(expected_path));
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected info message about saved image");
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(
+        rendered.contains("Generated image saved"),
+        "expected confirmation message: {rendered:?}"
+    );
 }
 
 #[tokio::test]
 async fn slash_undo_sends_op() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
 
-    chat.dispatch_command(SlashCommand::Undo);
+    chat.dispatch_command(SlashCommand::Undo, None);
 
     match rx.try_recv() {
         Ok(AppEvent::CodexOp(Op::Undo)) => {}
@@ -1473,7 +1428,7 @@ async fn slash_rollout_displays_current_path() {
     let rollout_path = PathBuf::from("/tmp/codex-test-rollout.jsonl");
     chat.current_rollout_path = Some(rollout_path.clone());
 
-    chat.dispatch_command(SlashCommand::Rollout);
+    chat.dispatch_command(SlashCommand::Rollout, None);
 
     let cells = drain_insert_history(&mut rx);
     assert_eq!(cells.len(), 1, "expected info message for rollout path");
@@ -1488,7 +1443,7 @@ async fn slash_rollout_displays_current_path() {
 async fn slash_rollout_handles_missing_path() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
 
-    chat.dispatch_command(SlashCommand::Rollout);
+    chat.dispatch_command(SlashCommand::Rollout, None);
 
     let cells = drain_insert_history(&mut rx);
     assert_eq!(
@@ -1901,71 +1856,6 @@ fn render_bottom_popup(chat: &ChatWidget, width: u16) -> String {
 }
 
 #[tokio::test]
-async fn experimental_features_popup_snapshot() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
-
-    let features = vec![
-        BetaFeatureItem {
-            feature: Feature::GhostCommit,
-            name: "Ghost snapshots".to_string(),
-            description: "Capture undo snapshots each turn.".to_string(),
-            enabled: false,
-        },
-        BetaFeatureItem {
-            feature: Feature::ShellTool,
-            name: "Shell tool".to_string(),
-            description: "Allow the model to run shell commands.".to_string(),
-            enabled: true,
-        },
-    ];
-    let view = ExperimentalFeaturesView::new(features, chat.app_event_tx.clone());
-    chat.bottom_pane.show_view(Box::new(view));
-
-    let popup = render_bottom_popup(&chat, 80);
-    assert_snapshot!("experimental_features_popup", popup);
-}
-
-#[tokio::test]
-async fn experimental_features_toggle_saves_on_exit() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
-
-    let expected_feature = Feature::GhostCommit;
-    let view = ExperimentalFeaturesView::new(
-        vec![BetaFeatureItem {
-            feature: expected_feature,
-            name: "Ghost snapshots".to_string(),
-            description: "Capture undo snapshots each turn.".to_string(),
-            enabled: false,
-        }],
-        chat.app_event_tx.clone(),
-    );
-    chat.bottom_pane.show_view(Box::new(view));
-
-    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-    assert!(
-        rx.try_recv().is_err(),
-        "expected no updates until exiting the popup"
-    );
-
-    chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-
-    let mut updates = None;
-    while let Ok(event) = rx.try_recv() {
-        if let AppEvent::UpdateFeatureFlags {
-            updates: event_updates,
-        } = event
-        {
-            updates = Some(event_updates);
-            break;
-        }
-    }
-
-    let updates = updates.expect("expected UpdateFeatureFlags event");
-    assert_eq!(updates, vec![(expected_feature, true)]);
-}
-
-#[tokio::test]
 async fn model_selection_popup_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
     chat.open_model_popup();
@@ -2162,7 +2052,7 @@ async fn feedback_selection_popup_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
 
     // Open the feedback category selection popup via slash command.
-    chat.dispatch_command(SlashCommand::Feedback);
+    chat.dispatch_command(SlashCommand::Feedback, None);
 
     let popup = render_bottom_popup(&chat, 80);
     assert_snapshot!("feedback_selection_popup", popup);
@@ -2257,7 +2147,7 @@ async fn disabled_slash_command_while_task_running_snapshot() {
     chat.bottom_pane.set_task_running(true);
 
     // Dispatch a command that is unavailable while a task runs (e.g., /model)
-    chat.dispatch_command(SlashCommand::Model);
+    chat.dispatch_command(SlashCommand::Model, None);
 
     // Drain history and snapshot the rendered error line(s)
     let cells = drain_insert_history(&mut rx);
@@ -2269,125 +2159,17 @@ async fn disabled_slash_command_while_task_running_snapshot() {
     assert_snapshot!(blob);
 }
 
-#[tokio::test]
-async fn approvals_popup_shows_disabled_presets() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
-
-    chat.config.approval_policy =
-        Constrained::new(AskForApproval::OnRequest, |candidate| match candidate {
-            AskForApproval::OnRequest => Ok(()),
-            _ => Err(ConstraintError {
-                message: "this message should be printed in the description".to_string(),
-            }),
-        })
-        .expect("construct constrained approval policy");
-
-    chat.open_approvals_popup();
-
-    let width = 80;
-    let height = chat.desired_height(width);
-    let mut terminal =
-        ratatui::Terminal::new(VT100Backend::new(width, height)).expect("create terminal");
-    terminal.set_viewport_area(Rect::new(0, 0, width, height));
-    terminal
-        .draw(|f| chat.render(f.area(), f.buffer_mut()))
-        .expect("render approvals popup");
-
-    let screen = terminal.backend().vt100().screen().contents();
-    let collapsed = screen.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(
-        collapsed.contains("(disabled)"),
-        "disabled preset label should be shown"
-    );
-    assert!(
-        collapsed.contains("this message should be printed in the description"),
-        "disabled preset reason should be shown"
-    );
-}
-
-#[tokio::test]
-async fn approvals_popup_navigation_skips_disabled() {
-    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
-
-    chat.config.approval_policy =
-        Constrained::new(AskForApproval::OnRequest, |candidate| match candidate {
-            AskForApproval::OnRequest => Ok(()),
-            _ => Err(ConstraintError {
-                message: "disabled preset".to_string(),
-            }),
-        })
-        .expect("construct constrained approval policy");
-
-    chat.open_approvals_popup();
-
-    // The approvals popup is the active bottom-pane view; drive navigation via chat handle_key_event.
-    // Start selected at idx 0 (enabled), move down twice; the disabled option should be skipped
-    // and selection should wrap back to idx 0 (also enabled).
-    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
-    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
-
-    // Press numeric shortcut for the disabled row (3 => idx 2); should not close or accept.
-    chat.handle_key_event(KeyEvent::from(KeyCode::Char('3')));
-
-    // Ensure the popup remains open and no selection actions were sent.
-    let width = 80;
-    let height = chat.desired_height(width);
-    let mut terminal =
-        ratatui::Terminal::new(VT100Backend::new(width, height)).expect("create terminal");
-    terminal.set_viewport_area(Rect::new(0, 0, width, height));
-    terminal
-        .draw(|f| chat.render(f.area(), f.buffer_mut()))
-        .expect("render approvals popup after disabled selection");
-    let screen = terminal.backend().vt100().screen().contents();
-    assert!(
-        screen.contains("Select Approval Mode"),
-        "popup should remain open after selecting a disabled entry"
-    );
-    assert!(
-        op_rx.try_recv().is_err(),
-        "no actions should be dispatched yet"
-    );
-    assert!(rx.try_recv().is_err(), "no history should be emitted");
-
-    // Press Enter; selection should land on an enabled preset and dispatch updates.
-    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
-    let mut app_events = Vec::new();
-    while let Ok(ev) = rx.try_recv() {
-        app_events.push(ev);
-    }
-    assert!(
-        app_events.iter().any(|ev| matches!(
-            ev,
-            AppEvent::CodexOp(Op::OverrideTurnContext {
-                approval_policy: Some(AskForApproval::OnRequest),
-                ..
-            })
-        )),
-        "enter should select an enabled preset"
-    );
-    assert!(
-        !app_events.iter().any(|ev| matches!(
-            ev,
-            AppEvent::CodexOp(Op::OverrideTurnContext {
-                approval_policy: Some(AskForApproval::Never),
-                ..
-            })
-        )),
-        "disabled preset should not be selected"
-    );
-}
-
 //
 // Snapshot test: command approval modal
 //
 // Synthesizes a Codex ExecApprovalRequest event to trigger the approval modal
 // and snapshots the visual output using the ratatui TestBackend.
 #[tokio::test]
-async fn approval_modal_exec_snapshot() -> anyhow::Result<()> {
+async fn approval_modal_exec_snapshot() {
     // Build a chat widget with manual channels to avoid spawning the agent.
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
     // Ensure policy allows surfacing approvals explicitly (not strictly required for direct event).
-    chat.config.approval_policy.set(AskForApproval::OnRequest)?;
+    chat.config.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     // Inject an exec approval request to display the approval modal.
     let ev = ExecApprovalRequestEvent {
         call_id: "call-approve-cmd".into(),
@@ -2433,16 +2215,14 @@ async fn approval_modal_exec_snapshot() -> anyhow::Result<()> {
         "approval_modal_exec",
         terminal.backend().vt100().screen().contents()
     );
-
-    Ok(())
 }
 
 // Snapshot test: command approval modal without a reason
 // Ensures spacing looks correct when no reason text is provided.
 #[tokio::test]
-async fn approval_modal_exec_without_reason_snapshot() -> anyhow::Result<()> {
+async fn approval_modal_exec_without_reason_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
-    chat.config.approval_policy.set(AskForApproval::OnRequest)?;
+    chat.config.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
 
     let ev = ExecApprovalRequestEvent {
         call_id: "call-approve-cmd-noreason".into(),
@@ -2474,15 +2254,13 @@ async fn approval_modal_exec_without_reason_snapshot() -> anyhow::Result<()> {
         "approval_modal_exec_no_reason",
         terminal.backend().vt100().screen().contents()
     );
-
-    Ok(())
 }
 
 // Snapshot test: patch approval modal
 #[tokio::test]
-async fn approval_modal_patch_snapshot() -> anyhow::Result<()> {
+async fn approval_modal_patch_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
-    chat.config.approval_policy.set(AskForApproval::OnRequest)?;
+    chat.config.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
 
     // Build a small changeset and a reason/grant_root to exercise the prompt text.
     let mut changes = HashMap::new();
@@ -2516,8 +2294,6 @@ async fn approval_modal_patch_snapshot() -> anyhow::Result<()> {
         "approval_modal_patch",
         terminal.backend().vt100().screen().contents()
     );
-
-    Ok(())
 }
 
 #[tokio::test]
@@ -3080,10 +2856,10 @@ async fn apply_patch_full_flow_integration_like() {
 }
 
 #[tokio::test]
-async fn apply_patch_untrusted_shows_approval_modal() -> anyhow::Result<()> {
+async fn apply_patch_untrusted_shows_approval_modal() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
     // Ensure approval policy is untrusted (OnRequest)
-    chat.config.approval_policy.set(AskForApproval::OnRequest)?;
+    chat.config.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
 
     // Simulate a patch approval request from backend
     let mut changes = HashMap::new();
@@ -3122,16 +2898,14 @@ async fn apply_patch_untrusted_shows_approval_modal() -> anyhow::Result<()> {
         contains_title,
         "expected approval modal to be visible with title 'Would you like to make the following edits?'"
     );
-
-    Ok(())
 }
 
 #[tokio::test]
-async fn apply_patch_request_shows_diff_summary() -> anyhow::Result<()> {
+async fn apply_patch_request_shows_diff_summary() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
 
     // Ensure we are in OnRequest so an approval is surfaced
-    chat.config.approval_policy.set(AskForApproval::OnRequest)?;
+    chat.config.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
 
     // Simulate backend asking to apply a patch adding two lines to README.md
     let mut changes = HashMap::new();
@@ -3190,8 +2964,6 @@ async fn apply_patch_request_shows_diff_summary() -> anyhow::Result<()> {
         saw_line1 && saw_line2,
         "expected modal to show per-line diff summary"
     );
-
-    Ok(())
 }
 
 #[tokio::test]

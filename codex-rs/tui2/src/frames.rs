@@ -68,4 +68,6 @@ pub(crate) const ALL_VARIANTS: &[&[&str]] = &[
     &FRAMES_SLUG,
 ];
 
-pub(crate) const FRAME_TICK_DEFAULT: Duration = Duration::from_millis(80);
+// Default animation tick interval. Higher values reduce GPU load.
+// 120ms = ~8fps which is sufficient for ASCII art animations.
+pub(crate) const FRAME_TICK_DEFAULT: Duration = Duration::from_millis(120);

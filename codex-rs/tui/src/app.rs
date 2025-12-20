@@ -3,10 +3,13 @@ use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::ApprovalRequest;
 use crate::chatwidget::ChatWidget;
+use crate::clipboard_copy;
+use crate::custom_terminal::Frame;
 use crate::diff_render::DiffSummary;
 use crate::exec_command::strip_bash_lc_and_escape;
 use crate::file_search::FileSearchManager;
 use crate::history_cell::HistoryCell;
+use crate::history_cell::UserHistoryCell;
 use crate::model_migration::ModelMigrationOutcome;
 use crate::model_migration::migration_copy_for_models;
 use crate::model_migration::run_model_migration_prompt;
@@ -14,14 +17,19 @@ use crate::pager_overlay::Overlay;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::Renderable;
 use crate::resume_picker::ResumeSelection;
+use crate::session_bar::SessionBar;
 use crate::tui;
 use crate::tui::TuiEvent;
+use crate::tui::scrolling::TranscriptLineMeta;
+use crate::tui::scrolling::TranscriptScroll;
 use crate::update_action::UpdateAction;
+use crate::wrapping::RtOptions;
+use crate::wrapping::word_wrap_line;
+use crate::wrapping::word_wrap_lines_borrowed;
 use codex_ansi_escape::ansi_escape_line;
 use codex_core::AuthManager;
 use codex_core::ConversationManager;
 use codex_core::config::Config;
-use codex_core::config::edit::ConfigEdit;
 use codex_core::config::edit::ConfigEditsBuilder;
 #[cfg(target_os = "windows")]
 use codex_core::features::Feature;
@@ -44,9 +52,14 @@ use color_eyre::eyre::WrapErr;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
+use crossterm::event::MouseButton;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
+use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
+use ratatui::widgets::WidgetRef;
 use ratatui::widgets::Wrap;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -56,8 +69,11 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::select;
 use tokio::sync::mpsc::unbounded_channel;
+use tokio::task::JoinHandle;
+use unicode_width::UnicodeWidthStr;
 
 #[cfg(not(debug_assertions))]
 use crate::history_cell::UpdateAvailableHistoryCell;
@@ -67,6 +83,12 @@ pub struct AppExitInfo {
     pub token_usage: TokenUsage,
     pub conversation_id: Option<ConversationId>,
     pub update_action: Option<UpdateAction>,
+    /// ANSI-styled transcript lines to print after the TUI exits.
+    ///
+    /// These lines are rendered against the same width as the final TUI
+    /// viewport and include styling (colors, bold, etc.) so that scrollback
+    /// preserves the visual structure of the on-screen transcript.
+    pub session_lines: Vec<String>,
 }
 
 fn session_summary(
@@ -168,15 +190,6 @@ fn migration_prompt_hidden(config: &Config, migration_config_key: &str) -> bool 
     }
 }
 
-fn target_preset_for_upgrade<'a>(
-    available_models: &'a [ModelPreset],
-    target_model: &str,
-) -> Option<&'a ModelPreset> {
-    available_models
-        .iter()
-        .find(|preset| preset.model == target_model)
-}
-
 async fn handle_model_migration_prompt_if_needed(
     tui: &mut tui::Tui,
     config: &mut Config,
@@ -194,8 +207,7 @@ async fn handle_model_migration_prompt_if_needed(
         id: target_model,
         reasoning_effort_mapping,
         migration_config_key,
-        model_link,
-        upgrade_copy,
+        ..
     }) = upgrade
     {
         if migration_prompt_hidden(config, migration_config_key.as_str()) {
@@ -213,22 +225,28 @@ async fn handle_model_migration_prompt_if_needed(
         }
 
         let current_preset = available_models.iter().find(|preset| preset.model == model);
-        let target_preset = target_preset_for_upgrade(&available_models, &target_model);
-        let target_preset = target_preset?;
-        let target_display_name = target_preset.display_name.clone();
+        let target_preset = available_models
+            .iter()
+            .find(|preset| preset.model == target_model);
+        let target_display_name = target_preset
+            .map(|preset| preset.display_name.clone())
+            .unwrap_or_else(|| target_model.clone());
         let heading_label = if target_display_name == model {
             target_model.clone()
         } else {
             target_display_name.clone()
         };
-        let target_description =
-            (!target_preset.description.is_empty()).then(|| target_preset.description.clone());
+        let target_description = target_preset.and_then(|preset| {
+            if preset.description.is_empty() {
+                None
+            } else {
+                Some(preset.description.clone())
+            }
+        });
         let can_opt_out = current_preset.is_some();
         let prompt_copy = migration_copy_for_models(
             model,
             &target_model,
-            model_link.clone(),
-            upgrade_copy.clone(),
             heading_label,
             target_description,
             can_opt_out,
@@ -272,6 +290,7 @@ async fn handle_model_migration_prompt_if_needed(
                     token_usage: TokenUsage::default(),
                     conversation_id: None,
                     update_action: None,
+                    session_lines: Vec::new(),
                 });
             }
         }
@@ -294,6 +313,12 @@ pub(crate) struct App {
 
     pub(crate) transcript_cells: Vec<Arc<dyn HistoryCell>>,
 
+    #[allow(dead_code)]
+    transcript_scroll: TranscriptScroll,
+    transcript_selection: TranscriptSelection,
+    transcript_view_top: usize,
+    transcript_total_lines: usize,
+
     // Pager overlay state (Transcript or Static like Diff)
     pub(crate) overlay: Option<Overlay>,
     pub(crate) deferred_history_lines: Vec<Line<'static>>,
@@ -306,6 +331,10 @@ pub(crate) struct App {
 
     // Esc-backtracking state grouped
     pub(crate) backtrack: crate::app_backtrack::BacktrackState,
+
+    cxresume_cache: Option<crate::cxresume_picker_widget::PickerState>,
+    cxresume_idle: CxresumeIdleLoader,
+
     pub(crate) feedback: codex_feedback::CodexFeedback,
     /// Set when the user confirms an update; propagated on exit.
     pub(crate) pending_update_action: Option<UpdateAction>,
@@ -316,8 +345,37 @@ pub(crate) struct App {
 
     // One-shot suppression of the next world-writable scan after user confirmation.
     skip_world_writable_scan_once: bool,
+
+    session_bar: SessionBar,
+    panel_focus: PanelFocus,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanelFocus {
+    Chat,
+    Sessions,
+}
+/// Content-relative selection within the inline transcript viewport.
+///
+/// Selection endpoints are expressed in terms of flattened, wrapped transcript
+/// line indices and columns, so the highlight tracks logical conversation
+/// content even when the viewport scrolls or the terminal is resized.
+#[derive(Debug, Clone, Copy, Default)]
+struct TranscriptSelection {
+    anchor: Option<TranscriptSelectionPoint>,
+    head: Option<TranscriptSelectionPoint>,
+}
+
+/// A single endpoint of a transcript selection.
+///
+/// `line_index` is an index into the flattened wrapped transcript lines, and
+/// `column` is a zero-based column offset within that visual line, counted from
+/// the first content column to the right of the transcript gutter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TranscriptSelectionPoint {
+    line_index: usize,
+    column: u16,
+}
 impl App {
     async fn shutdown_current_conversation(&mut self) {
         if let Some(conversation_id) = self.chat_widget.conversation_id() {
@@ -325,6 +383,156 @@ impl App {
             self.chat_widget.submit_op(Op::Shutdown);
             self.server.remove_conversation(&conversation_id).await;
         }
+    }
+
+    async fn resume_session_from_rollout(
+        &mut self,
+        tui: &mut tui::Tui,
+        path: PathBuf,
+    ) -> Result<()> {
+        let summary = session_summary(
+            self.chat_widget.token_usage(),
+            self.chat_widget.conversation_id(),
+        );
+        let resumed = self
+            .server
+            .resume_conversation_from_rollout(
+                self.config.clone(),
+                path.clone(),
+                self.auth_manager.clone(),
+            )
+            .await
+            .wrap_err_with(|| format!("Failed to resume session from {}", path.display()))?;
+
+        self.render_transcript_once(tui);
+        self.transcript_cells.clear();
+        self.deferred_history_lines.clear();
+        self.has_emitted_history_lines = false;
+        self.transcript_scroll = TranscriptScroll::default();
+        self.transcript_selection = TranscriptSelection::default();
+        self.transcript_view_top = 0;
+        self.transcript_total_lines = 0;
+        self.reset_backtrack_state();
+
+        let models_manager = self.server.get_models_manager();
+        let resumed_model = resumed.session_configured.model.clone();
+        let model_family = models_manager
+            .construct_model_family(&resumed_model, &self.config)
+            .await;
+        let init = crate::chatwidget::ChatWidgetInit {
+            config: self.config.clone(),
+            frame_requester: tui.frame_requester(),
+            app_event_tx: self.app_event_tx.clone(),
+            initial_prompt: None,
+            initial_images: Vec::new(),
+            enhanced_keys_supported: self.enhanced_keys_supported,
+            auth_manager: self.auth_manager.clone(),
+            models_manager,
+            feedback: self.feedback.clone(),
+            is_first_run: false,
+            model_family: model_family.clone(),
+        };
+
+        self.shutdown_current_conversation().await;
+
+        self.chat_widget =
+            ChatWidget::new_from_existing(init, resumed.conversation, resumed.session_configured);
+        self.current_model = model_family.get_model_slug().to_string();
+
+        if let Some(summary) = summary {
+            let mut lines: Vec<Line<'static>> = vec![summary.usage_line.clone().into()];
+            if let Some(command) = summary.resume_command {
+                let spans = vec!["To continue this session, run ".into(), command.cyan()];
+                lines.push(spans.into());
+            }
+            self.chat_widget.add_plain_history_lines(lines);
+        }
+
+        self.panel_focus = PanelFocus::Chat;
+        self.session_bar.set_focus(false);
+        self.session_bar.refresh_sessions();
+
+        tui.frame_requester().schedule_frame();
+        Ok(())
+    }
+
+    pub(crate) fn open_or_refresh_session_picker(&mut self, tui: &mut tui::Tui) {
+        if let Some(Overlay::SessionPicker(picker)) = self.overlay.as_mut() {
+            if let Err(err) = picker.refresh_sessions(&self.config.codex_home, &self.config.cwd) {
+                self.chat_widget
+                    .add_error_message(format!("Failed to refresh sessions: {err}"));
+                tracing::warn!("Failed to refresh session picker: {err}");
+            }
+            tui.frame_requester().schedule_frame();
+            return;
+        }
+
+        let using_cache = self.cxresume_cache.is_some();
+        let overlay = if let Some(state) = self.cxresume_cache.clone() {
+            Ok(Overlay::SessionPicker(Box::new(
+                crate::pager_overlay::SessionPickerOverlay::from_state(
+                    self.config.codex_home.clone(),
+                    self.config.cwd.clone(),
+                    state,
+                ),
+            )))
+        } else {
+            crate::cxresume_picker_widget::create_session_picker_overlay(
+                &self.config.codex_home,
+                &self.config.cwd,
+            )
+        };
+
+        match overlay {
+            Ok(overlay) => {
+                let _ = tui.enter_alt_screen();
+                self.overlay = Some(overlay);
+                if let Some(state) = self
+                    .overlay
+                    .as_ref()
+                    .and_then(super::pager_overlay::Overlay::session_picker_state)
+                {
+                    self.update_cxresume_cache(state);
+                }
+                tui.frame_requester().schedule_frame();
+
+                if using_cache {
+                    let tx = self.app_event_tx.clone();
+                    let codex_home = self.config.codex_home.clone();
+                    let cwd = self.config.cwd.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let result = crate::cxresume_picker_widget::load_picker_state(
+                            codex_home.as_path(),
+                            cwd.as_path(),
+                        );
+                        match result {
+                            Ok(state) => tx.send(AppEvent::CxresumePrewarmReady(state)),
+                            Err(err) => tx.send(AppEvent::CxresumePrewarmFailed(err)),
+                        }
+                    });
+                }
+            }
+            Err(err) => {
+                self.chat_widget
+                    .add_error_message(format!("Failed to load sessions: {err}"));
+                tracing::warn!("Failed to create session picker: {err}");
+            }
+        }
+    }
+
+    pub(crate) fn refresh_session_bar(&mut self) {
+        self.session_bar.refresh_sessions();
+    }
+
+    pub(crate) fn update_cxresume_cache(
+        &mut self,
+        state: crate::cxresume_picker_widget::PickerState,
+    ) {
+        self.cxresume_cache = Some(state);
+    }
+
+    pub(crate) fn reset_cxresume_idle(&mut self) {
+        self.cxresume_idle.on_user_activity(&self.app_event_tx);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -426,6 +634,8 @@ impl App {
         #[cfg(not(debug_assertions))]
         let upgrade_version = crate::updates::get_upgrade_version(&config);
 
+        let session_bar = SessionBar::new(config.codex_home.clone(), config.cwd.clone());
+
         let mut app = Self {
             server: conversation_manager.clone(),
             app_event_tx,
@@ -437,16 +647,26 @@ impl App {
             file_search,
             enhanced_keys_supported,
             transcript_cells: Vec::new(),
+            transcript_scroll: TranscriptScroll::default(),
+            transcript_selection: TranscriptSelection::default(),
+            transcript_view_top: 0,
+            transcript_total_lines: 0,
             overlay: None,
             deferred_history_lines: Vec::new(),
             has_emitted_history_lines: false,
             commit_anim_running: Arc::new(AtomicBool::new(false)),
             backtrack: BacktrackState::default(),
+            cxresume_cache: None,
+            cxresume_idle: CxresumeIdleLoader::new(Duration::from_secs(2)),
             feedback: feedback.clone(),
             pending_update_action: None,
             suppress_shutdown_complete: false,
             skip_world_writable_scan_once: false,
+            session_bar,
+            panel_focus: PanelFocus::Chat,
         };
+
+        app.cxresume_idle.trigger_immediate(&app.app_event_tx);
 
         // On startup, if Agent mode (workspace-write) or ReadOnly is active, warn about world-writable dirs on Windows.
         #[cfg(target_os = "windows")]
@@ -497,11 +717,25 @@ impl App {
                 app.handle_tui_event(tui, event).await?
             }
         } {}
+        let width = tui.terminal.last_known_screen_size.width;
+        let session_lines = if width == 0 {
+            Vec::new()
+        } else {
+            let (lines, line_meta) = Self::build_transcript_lines(&app.transcript_cells, width);
+            let is_user_cell: Vec<bool> = app
+                .transcript_cells
+                .iter()
+                .map(|cell| cell.as_any().is::<UserHistoryCell>())
+                .collect();
+            Self::render_lines_to_ansi(&lines, &line_meta, &is_user_cell, width)
+        };
+
         tui.terminal.clear()?;
         Ok(AppExitInfo {
             token_usage: app.token_usage(),
             conversation_id: app.chat_widget.conversation_id(),
             update_action: app.pending_update_action,
+            session_lines,
         })
     }
 
@@ -510,12 +744,19 @@ impl App {
         tui: &mut tui::Tui,
         event: TuiEvent,
     ) -> Result<bool> {
+        if matches!(event, TuiEvent::Key(_) | TuiEvent::Paste(_)) {
+            self.reset_cxresume_idle();
+        }
+
         if self.overlay.is_some() {
             let _ = self.handle_backtrack_overlay_event(tui, event).await?;
         } else {
             match event {
                 TuiEvent::Key(key_event) => {
                     self.handle_key_event(tui, key_event).await;
+                }
+                TuiEvent::Mouse(mouse_event) => {
+                    self.handle_mouse_event(tui, mouse_event);
                 }
                 TuiEvent::Paste(pasted) => {
                     // Many terminals convert newlines to \r when pasting (e.g., iTerm2),
@@ -533,19 +774,873 @@ impl App {
                     {
                         return Ok(true);
                     }
-                    tui.draw(
-                        self.chat_widget.desired_height(tui.terminal.size()?.width),
-                        |frame| {
-                            self.chat_widget.render(frame.area(), frame.buffer);
-                            if let Some((x, y)) = self.chat_widget.cursor_pos(frame.area()) {
-                                frame.set_cursor_position((x, y));
-                            }
-                        },
-                    )?;
+                    let current_conv_id =
+                        self.chat_widget.conversation_id().map(|id| id.to_string());
+                    self.session_bar
+                        .set_current_session(current_conv_id.clone());
+                    if let Some(id) = current_conv_id {
+                        self.session_bar
+                            .set_session_status(id, self.chat_widget.sidebar_status());
+                    }
+
+                    let cells = self.transcript_cells.clone();
+                    tui.draw(tui.terminal.size()?.height, |frame| {
+                        let session_height = 4u16.min(frame.area().height);
+                        let available_for_chat = frame.area().height.saturating_sub(session_height);
+                        let chat_height = self
+                            .chat_widget
+                            .desired_height(frame.area().width)
+                            .min(available_for_chat);
+
+                        let chat_top = self.render_transcript_cells(
+                            frame,
+                            &cells,
+                            chat_height.saturating_add(session_height),
+                        );
+                        let session_area = Rect {
+                            x: frame.area().x,
+                            y: frame.area().bottom().saturating_sub(session_height),
+                            width: frame.area().width,
+                            height: session_height,
+                        };
+                        let chat_max_height = session_area.y.saturating_sub(chat_top);
+                        let chat_area = Rect {
+                            x: frame.area().x,
+                            y: chat_top,
+                            width: frame.area().width,
+                            height: chat_height.min(chat_max_height),
+                        };
+                        self.chat_widget.render(chat_area, frame.buffer);
+                        let chat_bottom = chat_area.y.saturating_add(chat_area.height);
+                        if chat_bottom < frame.area().bottom() {
+                            Clear.render_ref(
+                                Rect {
+                                    x: frame.area().x,
+                                    y: chat_bottom,
+                                    width: frame.area().width,
+                                    height: frame.area().bottom().saturating_sub(chat_bottom),
+                                },
+                                frame.buffer,
+                            );
+                        }
+
+                        if !session_area.is_empty() {
+                            frame.render_widget_ref(&self.session_bar, session_area);
+                        }
+
+                        if self.panel_focus == PanelFocus::Chat
+                            && let Some((x, y)) = self.chat_widget.cursor_pos(chat_area)
+                        {
+                            frame.set_cursor_position((x, y));
+                        }
+                    })?;
+                    let transcript_scrolled =
+                        !matches!(self.transcript_scroll, TranscriptScroll::ToBottom);
+                    let selection_active = matches!(
+                        (self.transcript_selection.anchor, self.transcript_selection.head),
+                        (Some(a), Some(b)) if a != b
+                    );
+                    let scroll_position = if self.transcript_total_lines == 0 {
+                        None
+                    } else {
+                        Some((
+                            self.transcript_view_top.saturating_add(1),
+                            self.transcript_total_lines,
+                        ))
+                    };
+                    self.chat_widget.set_transcript_ui_state(
+                        transcript_scrolled,
+                        selection_active,
+                        scroll_position,
+                    );
                 }
             }
         }
         Ok(true)
+    }
+
+    pub(crate) fn render_transcript_cells(
+        &mut self,
+        frame: &mut Frame,
+        cells: &[Arc<dyn HistoryCell>],
+        chat_height: u16,
+    ) -> u16 {
+        let area = frame.area();
+        if area.width == 0 || area.height == 0 {
+            self.transcript_scroll = TranscriptScroll::default();
+            self.transcript_view_top = 0;
+            self.transcript_total_lines = 0;
+            return area.bottom().saturating_sub(chat_height);
+        }
+
+        let chat_height = chat_height.min(area.height);
+        let max_transcript_height = area.height.saturating_sub(chat_height);
+        if max_transcript_height == 0 {
+            self.transcript_scroll = TranscriptScroll::default();
+            self.transcript_view_top = 0;
+            self.transcript_total_lines = 0;
+            return area.y;
+        }
+
+        let transcript_area = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: max_transcript_height,
+        };
+
+        let (lines, line_meta) = Self::build_transcript_lines(cells, transcript_area.width);
+        if lines.is_empty() {
+            Clear.render_ref(transcript_area, frame.buffer);
+            self.transcript_scroll = TranscriptScroll::default();
+            self.transcript_view_top = 0;
+            self.transcript_total_lines = 0;
+            return area.y;
+        }
+
+        let wrapped = word_wrap_lines_borrowed(&lines, transcript_area.width.max(1) as usize);
+        if wrapped.is_empty() {
+            self.transcript_scroll = TranscriptScroll::default();
+            self.transcript_view_top = 0;
+            self.transcript_total_lines = 0;
+            return area.y;
+        }
+
+        let is_user_cell: Vec<bool> = cells
+            .iter()
+            .map(|c| c.as_any().is::<UserHistoryCell>())
+            .collect();
+        let wrapped_line_meta =
+            Self::build_wrapped_line_meta(&lines, &line_meta, transcript_area.width);
+        debug_assert_eq!(wrapped.len(), wrapped_line_meta.len());
+        let wrapped_is_user_row: Vec<bool> = wrapped_line_meta
+            .iter()
+            .map(TranscriptLineMeta::cell_index)
+            .map(|cell_index| {
+                cell_index
+                    .and_then(|idx| is_user_cell.get(idx).copied())
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        let total_lines = wrapped_line_meta.len();
+        self.transcript_total_lines = total_lines;
+        let max_visible = std::cmp::min(max_transcript_height as usize, total_lines);
+        let max_start = total_lines.saturating_sub(max_visible);
+
+        let (scroll_state, top_offset) = self
+            .transcript_scroll
+            .resolve_top(&wrapped_line_meta, max_start);
+        self.transcript_scroll = scroll_state;
+        self.transcript_view_top = top_offset;
+
+        let transcript_visible_height = max_visible as u16;
+        let chat_top = if total_lines <= max_transcript_height as usize {
+            let gap = if transcript_visible_height == 0 { 0 } else { 1 };
+            area.y
+                .saturating_add(transcript_visible_height)
+                .saturating_add(gap)
+        } else {
+            area.bottom().saturating_sub(chat_height)
+        };
+
+        let clear_height = chat_top.saturating_sub(area.y);
+        if clear_height > 0 {
+            Clear.render_ref(
+                Rect {
+                    x: area.x,
+                    y: area.y,
+                    width: area.width,
+                    height: clear_height,
+                },
+                frame.buffer,
+            );
+        }
+
+        let transcript_area = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: transcript_visible_height,
+        };
+
+        for (row_index, line_index) in (top_offset..total_lines).enumerate() {
+            if row_index >= max_visible {
+                break;
+            }
+
+            let y = transcript_area.y + row_index as u16;
+            let row_area = Rect {
+                x: transcript_area.x,
+                y,
+                width: transcript_area.width,
+                height: 1,
+            };
+
+            if wrapped_is_user_row
+                .get(line_index)
+                .copied()
+                .unwrap_or(false)
+            {
+                let base_style = crate::style::user_message_style();
+                for x in row_area.x..row_area.right() {
+                    let cell = &mut frame.buffer[(x, y)];
+                    let style = cell.style().patch(base_style);
+                    cell.set_style(style);
+                }
+            }
+
+            wrapped[line_index].render_ref(row_area, frame.buffer);
+        }
+
+        self.apply_transcript_selection(transcript_area, frame.buffer);
+        chat_top
+    }
+
+    /// Handle mouse interaction in the main transcript view.
+    ///
+    /// - Mouse wheel movement scrolls the conversation history by small, fixed increments,
+    ///   independent of the terminal's own scrollback.
+    /// - Mouse clicks and drags adjust a text selection defined in terms of
+    ///   flattened transcript lines and columns, so the selection is anchored
+    ///   to the underlying content rather than absolute screen rows.
+    /// - When the user drags to extend a selection while the view is following the bottom
+    ///   and a task is actively running (e.g., streaming a response), the scroll mode is
+    ///   first converted into an anchored position so that ongoing updates no longer move
+    ///   the viewport under the selection. A simple click without a drag does not change
+    ///   scroll behavior.
+    fn handle_mouse_event(
+        &mut self,
+        tui: &mut tui::Tui,
+        mouse_event: crossterm::event::MouseEvent,
+    ) {
+        use crossterm::event::MouseEventKind;
+
+        if self.overlay.is_some() {
+            return;
+        }
+
+        let size = tui.terminal.last_known_screen_size;
+        let width = size.width;
+        let height = size.height;
+        if width == 0 || height == 0 {
+            return;
+        }
+
+        let session_height = 4u16.min(height);
+        let available_for_chat = height.saturating_sub(session_height);
+        let chat_height = self
+            .chat_widget
+            .desired_height(width)
+            .min(available_for_chat);
+        let reserved = chat_height.saturating_add(session_height);
+        if reserved >= height {
+            return;
+        }
+
+        // Only handle events over the transcript area above the composer.
+        let transcript_height = height.saturating_sub(reserved);
+        if transcript_height == 0 {
+            return;
+        }
+
+        let transcript_area = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height: transcript_height,
+        };
+        let base_x = transcript_area.x.saturating_add(2);
+        let max_x = transcript_area.right().saturating_sub(1);
+
+        let mut clamped_x = mouse_event.column;
+        let mut clamped_y = mouse_event.row;
+
+        if clamped_y < transcript_area.y || clamped_y >= transcript_area.bottom() {
+            clamped_y = transcript_area.y;
+        }
+        if clamped_x < base_x {
+            clamped_x = base_x;
+        }
+        if clamped_x > max_x {
+            clamped_x = max_x;
+        }
+
+        let streaming = self.chat_widget.is_task_running();
+
+        match mouse_event.kind {
+            MouseEventKind::ScrollUp => {
+                self.scroll_transcript(
+                    tui,
+                    -3,
+                    transcript_area.height as usize,
+                    transcript_area.width,
+                );
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_transcript(
+                    tui,
+                    3,
+                    transcript_area.height as usize,
+                    transcript_area.width,
+                );
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(point) = self.transcript_point_from_coordinates(
+                    transcript_area,
+                    base_x,
+                    clamped_x,
+                    clamped_y,
+                ) {
+                    self.transcript_selection.anchor = Some(point);
+                    self.transcript_selection.head = Some(point);
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(anchor) = self.transcript_selection.anchor
+                    && let Some(point) = self.transcript_point_from_coordinates(
+                        transcript_area,
+                        base_x,
+                        clamped_x,
+                        clamped_y,
+                    )
+                {
+                    if streaming
+                        && matches!(self.transcript_scroll, TranscriptScroll::ToBottom)
+                        && point != anchor
+                    {
+                        self.lock_transcript_scroll_to_current_view(
+                            transcript_area.height as usize,
+                            transcript_area.width,
+                        );
+                    }
+                    self.transcript_selection.head = Some(point);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.transcript_selection.anchor == self.transcript_selection.head {
+                    self.transcript_selection = TranscriptSelection::default();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Scroll the transcript by a fixed number of visual lines.
+    ///
+    /// This is the shared implementation behind mouse wheel movement and PgUp/PgDn keys in
+    /// the main view. Scroll state is expressed in terms of transcript cells and their
+    /// internal line indices, so scrolling refers to logical conversation content and
+    /// remains stable even as wrapping or streaming causes visual reflows.
+    fn scroll_transcript(
+        &mut self,
+        tui: &mut tui::Tui,
+        delta_lines: i32,
+        visible_lines: usize,
+        width: u16,
+    ) {
+        if visible_lines == 0 {
+            return;
+        }
+
+        let (lines, line_meta) = Self::build_transcript_lines(&self.transcript_cells, width);
+        let wrapped_line_meta = Self::build_wrapped_line_meta(&lines, &line_meta, width);
+        self.transcript_scroll =
+            self.transcript_scroll
+                .scrolled_by(delta_lines, &wrapped_line_meta, visible_lines);
+
+        tui.frame_requester().schedule_frame();
+    }
+
+    /// Convert a `ToBottom` (auto-follow) scroll state into a fixed anchor at the current view.
+    ///
+    /// When the user begins a mouse selection while new output is streaming in, the view
+    /// should stop auto-following the latest line so the selection stays on the intended
+    /// content. This helper inspects the flattened transcript at the given width, derives
+    /// a concrete position corresponding to the current top row, and switches into a scroll
+    /// mode that keeps that position stable until the user scrolls again.
+    fn lock_transcript_scroll_to_current_view(&mut self, visible_lines: usize, width: u16) {
+        if self.transcript_cells.is_empty() || visible_lines == 0 || width == 0 {
+            return;
+        }
+
+        let (lines, line_meta) = Self::build_transcript_lines(&self.transcript_cells, width);
+        let wrapped_line_meta = Self::build_wrapped_line_meta(&lines, &line_meta, width);
+        if wrapped_line_meta.is_empty() {
+            return;
+        }
+
+        let total_lines = wrapped_line_meta.len();
+        let max_visible = std::cmp::min(visible_lines, total_lines);
+        if max_visible == 0 {
+            return;
+        }
+
+        let max_start = total_lines.saturating_sub(max_visible);
+        let top_offset = match self.transcript_scroll {
+            TranscriptScroll::ToBottom => max_start,
+            TranscriptScroll::Scrolled { .. } => {
+                // Already anchored; nothing to lock.
+                return;
+            }
+        };
+
+        if let Some(scroll_state) = TranscriptScroll::anchor_for(&wrapped_line_meta, top_offset) {
+            self.transcript_scroll = scroll_state;
+        }
+    }
+
+    /// Build the flattened transcript lines for rendering, scrolling, and exit transcripts.
+    ///
+    /// Returns both the visible `Line` buffer and a parallel metadata vector
+    /// that maps each line back to its originating `(cell_index, line_in_cell)`
+    /// pair (see `TranscriptLineMeta::CellLine`), or `TranscriptLineMeta::Spacer` for
+    /// synthetic spacer rows inserted between cells. This allows the scroll state
+    /// to anchor to a specific history cell even as new content arrives or the
+    /// viewport size changes, and gives exit transcript renderers enough structure
+    /// to style user rows differently from agent rows.
+    fn build_transcript_lines(
+        cells: &[Arc<dyn HistoryCell>],
+        width: u16,
+    ) -> (Vec<Line<'static>>, Vec<TranscriptLineMeta>) {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut line_meta: Vec<TranscriptLineMeta> = Vec::new();
+        let mut has_emitted_lines = false;
+
+        for (cell_index, cell) in cells.iter().enumerate() {
+            let cell_lines = cell.display_lines(width);
+            if cell_lines.is_empty() {
+                continue;
+            }
+
+            if !cell.is_stream_continuation() {
+                if has_emitted_lines {
+                    lines.push(Line::from(""));
+                    line_meta.push(TranscriptLineMeta::Spacer);
+                } else {
+                    has_emitted_lines = true;
+                }
+            }
+
+            for (line_in_cell, line) in cell_lines.into_iter().enumerate() {
+                line_meta.push(TranscriptLineMeta::CellLine {
+                    cell_index,
+                    line_in_cell,
+                });
+                lines.push(line);
+            }
+        }
+
+        (lines, line_meta)
+    }
+
+    fn build_wrapped_line_meta(
+        lines: &[Line<'static>],
+        line_meta: &[TranscriptLineMeta],
+        width: u16,
+    ) -> Vec<TranscriptLineMeta> {
+        let base_opts: RtOptions<'_> = RtOptions::new(width.max(1) as usize);
+        let mut wrapped_meta: Vec<TranscriptLineMeta> = Vec::new();
+        let mut first = true;
+        let mut current_cell = None;
+        let mut current_line_in_cell = 0usize;
+
+        for (idx, line) in lines.iter().enumerate() {
+            let opts = if first {
+                base_opts.clone()
+            } else {
+                base_opts
+                    .clone()
+                    .initial_indent(base_opts.subsequent_indent.clone())
+            };
+            let seg_count = word_wrap_line(line, opts).len();
+            let meta = line_meta
+                .get(idx)
+                .copied()
+                .unwrap_or(TranscriptLineMeta::Spacer);
+
+            match meta {
+                TranscriptLineMeta::CellLine { cell_index, .. } => {
+                    if current_cell != Some(cell_index) {
+                        current_cell = Some(cell_index);
+                        current_line_in_cell = 0;
+                    }
+                    for offset in 0..seg_count {
+                        wrapped_meta.push(TranscriptLineMeta::CellLine {
+                            cell_index,
+                            line_in_cell: current_line_in_cell + offset,
+                        });
+                    }
+                    current_line_in_cell += seg_count;
+                }
+                TranscriptLineMeta::Spacer => {
+                    wrapped_meta.extend(std::iter::repeat_n(TranscriptLineMeta::Spacer, seg_count));
+                    current_cell = None;
+                }
+            }
+            first = false;
+        }
+
+        wrapped_meta
+    }
+
+    /// Render flattened transcript lines into ANSI strings suitable for
+    /// printing after the TUI exits.
+    ///
+    /// This helper mirrors the original TUI viewport behavior:
+    ///  - Merges line-level style into each span so the ANSI output matches
+    ///    the on-screen styling (e.g., blockquotes, lists).
+    ///  - For user-authored rows, pads the background style out to the full
+    ///    terminal width so prompts appear as solid blocks in scrollback.
+    ///  - Streams spans through the shared vt100 writer so downstream tests
+    ///    and tools see consistent escape sequences.
+    fn render_lines_to_ansi(
+        lines: &[Line<'static>],
+        line_meta: &[TranscriptLineMeta],
+        is_user_cell: &[bool],
+        width: u16,
+    ) -> Vec<String> {
+        lines
+            .iter()
+            .enumerate()
+            .map(|(idx, line)| {
+                let is_user_row = line_meta
+                    .get(idx)
+                    .and_then(TranscriptLineMeta::cell_index)
+                    .map(|cell_index| is_user_cell.get(cell_index).copied().unwrap_or(false))
+                    .unwrap_or(false);
+
+                let mut merged_spans: Vec<ratatui::text::Span<'static>> = line
+                    .spans
+                    .iter()
+                    .map(|span| ratatui::text::Span {
+                        style: span.style.patch(line.style),
+                        content: span.content.clone(),
+                    })
+                    .collect();
+
+                if is_user_row && width > 0 {
+                    let text: String = merged_spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect();
+                    let text_width = UnicodeWidthStr::width(text.as_str());
+                    let total_width = usize::from(width);
+                    if text_width < total_width {
+                        let pad_len = total_width.saturating_sub(text_width);
+                        if pad_len > 0 {
+                            let pad_style = crate::style::user_message_style();
+                            merged_spans.push(ratatui::text::Span {
+                                style: pad_style,
+                                content: " ".repeat(pad_len).into(),
+                            });
+                        }
+                    }
+                }
+
+                let mut buf: Vec<u8> = Vec::new();
+                let _ = crate::insert_history::write_spans(&mut buf, merged_spans.iter());
+                String::from_utf8(buf).unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// Apply the current transcript selection to the given buffer.
+    ///
+    /// The selection is defined in terms of flattened wrapped transcript line
+    /// indices and columns. This method maps those content-relative endpoints
+    /// into the currently visible viewport based on `transcript_view_top` and
+    /// `transcript_total_lines`, so the highlight moves with the content as the
+    /// user scrolls.
+    fn apply_transcript_selection(&self, area: Rect, buf: &mut Buffer) {
+        let (anchor, head) = match (
+            self.transcript_selection.anchor,
+            self.transcript_selection.head,
+        ) {
+            (Some(a), Some(h)) => (a, h),
+            _ => return,
+        };
+
+        if self.transcript_total_lines == 0 {
+            return;
+        }
+
+        let base_x = area.x.saturating_add(2);
+        let max_x = area.right().saturating_sub(1);
+
+        let mut start = anchor;
+        let mut end = head;
+        if (end.line_index < start.line_index)
+            || (end.line_index == start.line_index && end.column < start.column)
+        {
+            std::mem::swap(&mut start, &mut end);
+        }
+
+        let visible_start = self.transcript_view_top;
+        let visible_end = self
+            .transcript_view_top
+            .saturating_add(area.height as usize)
+            .min(self.transcript_total_lines);
+
+        for (row_index, line_index) in (visible_start..visible_end).enumerate() {
+            if line_index < start.line_index || line_index > end.line_index {
+                continue;
+            }
+
+            let y = area.y + row_index as u16;
+
+            let mut first_text_x = None;
+            let mut last_text_x = None;
+            for x in base_x..=max_x {
+                let cell = &buf[(x, y)];
+                if cell.symbol() != " " {
+                    if first_text_x.is_none() {
+                        first_text_x = Some(x);
+                    }
+                    last_text_x = Some(x);
+                }
+            }
+
+            let (text_start, text_end) = match (first_text_x, last_text_x) {
+                // Treat indentation spaces as part of the selectable region by
+                // starting from the first content column to the right of the
+                // transcript gutter, but still clamp to the last non-space
+                // glyph so trailing padding is not included.
+                (Some(_), Some(e)) => (base_x, e),
+                _ => continue,
+            };
+
+            let line_start_col = if line_index == start.line_index {
+                start.column
+            } else {
+                0
+            };
+            let line_end_col = if line_index == end.line_index {
+                end.column
+            } else {
+                max_x.saturating_sub(base_x)
+            };
+
+            let row_sel_start = base_x.saturating_add(line_start_col);
+            let row_sel_end = base_x.saturating_add(line_end_col).min(max_x);
+
+            if row_sel_start > row_sel_end {
+                continue;
+            }
+
+            let from_x = row_sel_start.max(text_start);
+            let to_x = row_sel_end.min(text_end);
+
+            if from_x > to_x {
+                continue;
+            }
+
+            for x in from_x..=to_x {
+                let cell = &mut buf[(x, y)];
+                let style = cell.style();
+                cell.set_style(style.add_modifier(ratatui::style::Modifier::REVERSED));
+            }
+        }
+    }
+
+    /// Copy the currently selected transcript region to the system clipboard.
+    ///
+    /// The selection is defined in terms of flattened wrapped transcript line
+    /// indices and columns, and this method reconstructs the same wrapped
+    /// transcript used for on-screen rendering so the copied text closely
+    /// matches the highlighted region.
+    fn copy_transcript_selection(&mut self, tui: &tui::Tui) {
+        let (anchor, head) = match (
+            self.transcript_selection.anchor,
+            self.transcript_selection.head,
+        ) {
+            (Some(a), Some(h)) if a != h => (a, h),
+            _ => return,
+        };
+
+        let size = tui.terminal.last_known_screen_size;
+        let width = size.width;
+        let height = size.height;
+        if width == 0 || height == 0 {
+            return;
+        }
+
+        let session_height = 4u16.min(height);
+        let available_for_chat = height.saturating_sub(session_height);
+        let chat_height = self
+            .chat_widget
+            .desired_height(width)
+            .min(available_for_chat);
+        let reserved = chat_height.saturating_add(session_height);
+        if reserved >= height {
+            return;
+        }
+
+        let transcript_height = height.saturating_sub(reserved);
+        if transcript_height == 0 {
+            return;
+        }
+
+        let transcript_area = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height: transcript_height,
+        };
+
+        let cells = self.transcript_cells.clone();
+        let (lines, _) = Self::build_transcript_lines(&cells, transcript_area.width);
+        if lines.is_empty() {
+            return;
+        }
+
+        let wrapped = crate::wrapping::word_wrap_lines_borrowed(
+            &lines,
+            transcript_area.width.max(1) as usize,
+        );
+        let total_lines = wrapped.len();
+        if total_lines == 0 {
+            return;
+        }
+
+        let max_visible = transcript_area.height as usize;
+        let visible_start = self
+            .transcript_view_top
+            .min(total_lines.saturating_sub(max_visible));
+        let visible_end = std::cmp::min(visible_start + max_visible, total_lines);
+
+        let mut buf = Buffer::empty(transcript_area);
+        Clear.render_ref(transcript_area, &mut buf);
+
+        for (row_index, line_index) in (visible_start..visible_end).enumerate() {
+            let row_area = Rect {
+                x: transcript_area.x,
+                y: transcript_area.y + row_index as u16,
+                width: transcript_area.width,
+                height: 1,
+            };
+            wrapped[line_index].render_ref(row_area, &mut buf);
+        }
+
+        let base_x = transcript_area.x.saturating_add(2);
+        let max_x = transcript_area.right().saturating_sub(1);
+
+        let mut start = anchor;
+        let mut end = head;
+        if (end.line_index < start.line_index)
+            || (end.line_index == start.line_index && end.column < start.column)
+        {
+            std::mem::swap(&mut start, &mut end);
+        }
+
+        let mut lines_out: Vec<String> = Vec::new();
+
+        for (row_index, line_index) in (visible_start..visible_end).enumerate() {
+            if line_index < start.line_index || line_index > end.line_index {
+                continue;
+            }
+
+            let y = transcript_area.y + row_index as u16;
+
+            let line_start_col = if line_index == start.line_index {
+                start.column
+            } else {
+                0
+            };
+            let line_end_col = if line_index == end.line_index {
+                end.column
+            } else {
+                max_x.saturating_sub(base_x)
+            };
+
+            let row_sel_start = base_x.saturating_add(line_start_col);
+            let row_sel_end = base_x.saturating_add(line_end_col).min(max_x);
+
+            if row_sel_start > row_sel_end {
+                continue;
+            }
+
+            let mut first_text_x = None;
+            let mut last_text_x = None;
+            for x in base_x..=max_x {
+                let cell = &buf[(x, y)];
+                if cell.symbol() != " " {
+                    if first_text_x.is_none() {
+                        first_text_x = Some(x);
+                    }
+                    last_text_x = Some(x);
+                }
+            }
+
+            let (text_start, text_end) = match (first_text_x, last_text_x) {
+                // Treat indentation spaces as part of the copyable region by
+                // starting from the first content column to the right of the
+                // transcript gutter, but still clamp to the last non-space
+                // glyph so trailing padding is not included.
+                (Some(_), Some(e)) => (base_x, e),
+                _ => {
+                    lines_out.push(String::new());
+                    continue;
+                }
+            };
+
+            let from_x = row_sel_start.max(text_start);
+            let to_x = row_sel_end.min(text_end);
+            if from_x > to_x {
+                continue;
+            }
+
+            let mut line_text = String::new();
+            for x in from_x..=to_x {
+                let cell = &buf[(x, y)];
+                let symbol = cell.symbol();
+                if !symbol.is_empty() {
+                    line_text.push_str(symbol);
+                }
+            }
+
+            lines_out.push(line_text);
+        }
+
+        if lines_out.is_empty() {
+            return;
+        }
+
+        let text = lines_out.join("\n");
+        if let Err(err) = clipboard_copy::copy_text(text) {
+            tracing::error!(error = %err, "failed to copy selection to clipboard");
+        }
+    }
+
+    /// Map a mouse position in the transcript area to a content-relative
+    /// selection point, if there is transcript content to select.
+    fn transcript_point_from_coordinates(
+        &self,
+        transcript_area: Rect,
+        base_x: u16,
+        x: u16,
+        y: u16,
+    ) -> Option<TranscriptSelectionPoint> {
+        if self.transcript_total_lines == 0 {
+            return None;
+        }
+
+        let mut row_index = y.saturating_sub(transcript_area.y);
+        if row_index >= transcript_area.height {
+            if transcript_area.height == 0 {
+                return None;
+            }
+            row_index = transcript_area.height.saturating_sub(1);
+        }
+
+        let max_line = self.transcript_total_lines.saturating_sub(1);
+        let line_index = self
+            .transcript_view_top
+            .saturating_add(usize::from(row_index))
+            .min(max_line);
+        let column = x.saturating_sub(base_x);
+
+        Some(TranscriptSelectionPoint { line_index, column })
     }
 
     async fn handle_event(&mut self, tui: &mut tui::Tui, event: AppEvent) -> Result<bool> {
@@ -560,6 +1655,15 @@ impl App {
                     self.chat_widget.token_usage(),
                     self.chat_widget.conversation_id(),
                 );
+                self.render_transcript_once(tui);
+                self.transcript_cells.clear();
+                self.deferred_history_lines.clear();
+                self.has_emitted_history_lines = false;
+                self.transcript_scroll = TranscriptScroll::default();
+                self.transcript_selection = TranscriptSelection::default();
+                self.transcript_view_top = 0;
+                self.transcript_total_lines = 0;
+                self.reset_backtrack_state();
                 self.shutdown_current_conversation().await;
                 let init = crate::chatwidget::ChatWidgetInit {
                     config: self.config.clone(),
@@ -584,83 +1688,128 @@ impl App {
                     }
                     self.chat_widget.add_plain_history_lines(lines);
                 }
+                self.panel_focus = PanelFocus::Chat;
+                self.session_bar.set_focus(false);
+                self.session_bar.refresh_sessions();
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::ResumeSession(path) => {
+                if let Err(err) = self.resume_session_from_rollout(tui, path.clone()).await {
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to resume session from {}: {err}",
+                        path.display()
+                    ));
+                }
+            }
+            AppEvent::SaveSessionAlias { session_id, alias } => {
+                self.session_bar.set_session_alias(session_id, alias);
+                self.session_bar.refresh_sessions();
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::CloneSession(source_path) => {
+                if self.chat_widget.is_task_running() {
+                    self.chat_widget.add_error_message(
+                        "Cannot clone a session while a task is running.".to_string(),
+                    );
+                    return Ok(true);
+                }
+
+                let config = self.chat_widget.config_ref().clone();
+                let cloned = match self
+                    .server
+                    .clone_conversation_from_rollout(config, source_path.clone())
+                    .await
+                {
+                    Ok(cloned) => cloned,
+                    Err(err) => {
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to clone session from {}: {err}",
+                            source_path.display()
+                        ));
+                        return Ok(true);
+                    }
+                };
+
+                let codex_core::NewConversation {
+                    conversation_id,
+                    conversation,
+                    session_configured,
+                } = cloned;
+                let session_id = session_configured.session_id.to_string();
+                self.server.remove_conversation(&conversation_id).await;
+                drop(conversation);
+
+                let app_tx = self.app_event_tx.clone();
+                self.chat_widget.show_session_alias_input_for_rename(
+                    session_id,
+                    Box::new(move |sid, alias| {
+                        app_tx.send(AppEvent::SaveSessionAlias {
+                            session_id: sid,
+                            alias,
+                        });
+                    }),
+                );
+
+                self.session_bar.refresh_sessions();
                 tui.frame_requester().schedule_frame();
             }
             AppEvent::OpenResumePicker => {
-                match crate::resume_picker::run_resume_picker(
-                    tui,
-                    &self.config.codex_home,
-                    &self.config.model_provider_id,
-                    false,
-                )
-                .await?
+                self.open_or_refresh_session_picker(tui);
+            }
+            AppEvent::CxresumeIdleCheck => {
+                if self
+                    .cxresume_idle
+                    .handle_idle_check(self.overlay.is_some(), &self.app_event_tx)
                 {
-                    ResumeSelection::Resume(path) => {
-                        let summary = session_summary(
-                            self.chat_widget.token_usage(),
-                            self.chat_widget.conversation_id(),
-                        );
-                        match self
-                            .server
-                            .resume_conversation_from_rollout(
-                                self.config.clone(),
-                                path.clone(),
-                                self.auth_manager.clone(),
+                    let tx = self.app_event_tx.clone();
+                    let codex_home = self.config.codex_home.clone();
+                    let cwd = self.config.cwd.clone();
+                    tokio::spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            crate::cxresume_picker_widget::load_picker_state(
+                                codex_home.as_path(),
+                                cwd.as_path(),
                             )
-                            .await
-                        {
-                            Ok(resumed) => {
-                                self.shutdown_current_conversation().await;
-                                let init = crate::chatwidget::ChatWidgetInit {
-                                    config: self.config.clone(),
-                                    frame_requester: tui.frame_requester(),
-                                    app_event_tx: self.app_event_tx.clone(),
-                                    initial_prompt: None,
-                                    initial_images: Vec::new(),
-                                    enhanced_keys_supported: self.enhanced_keys_supported,
-                                    auth_manager: self.auth_manager.clone(),
-                                    models_manager: self.server.get_models_manager(),
-                                    feedback: self.feedback.clone(),
-                                    is_first_run: false,
-                                    model_family: model_family.clone(),
-                                };
-                                self.chat_widget = ChatWidget::new_from_existing(
-                                    init,
-                                    resumed.conversation,
-                                    resumed.session_configured,
-                                );
-                                self.current_model = model_family.get_model_slug().to_string();
-                                if let Some(summary) = summary {
-                                    let mut lines: Vec<Line<'static>> =
-                                        vec![summary.usage_line.clone().into()];
-                                    if let Some(command) = summary.resume_command {
-                                        let spans = vec![
-                                            "To continue this session, run ".into(),
-                                            command.cyan(),
-                                        ];
-                                        lines.push(spans.into());
-                                    }
-                                    self.chat_widget.add_plain_history_lines(lines);
-                                }
+                        })
+                        .await;
+                        match result {
+                            Ok(Ok(state)) => {
+                                tx.send(AppEvent::CxresumePrewarmReady(state));
                             }
-                            Err(err) => {
-                                self.chat_widget.add_error_message(format!(
-                                    "Failed to resume session from {}: {err}",
-                                    path.display()
-                                ));
+                            Ok(Err(err)) => {
+                                tx.send(AppEvent::CxresumePrewarmFailed(err));
+                            }
+                            Err(join_err) => {
+                                tx.send(AppEvent::CxresumePrewarmFailed(join_err.to_string()));
                             }
                         }
-                    }
-                    ResumeSelection::Exit | ResumeSelection::StartFresh => {}
+                    });
                 }
-
-                // Leaving alt-screen may blank the inline viewport; force a redraw either way.
-                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::CxresumePrewarmReady(state) => {
+                tracing::debug!(
+                    "cxresume prewarm completed with {} sessions",
+                    state.sessions.len()
+                );
+                self.update_cxresume_cache(state.clone());
+                if self.cxresume_idle.job_in_flight {
+                    self.cxresume_idle.job_complete(&self.app_event_tx, true);
+                }
+                if let Some(Overlay::SessionPicker(picker)) = self.overlay.as_mut() {
+                    picker.replace_state(state);
+                    tui.frame_requester().schedule_frame();
+                }
+            }
+            AppEvent::CxresumePrewarmFailed(err) => {
+                tracing::debug!("cxresume prewarm failed: {err}");
+                if self.cxresume_idle.job_in_flight {
+                    self.cxresume_idle.job_complete(&self.app_event_tx, false);
+                }
             }
             AppEvent::InsertHistoryCell(cell) => {
                 let cell: Arc<dyn HistoryCell> = cell.into();
-                if let Some(Overlay::Transcript(t)) = &mut self.overlay {
-                    t.insert_cell(cell.clone());
+                if let Some(Overlay::Transcript(transcript)) = &mut self.overlay {
+                    transcript.insert_cell(cell.clone());
                     tui.frame_requester().schedule_frame();
                 }
                 self.transcript_cells.push(cell.clone());
@@ -678,8 +1827,6 @@ impl App {
                     }
                     if self.overlay.is_some() {
                         self.deferred_history_lines.extend(display);
-                    } else {
-                        tui.insert_history_lines(display);
                     }
                 }
             }
@@ -947,42 +2094,6 @@ impl App {
                     }
                 }
             }
-            AppEvent::UpdateFeatureFlags { updates } => {
-                if updates.is_empty() {
-                    return Ok(true);
-                }
-                let mut builder = ConfigEditsBuilder::new(&self.config.codex_home)
-                    .with_profile(self.active_profile.as_deref());
-                for (feature, enabled) in &updates {
-                    let feature_key = feature.key();
-                    if *enabled {
-                        // Update the in-memory configs.
-                        self.config.features.enable(*feature);
-                        self.chat_widget.set_feature_enabled(*feature, true);
-                        builder = builder.set_feature_enabled(feature_key, true);
-                    } else {
-                        // Update the in-memory configs.
-                        self.config.features.disable(*feature);
-                        self.chat_widget.set_feature_enabled(*feature, false);
-                        if feature.default_enabled() {
-                            builder = builder.set_feature_enabled(feature_key, false);
-                        } else {
-                            // If the feature already default to `false`, we drop the key
-                            // in the config file so that the user does not miss the feature
-                            // once it gets globally released.
-                            builder = builder.with_edits(vec![ConfigEdit::ClearPath {
-                                segments: vec!["features".to_string(), feature_key.to_string()],
-                            }]);
-                        }
-                    }
-                }
-                if let Err(err) = builder.apply().await {
-                    tracing::error!(error = %err, "failed to persist feature flags");
-                    self.chat_widget.add_error_message(format!(
-                        "Failed to update experimental features: {err}"
-                    ));
-                }
-            }
             AppEvent::SkipNextWorldWritableScan => {
                 self.skip_world_writable_scan_once = true;
             }
@@ -1146,15 +2257,75 @@ impl App {
                 kind: KeyEventKind::Press,
                 ..
             } => {
-                // Enter alternate screen and set viewport to full size.
                 let _ = tui.enter_alt_screen();
                 self.overlay = Some(Overlay::new_transcript(self.transcript_cells.clone()));
                 tui.frame_requester().schedule_frame();
+                return;
             }
-            // Esc primes/advances backtracking only in normal (not working) mode
-            // with the composer focused and empty. In any other state, forward
-            // Esc so the active UI (e.g. status indicator, modals, popups)
-            // handles it.
+            KeyEvent {
+                code: KeyCode::Char('x' | 'q'),
+                modifiers: crossterm::event::KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                self.open_or_refresh_session_picker(tui);
+                return;
+            }
+            KeyEvent {
+                code: KeyCode::Char('g'),
+                modifiers: crossterm::event::KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                match crate::git_graph_widget::create_git_graph_overlay(".") {
+                    Ok(overlay) => {
+                        let _ = tui.enter_alt_screen();
+                        self.overlay = Some(overlay);
+                        tui.frame_requester().schedule_frame();
+                    }
+                    Err(err) => {
+                        let error_lines = vec![
+                            "Failed to generate git graph:".red().into(),
+                            Line::from(""),
+                            err.clone().dim().into(),
+                            Line::from(""),
+                            "Make sure you are in a git repository.".italic().into(),
+                        ];
+                        let _ = tui.enter_alt_screen();
+                        self.overlay = Some(Overlay::new_static_with_lines(
+                            error_lines,
+                            "G I T   G R A P H   E R R O R".to_string(),
+                        ));
+                        tui.frame_requester().schedule_frame();
+                        tracing::warn!("Failed to create git graph: {err}");
+                    }
+                }
+                return;
+            }
+            KeyEvent {
+                code: KeyCode::Char('p'),
+                modifiers: crossterm::event::KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                self.panel_focus = PanelFocus::Sessions;
+                self.session_bar.set_focus(true);
+                self.session_bar.refresh_sessions();
+                let current_id = self.chat_widget.conversation_id().map(|id| id.to_string());
+                self.session_bar
+                    .reset_selection_for_focus(current_id.as_deref());
+                tui.frame_requester().schedule_frame();
+                return;
+            }
+            _ => {}
+        }
+
+        if self.panel_focus == PanelFocus::Sessions {
+            self.handle_session_bar_key_event(tui, key_event).await;
+            return;
+        }
+
+        match key_event {
             KeyEvent {
                 code: KeyCode::Esc,
                 kind: KeyEventKind::Press | KeyEventKind::Repeat,
@@ -1168,6 +2339,95 @@ impl App {
                     self.chat_widget.handle_key_event(key_event);
                 }
             }
+            KeyEvent {
+                code: KeyCode::Char('y'),
+                modifiers: crossterm::event::KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            } => {
+                self.copy_transcript_selection(tui);
+            }
+            KeyEvent {
+                code: KeyCode::PageUp,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            } => {
+                let size = tui.terminal.last_known_screen_size;
+                let width = size.width;
+                let height = size.height;
+                if width > 0 && height > 0 {
+                    let session_height = 4u16.min(height);
+                    let available_for_chat = height.saturating_sub(session_height);
+                    let chat_height = self
+                        .chat_widget
+                        .desired_height(width)
+                        .min(available_for_chat);
+                    let reserved = chat_height.saturating_add(session_height);
+                    if reserved < height {
+                        let transcript_height = height.saturating_sub(reserved);
+                        if transcript_height > 0 {
+                            let delta = -i32::from(transcript_height);
+                            self.scroll_transcript(
+                                tui,
+                                delta,
+                                usize::from(transcript_height),
+                                width,
+                            );
+                        }
+                    }
+                }
+            }
+            KeyEvent {
+                code: KeyCode::PageDown,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            } => {
+                let size = tui.terminal.last_known_screen_size;
+                let width = size.width;
+                let height = size.height;
+                if width > 0 && height > 0 {
+                    let session_height = 4u16.min(height);
+                    let available_for_chat = height.saturating_sub(session_height);
+                    let chat_height = self
+                        .chat_widget
+                        .desired_height(width)
+                        .min(available_for_chat);
+                    let reserved = chat_height.saturating_add(session_height);
+                    if reserved < height {
+                        let transcript_height = height.saturating_sub(reserved);
+                        if transcript_height > 0 {
+                            let delta = i32::from(transcript_height);
+                            self.scroll_transcript(
+                                tui,
+                                delta,
+                                usize::from(transcript_height),
+                                width,
+                            );
+                        }
+                    }
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Home,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            } => {
+                if !self.transcript_cells.is_empty() {
+                    self.transcript_scroll = TranscriptScroll::Scrolled {
+                        cell_index: 0,
+                        line_in_cell: 0,
+                    };
+                    tui.frame_requester().schedule_frame();
+                }
+            }
+            KeyEvent {
+                code: KeyCode::End,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            } => {
+                self.transcript_scroll = TranscriptScroll::ToBottom;
+                tui.frame_requester().schedule_frame();
+            }
             // Enter confirms backtrack when primed + count > 0. Otherwise pass to widget.
             KeyEvent {
                 code: KeyCode::Enter,
@@ -1177,25 +2437,179 @@ impl App {
                 && self.backtrack.nth_user_message != usize::MAX
                 && self.chat_widget.composer_is_empty() =>
             {
-                // Delegate to helper for clarity; preserves behavior.
                 self.confirm_backtrack_from_main();
             }
             KeyEvent {
                 kind: KeyEventKind::Press | KeyEventKind::Repeat,
                 ..
             } => {
-                // Any non-Esc key press should cancel a primed backtrack.
-                // This avoids stale "Esc-primed" state after the user starts typing
-                // (even if they later backspace to empty).
                 if key_event.code != KeyCode::Esc && self.backtrack.primed {
                     self.reset_backtrack_state();
                 }
                 self.chat_widget.handle_key_event(key_event);
             }
-            _ => {
-                // Ignore Release key events.
+            _ => {}
+        }
+    }
+
+    async fn handle_session_bar_key_event(&mut self, tui: &mut tui::Tui, key_event: KeyEvent) {
+        if matches!(key_event.kind, KeyEventKind::Release) {
+            return;
+        }
+
+        match key_event {
+            KeyEvent {
+                code: KeyCode::Esc,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            } => {
+                self.panel_focus = PanelFocus::Chat;
+                self.session_bar.set_focus(false);
+                tui.frame_requester().schedule_frame();
             }
-        };
+            KeyEvent {
+                code: KeyCode::Left,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            } => {
+                self.session_bar.select_previous();
+                tui.frame_requester().schedule_frame();
+            }
+            KeyEvent {
+                code: KeyCode::Right,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            } => {
+                self.session_bar.select_next();
+                tui.frame_requester().schedule_frame();
+            }
+            KeyEvent {
+                code: KeyCode::Enter,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                if self.chat_widget.is_task_running() {
+                    self.chat_widget.add_error_message(
+                        "Cannot switch sessions while a task is running.".to_string(),
+                    );
+                    return;
+                }
+
+                if self.session_bar.selected_is_new() {
+                    self.app_event_tx.send(AppEvent::NewSession);
+                } else if let Some(session) = self.session_bar.selected_session() {
+                    self.app_event_tx
+                        .send(AppEvent::ResumeSession(session.path.clone()));
+                } else {
+                    self.chat_widget
+                        .add_error_message("No session selected.".to_string());
+                    return;
+                }
+
+                self.panel_focus = PanelFocus::Chat;
+                self.session_bar.set_focus(false);
+                tui.frame_requester().schedule_frame();
+            }
+            KeyEvent {
+                code: KeyCode::Char('n'),
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                if self.chat_widget.is_task_running() {
+                    self.chat_widget.add_error_message(
+                        "Cannot start a new session while a task is running.".to_string(),
+                    );
+                    return;
+                }
+                self.app_event_tx.send(AppEvent::NewSession);
+                self.panel_focus = PanelFocus::Chat;
+                self.session_bar.set_focus(false);
+                tui.frame_requester().schedule_frame();
+            }
+            KeyEvent {
+                code: KeyCode::Char('r'),
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                if self.chat_widget.is_task_running() {
+                    self.chat_widget.add_error_message(
+                        "Cannot rename a session while a task is running.".to_string(),
+                    );
+                    return;
+                }
+
+                let Some(session) = self.session_bar.selected_session() else {
+                    self.chat_widget
+                        .add_error_message("No session selected to rename.".to_string());
+                    return;
+                };
+
+                let session_id = session.id.clone();
+                let app_tx = self.app_event_tx.clone();
+                self.chat_widget.show_session_alias_input_for_rename(
+                    session_id,
+                    Box::new(move |sid, alias| {
+                        app_tx.send(AppEvent::SaveSessionAlias {
+                            session_id: sid,
+                            alias,
+                        });
+                    }),
+                );
+
+                self.panel_focus = PanelFocus::Chat;
+                self.session_bar.set_focus(false);
+                tui.frame_requester().schedule_frame();
+            }
+            KeyEvent {
+                code: KeyCode::Char('c'),
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                if self.chat_widget.is_task_running() {
+                    self.chat_widget.add_error_message(
+                        "Cannot clone a session while a task is running.".to_string(),
+                    );
+                    return;
+                }
+
+                let Some(session) = self.session_bar.selected_session() else {
+                    self.chat_widget
+                        .add_error_message("No session selected to clone.".to_string());
+                    return;
+                };
+
+                self.app_event_tx
+                    .send(AppEvent::CloneSession(session.path.clone()));
+
+                self.panel_focus = PanelFocus::Chat;
+                self.session_bar.set_focus(false);
+                tui.frame_requester().schedule_frame();
+            }
+            KeyEvent {
+                code: KeyCode::Char('x'),
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                if self.chat_widget.is_task_running() {
+                    self.chat_widget.add_error_message(
+                        "Cannot delete a session while a task is running.".to_string(),
+                    );
+                    return;
+                }
+
+                if !self.session_bar.selected_is_new()
+                    && let Some(session) = self.session_bar.selected_session()
+                {
+                    let session_path = session.path.clone();
+                    let session_id = session.id.clone();
+                    let _ = std::fs::remove_file(&session_path);
+                    self.session_bar.remove_session_alias(&session_id);
+                    self.session_bar.refresh_sessions();
+                    tui.frame_requester().schedule_frame();
+                }
+            }
+            _ => {}
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -1227,6 +2641,108 @@ impl App {
     }
 }
 
+struct CxresumeIdleLoader {
+    idle_after: Duration,
+    last_activity: Instant,
+    job_in_flight: bool,
+    cooldown_until: Option<Instant>,
+    pending_check: Option<JoinHandle<()>>,
+}
+
+impl CxresumeIdleLoader {
+    fn new(idle_after: Duration) -> Self {
+        Self {
+            idle_after,
+            last_activity: Instant::now(),
+            job_in_flight: false,
+            cooldown_until: None,
+            pending_check: None,
+        }
+    }
+
+    fn on_user_activity(&mut self, tx: &AppEventSender) {
+        self.last_activity = Instant::now();
+        if !self.job_in_flight {
+            self.schedule_after(tx, self.idle_after);
+        }
+    }
+
+    fn handle_idle_check(&mut self, overlay_active: bool, tx: &AppEventSender) -> bool {
+        if self.job_in_flight {
+            return false;
+        }
+        if overlay_active {
+            self.schedule_after(tx, self.idle_after);
+            return false;
+        }
+
+        let now = Instant::now();
+        if let Some(deadline) = self.cooldown_until
+            && now < deadline
+        {
+            let remaining = deadline.saturating_duration_since(now);
+            self.schedule_after(tx, remaining);
+            return false;
+        }
+
+        let since_activity = now.saturating_duration_since(self.last_activity);
+        if since_activity < self.idle_after {
+            let remaining = self.idle_after - since_activity;
+            self.schedule_after(tx, remaining);
+            return false;
+        }
+
+        self.job_in_flight = true;
+        self.cancel_pending();
+        true
+    }
+
+    fn job_complete(&mut self, tx: &AppEventSender, success: bool) {
+        self.job_in_flight = false;
+        self.last_activity = Instant::now();
+        let cooldown = if success {
+            Duration::from_secs(300)
+        } else {
+            Duration::from_secs(60)
+        };
+        self.cooldown_until = Some(self.last_activity + cooldown);
+        self.schedule_after(tx, cooldown);
+    }
+
+    fn cancel_pending(&mut self) {
+        if let Some(handle) = self.pending_check.take() {
+            handle.abort();
+        }
+    }
+
+    fn schedule_after(&mut self, tx: &AppEventSender, delay: Duration) {
+        if self.job_in_flight {
+            return;
+        }
+        self.cancel_pending();
+        let tx = tx.clone();
+        self.pending_check = Some(tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            tx.send(AppEvent::CxresumeIdleCheck);
+        }));
+    }
+
+    fn trigger_immediate(&mut self, tx: &AppEventSender) {
+        if self.job_in_flight {
+            return;
+        }
+        self.last_activity = Instant::now()
+            .checked_sub(self.idle_after)
+            .unwrap_or_else(Instant::now);
+        self.schedule_after(tx, Duration::ZERO);
+    }
+}
+
+impl Drop for CxresumeIdleLoader {
+    fn drop(&mut self) {
+        self.cancel_pending();
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1247,6 +2763,7 @@ mod tests {
     use codex_core::protocol::SandboxPolicy;
     use codex_core::protocol::SessionConfiguredEvent;
     use codex_protocol::ConversationId;
+    use pretty_assertions::assert_eq;
     use ratatui::prelude::Line;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -1263,6 +2780,7 @@ mod tests {
         let auth_manager =
             AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
         let file_search = FileSearchManager::new(config.cwd.clone(), app_event_tx.clone());
+        let session_bar = SessionBar::new(config.codex_home.clone(), config.cwd.clone());
 
         App {
             server,
@@ -1274,16 +2792,24 @@ mod tests {
             active_profile: None,
             file_search,
             transcript_cells: Vec::new(),
+            transcript_scroll: TranscriptScroll::default(),
+            transcript_selection: TranscriptSelection::default(),
+            transcript_view_top: 0,
+            transcript_total_lines: 0,
             overlay: None,
             deferred_history_lines: Vec::new(),
             has_emitted_history_lines: false,
             enhanced_keys_supported: false,
             commit_anim_running: Arc::new(AtomicBool::new(false)),
             backtrack: BacktrackState::default(),
+            cxresume_cache: None,
+            cxresume_idle: CxresumeIdleLoader::new(Duration::from_secs(2)),
             feedback: codex_feedback::CodexFeedback::new(),
             pending_update_action: None,
             suppress_shutdown_complete: false,
             skip_world_writable_scan_once: false,
+            session_bar,
+            panel_focus: PanelFocus::Chat,
         }
     }
 
@@ -1302,6 +2828,7 @@ mod tests {
         let auth_manager =
             AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
         let file_search = FileSearchManager::new(config.cwd.clone(), app_event_tx.clone());
+        let session_bar = SessionBar::new(config.codex_home.clone(), config.cwd.clone());
 
         (
             App {
@@ -1314,16 +2841,24 @@ mod tests {
                 active_profile: None,
                 file_search,
                 transcript_cells: Vec::new(),
+                transcript_scroll: TranscriptScroll::default(),
+                transcript_selection: TranscriptSelection::default(),
+                transcript_view_top: 0,
+                transcript_total_lines: 0,
                 overlay: None,
                 deferred_history_lines: Vec::new(),
                 has_emitted_history_lines: false,
                 enhanced_keys_supported: false,
                 commit_anim_running: Arc::new(AtomicBool::new(false)),
                 backtrack: BacktrackState::default(),
+                cxresume_cache: None,
+                cxresume_idle: CxresumeIdleLoader::new(Duration::from_secs(2)),
                 feedback: codex_feedback::CodexFeedback::new(),
                 pending_update_action: None,
                 suppress_shutdown_complete: false,
                 skip_world_writable_scan_once: false,
+                session_bar,
+                panel_focus: PanelFocus::Chat,
             },
             rx,
             op_rx,
@@ -1385,34 +2920,6 @@ mod tests {
             &seen,
             &all_model_presets()
         ));
-    }
-
-    #[tokio::test]
-    async fn model_migration_prompt_skips_when_target_missing() {
-        let mut available = all_model_presets();
-        let mut current = available
-            .iter()
-            .find(|preset| preset.model == "gpt-5-codex")
-            .cloned()
-            .expect("preset present");
-        current.upgrade = Some(ModelUpgrade {
-            id: "missing-target".to_string(),
-            reasoning_effort_mapping: None,
-            migration_config_key: HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG.to_string(),
-            model_link: None,
-            upgrade_copy: None,
-        });
-        available.retain(|preset| preset.model != "gpt-5-codex");
-        available.push(current.clone());
-
-        assert!(should_show_model_migration_prompt(
-            &current.model,
-            "missing-target",
-            &BTreeMap::new(),
-            &available,
-        ));
-
-        assert!(target_preset_for_upgrade(&available, "missing-target").is_none());
     }
 
     #[tokio::test]
@@ -1503,6 +3010,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transcript_selection_moves_with_scroll() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        let mut app = make_test_app().await;
+        app.transcript_total_lines = 3;
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 2,
+        };
+
+        // Anchor selection to logical line 1, columns 2..4.
+        app.transcript_selection = TranscriptSelection {
+            anchor: Some(TranscriptSelectionPoint {
+                line_index: 1,
+                column: 2,
+            }),
+            head: Some(TranscriptSelectionPoint {
+                line_index: 1,
+                column: 4,
+            }),
+        };
+
+        // First render: top of view is line 0, so line 1 maps to the second row.
+        app.transcript_view_top = 0;
+        let mut buf = Buffer::empty(area);
+        for x in 2..area.width {
+            buf[(x, 0)].set_symbol("A");
+            buf[(x, 1)].set_symbol("B");
+        }
+
+        app.apply_transcript_selection(area, &mut buf);
+
+        // No selection should be applied to the first row when the view is anchored at the top.
+        for x in 0..area.width {
+            let cell = &buf[(x, 0)];
+            assert!(cell.style().add_modifier.is_empty());
+        }
+
+        // After scrolling down by one line, the same logical line should now be
+        // rendered on the first row, and the highlight should move with it.
+        app.transcript_view_top = 1;
+        let mut buf_scrolled = Buffer::empty(area);
+        for x in 2..area.width {
+            buf_scrolled[(x, 0)].set_symbol("B");
+            buf_scrolled[(x, 1)].set_symbol("C");
+        }
+
+        app.apply_transcript_selection(area, &mut buf_scrolled);
+
+        // After scrolling, the selection should now be applied on the first row rather than the
+        // second.
+        for x in 0..area.width {
+            let cell = &buf_scrolled[(x, 1)];
+            assert!(cell.style().add_modifier.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn wrapped_line_meta_tracks_visual_lines() {
+        let lines = vec![Line::from("abcd efgh")];
+        let line_meta = vec![TranscriptLineMeta::CellLine {
+            cell_index: 0,
+            line_in_cell: 0,
+        }];
+
+        let wrapped_meta = App::build_wrapped_line_meta(&lines, &line_meta, 4);
+
+        assert_eq!(
+            wrapped_meta,
+            vec![
+                TranscriptLineMeta::CellLine {
+                    cell_index: 0,
+                    line_in_cell: 0,
+                },
+                TranscriptLineMeta::CellLine {
+                    cell_index: 0,
+                    line_in_cell: 1,
+                },
+            ],
+        );
+    }
+
+    #[tokio::test]
     async fn new_session_requests_shutdown_for_previous_conversation() {
         let (mut app, mut app_event_rx, mut op_rx) = make_test_app_with_channels().await;
 
@@ -1542,6 +3136,22 @@ mod tests {
     #[tokio::test]
     async fn session_summary_skip_zero_usage() {
         assert!(session_summary(TokenUsage::default(), None).is_none());
+    }
+
+    #[tokio::test]
+    async fn render_lines_to_ansi_pads_user_rows_to_full_width() {
+        let line: Line<'static> = Line::from("hi");
+        let lines = vec![line];
+        let line_meta = vec![TranscriptLineMeta::CellLine {
+            cell_index: 0,
+            line_in_cell: 0,
+        }];
+        let is_user_cell = vec![true];
+        let width: u16 = 10;
+
+        let rendered = App::render_lines_to_ansi(&lines, &line_meta, &is_user_cell, width);
+        assert_eq!(rendered.len(), 1);
+        assert!(rendered[0].contains("hi"));
     }
 
     #[tokio::test]

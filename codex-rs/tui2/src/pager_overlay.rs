@@ -228,7 +228,9 @@ impl SessionPickerOverlay {
                     crate::cxresume_picker_widget::render_picker_view(frame, &self.picker_state);
                 })?;
                 if self.picker_state.advance_animation() {
-                    tui.frame_requester().schedule_frame();
+                    // Use 100ms delay for tumix status animation to reduce GPU load
+                    tui.frame_requester()
+                        .schedule_frame_in(std::time::Duration::from_millis(100));
                 }
                 Ok(())
             }
@@ -783,8 +785,9 @@ impl PagerView {
                 return Ok(());
             }
         }
+        // Use 50ms instead of 16ms to reduce GPU load while still feeling responsive
         tui.frame_requester()
-            .schedule_frame_in(Duration::from_millis(16));
+            .schedule_frame_in(Duration::from_millis(50));
         Ok(())
     }
 
@@ -801,8 +804,9 @@ impl PagerView {
                 return Ok(());
             }
         }
+        // Use 50ms instead of 16ms to reduce GPU load while still feeling responsive
         tui.frame_requester()
-            .schedule_frame_in(Duration::from_millis(16));
+            .schedule_frame_in(Duration::from_millis(50));
         Ok(())
     }
 

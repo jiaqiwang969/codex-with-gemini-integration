@@ -1,4 +1,6 @@
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -13,12 +15,40 @@ use crate::terminal_palette::default_fg;
 
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 
+/// Global flag to disable shimmer animation for low GPU mode.
+/// When true, shimmer_spans returns simple bold text instead of RGB animation.
+static SHIMMER_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// Disable shimmer animation globally to reduce GPU usage.
+pub fn disable_shimmer() {
+    SHIMMER_DISABLED.store(true, Ordering::Relaxed);
+}
+
+/// Check if shimmer is currently disabled.
+pub fn is_shimmer_disabled() -> bool {
+    SHIMMER_DISABLED.load(Ordering::Relaxed)
+}
+
 fn elapsed_since_start() -> Duration {
     let start = PROCESS_START.get_or_init(Instant::now);
     start.elapsed()
 }
 
+/// Returns simple non-animated spans when shimmer is disabled.
+/// This significantly reduces GPU load by avoiding per-character RGB colors.
+pub(crate) fn simple_spans(text: &str) -> Vec<Span<'static>> {
+    vec![Span::styled(
+        text.to_string(),
+        Style::default().add_modifier(Modifier::BOLD),
+    )]
+}
+
 pub(crate) fn shimmer_spans(text: &str) -> Vec<Span<'static>> {
+    // Fast path: return simple spans if shimmer is disabled
+    if is_shimmer_disabled() {
+        return simple_spans(text);
+    }
+
     let chars: Vec<char> = text.chars().collect();
     if chars.is_empty() {
         return Vec::new();
@@ -26,7 +56,8 @@ pub(crate) fn shimmer_spans(text: &str) -> Vec<Span<'static>> {
     // Use time-based sweep synchronized to process start.
     let padding = 10usize;
     let period = chars.len() + padding * 2;
-    let sweep_seconds = 2.0f32;
+    // Slower sweep (3s instead of 2s) reduces the visual change rate and GPU load
+    let sweep_seconds = 3.0f32;
     let pos_f =
         (elapsed_since_start().as_secs_f32() % sweep_seconds) / sweep_seconds * (period as f32);
     let pos = pos_f as usize;

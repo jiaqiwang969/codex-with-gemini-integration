@@ -12,15 +12,6 @@ pub(crate) fn selection_option_row(
     label: String,
     is_selected: bool,
 ) -> Box<dyn Renderable> {
-    selection_option_row_with_dim(index, label, is_selected, false)
-}
-
-pub(crate) fn selection_option_row_with_dim(
-    index: usize,
-    label: String,
-    is_selected: bool,
-    dim: bool,
-) -> Box<dyn Renderable> {
     let prefix = if is_selected {
         format!("› {}. ", index + 1)
     } else {
@@ -28,8 +19,6 @@ pub(crate) fn selection_option_row_with_dim(
     };
     let style = if is_selected {
         Style::default().cyan()
-    } else if dim {
-        Style::default().dim()
     } else {
         Style::default()
     };
