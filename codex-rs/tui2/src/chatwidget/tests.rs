@@ -66,6 +66,7 @@ use tempfile::NamedTempFile;
 use tempfile::tempdir;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::unbounded_channel;
+use toml::Value as TomlValue;
 
 #[cfg(target_os = "windows")]
 fn set_windows_sandbox_enabled(enabled: bool) {
@@ -77,6 +78,10 @@ async fn test_config() -> Config {
     let codex_home = std::env::temp_dir();
     ConfigBuilder::default()
         .codex_home(codex_home.clone())
+        .cli_overrides(vec![(
+            "tui.animations".to_string(),
+            TomlValue::Boolean(true),
+        )])
         .build()
         .await
         .expect("config")

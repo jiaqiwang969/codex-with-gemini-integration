@@ -9,7 +9,6 @@ use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::Widget;
 use unicode_width::UnicodeWidthChar;
-use unicode_width::UnicodeWidthStr;
 
 use crate::key_hint::KeyBinding;
 
@@ -20,79 +19,8 @@ pub(crate) struct GenericDisplayRow {
     pub name: String,
     pub display_shortcut: Option<KeyBinding>,
     pub match_indices: Option<Vec<usize>>, // indices to bold (char positions)
-    pub description: Option<String>,       // optional grey text after the name
-    pub wrap_indent: Option<usize>,        // optional indent for wrapped lines
-}
-
-fn line_width(line: &Line<'_>) -> usize {
-    line.iter()
-        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-        .sum()
-}
-
-fn truncate_line_to_width(line: Line<'static>, max_width: usize) -> Line<'static> {
-    if max_width == 0 {
-        return Line::from(Vec::<Span<'static>>::new());
-    }
-
-    let mut used = 0usize;
-    let mut spans_out: Vec<Span<'static>> = Vec::new();
-
-    for span in line.spans {
-        let text = span.content.into_owned();
-        let style = span.style;
-        let span_width = UnicodeWidthStr::width(text.as_str());
-
-        if span_width == 0 {
-            spans_out.push(Span::styled(text, style));
-            continue;
-        }
-
-        if used >= max_width {
-            break;
-        }
-
-        if used + span_width <= max_width {
-            used += span_width;
-            spans_out.push(Span::styled(text, style));
-            continue;
-        }
-
-        let mut truncated = String::new();
-        for ch in text.chars() {
-            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if used + ch_width > max_width {
-                break;
-            }
-            truncated.push(ch);
-            used += ch_width;
-        }
-
-        if !truncated.is_empty() {
-            spans_out.push(Span::styled(truncated, style));
-        }
-
-        break;
-    }
-
-    Line::from(spans_out)
-}
-
-fn truncate_line_with_ellipsis_if_overflow(line: Line<'static>, max_width: usize) -> Line<'static> {
-    if max_width == 0 {
-        return Line::from(Vec::<Span<'static>>::new());
-    }
-
-    let width = line_width(&line);
-    if width <= max_width {
-        return line;
-    }
-
-    let truncated = truncate_line_to_width(line, max_width.saturating_sub(1));
-    let mut spans = truncated.spans;
-    let ellipsis_style = spans.last().map(|span| span.style).unwrap_or_default();
-    spans.push(Span::styled("…", ellipsis_style));
-    Line::from(spans)
+    pub is_current: bool,
+    pub description: Option<String>, // optional grey text after the name
 }
 
 /// Compute a shared description-column start based on the widest visible name
@@ -119,30 +47,13 @@ fn compute_desc_col(
     desc_col
 }
 
-/// Determine how many spaces to indent wrapped lines for a row.
-fn wrap_indent(row: &GenericDisplayRow, desc_col: usize, max_width: u16) -> usize {
-    let max_indent = max_width.saturating_sub(1) as usize;
-    let indent = row.wrap_indent.unwrap_or_else(|| {
-        if row.description.is_some() {
-            desc_col
-        } else {
-            0
-        }
-    });
-    indent.min(max_indent)
-}
-
 /// Build the full display line for a row with the description padded to start
 /// at `desc_col`. Applies fuzzy-match bolding when indices are present and
 /// dims the description.
 fn build_full_line(row: &GenericDisplayRow, desc_col: usize) -> Line<'static> {
     // Enforce single-line name: allow at most desc_col - 2 cells for name,
     // reserving two spaces before the description column.
-    let name_limit = row
-        .description
-        .as_ref()
-        .map(|_| desc_col.saturating_sub(2))
-        .unwrap_or(usize::MAX);
+    let name_limit = desc_col.saturating_sub(2);
 
     let mut name_spans: Vec<Span> = Vec::with_capacity(row.name.len());
     let mut used_width = 0usize;
@@ -152,12 +63,11 @@ fn build_full_line(row: &GenericDisplayRow, desc_col: usize) -> Line<'static> {
         let mut idx_iter = idxs.iter().peekable();
         for (char_idx, ch) in row.name.chars().enumerate() {
             let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
-            let next_width = used_width.saturating_add(ch_w);
-            if next_width > name_limit {
+            if used_width + ch_w > name_limit {
                 truncated = true;
                 break;
             }
-            used_width = next_width;
+            used_width += ch_w;
 
             if idx_iter.peek().is_some_and(|next| **next == char_idx) {
                 idx_iter.next();
@@ -169,12 +79,11 @@ fn build_full_line(row: &GenericDisplayRow, desc_col: usize) -> Line<'static> {
     } else {
         for ch in row.name.chars() {
             let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
-            let next_width = used_width.saturating_add(ch_w);
-            if next_width > name_limit {
+            if used_width + ch_w > name_limit {
                 truncated = true;
                 break;
             }
-            used_width = next_width;
+            used_width += ch_w;
             name_spans.push(ch.to_string().into());
         }
     }
@@ -252,7 +161,24 @@ pub(crate) fn render_rows(
             break;
         }
 
-        let mut full_line = build_full_line(row, desc_col);
+        let GenericDisplayRow {
+            name,
+            match_indices,
+            display_shortcut,
+            is_current: _is_current,
+            description,
+        } = row;
+
+        let mut full_line = build_full_line(
+            &GenericDisplayRow {
+                name: name.clone(),
+                match_indices: match_indices.clone(),
+                display_shortcut: *display_shortcut,
+                is_current: *_is_current,
+                description: description.clone(),
+            },
+            desc_col,
+        );
         if Some(i) == state.selected_idx {
             // Match previous behavior: cyan + bold for the selected row.
             // Reset the style first to avoid inheriting dim from keyboard shortcuts.
@@ -264,10 +190,9 @@ pub(crate) fn render_rows(
         // Wrap with subsequent indent aligned to the description column.
         use crate::wrapping::RtOptions;
         use crate::wrapping::word_wrap_line;
-        let continuation_indent = wrap_indent(row, desc_col, area.width);
         let options = RtOptions::new(area.width as usize)
             .initial_indent(Line::from(""))
-            .subsequent_indent(Line::from(" ".repeat(continuation_indent)));
+            .subsequent_indent(Line::from(" ".repeat(desc_col)));
         let wrapped = word_wrap_line(&full_line, options);
 
         // Render the wrapped lines.
@@ -286,72 +211,6 @@ pub(crate) fn render_rows(
             );
             cur_y = cur_y.saturating_add(1);
         }
-    }
-}
-
-/// Render rows as a single line each (no wrapping), truncating overflow with an ellipsis.
-pub(crate) fn render_rows_single_line(
-    area: Rect,
-    buf: &mut Buffer,
-    rows_all: &[GenericDisplayRow],
-    state: &ScrollState,
-    max_results: usize,
-    empty_message: &str,
-) {
-    if rows_all.is_empty() {
-        if area.height > 0 {
-            Line::from(empty_message.dim().italic()).render(area, buf);
-        }
-        return;
-    }
-
-    let visible_items = max_results
-        .min(rows_all.len())
-        .min(area.height.max(1) as usize);
-
-    let mut start_idx = state.scroll_top.min(rows_all.len().saturating_sub(1));
-    if let Some(sel) = state.selected_idx {
-        if sel < start_idx {
-            start_idx = sel;
-        } else if visible_items > 0 {
-            let bottom = start_idx + visible_items - 1;
-            if sel > bottom {
-                start_idx = sel + 1 - visible_items;
-            }
-        }
-    }
-
-    let desc_col = compute_desc_col(rows_all, start_idx, visible_items, area.width);
-
-    let mut cur_y = area.y;
-    for (i, row) in rows_all
-        .iter()
-        .enumerate()
-        .skip(start_idx)
-        .take(visible_items)
-    {
-        if cur_y >= area.y + area.height {
-            break;
-        }
-
-        let mut full_line = build_full_line(row, desc_col);
-        if Some(i) == state.selected_idx {
-            full_line.spans.iter_mut().for_each(|span| {
-                span.style = Style::default().fg(Color::Cyan).bold();
-            });
-        }
-
-        let full_line = truncate_line_with_ellipsis_if_overflow(full_line, area.width as usize);
-        full_line.render(
-            Rect {
-                x: area.x,
-                y: cur_y,
-                width: area.width,
-                height: 1,
-            },
-            buf,
-        );
-        cur_y = cur_y.saturating_add(1);
     }
 }
 
@@ -397,12 +256,10 @@ pub(crate) fn measure_rows_height(
         .map(|(_, r)| r)
     {
         let full_line = build_full_line(row, desc_col);
-        let continuation_indent = wrap_indent(row, desc_col, content_width);
         let opts = RtOptions::new(content_width as usize)
             .initial_indent(Line::from(""))
-            .subsequent_indent(Line::from(" ".repeat(continuation_indent)));
-        let wrapped_lines = word_wrap_line(&full_line, opts).len();
-        total = total.saturating_add(wrapped_lines as u16);
+            .subsequent_indent(Line::from(" ".repeat(desc_col)));
+        total = total.saturating_add(word_wrap_line(&full_line, opts).len() as u16);
     }
     total.max(1)
 }

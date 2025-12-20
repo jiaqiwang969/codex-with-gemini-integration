@@ -5,6 +5,7 @@ use codex_core::protocol::ConversationPathResponseEvent;
 use codex_core::protocol::Event;
 use codex_core::protocol::RateLimitSnapshot;
 use codex_file_search::FileMatch;
+use codex_multi_agent::DelegateEvent;
 use codex_protocol::openai_models::ModelPreset;
 
 use crate::bottom_pane::ApprovalRequest;
@@ -19,33 +20,17 @@ use codex_protocol::openai_models::ReasoningEffort;
 #[derive(Debug)]
 pub(crate) enum AppEvent {
     CodexEvent(Event),
+    /// Event tagged with its source conversation id for routing/guarding
+    CodexEventFor {
+        conversation_id: String,
+        event: Event,
+    },
 
     /// Start a new session.
     NewSession,
 
     /// Resume an existing session from a saved rollout file.
     ResumeSession(PathBuf),
-
-    /// Persist a user-defined alias for a session id.
-    SaveSessionAlias {
-        session_id: String,
-        alias: String,
-    },
-
-    /// Clone an existing session rollout into a new session.
-    CloneSession(PathBuf),
-
-    /// Open the resume picker inside the running TUI session.
-    OpenResumePicker,
-
-    /// Triggered after a period without user interaction to prewarm cxresume state.
-    CxresumeIdleCheck,
-
-    /// Result of background cxresume prewarm.
-    CxresumePrewarmReady(PickerState),
-
-    /// Background cxresume prewarm failed.
-    CxresumePrewarmFailed(String),
 
     /// Request to exit the application gracefully.
     ExitRequest,
@@ -54,11 +39,21 @@ pub(crate) enum AppEvent {
     /// bubbling channels through layers of widgets.
     CodexOp(codex_core::protocol::Op),
 
+    /// Update emitted from the orchestrator about delegate progress/completion.
+    DelegateUpdate(DelegateEvent),
+
+    /// Request to launch a Tumix run using delegate-style UI wiring.
+    TumixRunRequested {
+        run_id: String,
+        session_id: String,
+        user_prompt: Option<String>,
+        display_prompt: String,
+    },
+
     /// Kick off an asynchronous file search for the given query (text after
     /// the `@`). Previous searches may be cancelled by the app layer so there
     /// is at most one in-flight search.
     StartFileSearch(String),
-
     /// Result of a completed asynchronous file search. The `query` echoes the
     /// original search term so the UI can decide whether the results are
     /// still relevant.
@@ -96,7 +91,7 @@ pub(crate) enum AppEvent {
         model: ModelPreset,
     },
 
-    /// Open the full model picker (non-auto models).
+    /// Open the full model list after selecting "All models".
     OpenAllModelsPopup {
         models: Vec<ModelPreset>,
     },
@@ -161,8 +156,7 @@ pub(crate) enum AppEvent {
 
     /// Persist the acknowledgement flag for the model migration prompt.
     PersistModelMigrationPromptAcknowledged {
-        from_model: String,
-        to_model: String,
+        migration_config: String,
     },
 
     /// Skip the next world-writable scan (one-shot) after a user-confirmed continue.
@@ -171,6 +165,21 @@ pub(crate) enum AppEvent {
 
     /// Re-open the approval presets popup.
     OpenApprovalsPopup,
+
+    /// Request to open the delegate session picker.
+    OpenDelegatePicker,
+
+    /// Switch into the provided delegate session.
+    EnterDelegateSession(String),
+
+    /// Return from the active delegate session to the main agent.
+    ExitDelegateSession,
+
+    /// Dismiss a detached delegate run from the registry.
+    DismissDetachedRun(String),
+
+    /// Inject text into the main composer as if the user typed it.
+    InsertUserTextMessage(String),
 
     /// Forwarded conversation history snapshot from the current conversation.
     ConversationHistory(ConversationPathResponseEvent),
@@ -187,6 +196,15 @@ pub(crate) enum AppEvent {
     /// Open the approval popup.
     FullScreenApprovalRequest(ApprovalRequest),
 
+    /// Triggered after a period without user interaction to prewarm cxresume state.
+    CxresumeIdleCheck,
+
+    /// Result of background cxresume prewarm.
+    CxresumePrewarmReady(PickerState),
+
+    /// Background cxresume prewarm failed.
+    CxresumePrewarmFailed(String),
+
     /// Open the feedback note entry overlay after the user selects a category.
     OpenFeedbackNote {
         category: FeedbackCategory,
@@ -196,6 +214,25 @@ pub(crate) enum AppEvent {
     /// Open the upload consent popup for feedback after selecting a category.
     OpenFeedbackConsent {
         category: FeedbackCategory,
+    },
+
+    /// Update per-session runtime status (for UnifiedExec etc.).
+    #[allow(dead_code)]
+    UpdateSessionStatus {
+        session_id: String,
+        status: String,
+    },
+
+    /// Update runtime status for the current active conversation (id inferred in App).
+    #[allow(dead_code)]
+    UpdateCurrentSessionStatus {
+        status: String,
+    },
+
+    /// Save session alias after user input.
+    SaveSessionAlias {
+        session_id: String,
+        alias: String,
     },
 }
 

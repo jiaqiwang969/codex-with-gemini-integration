@@ -26,12 +26,12 @@ use base64::Engine;
 use codex_common::format_env_display::format_env_display;
 use codex_core::config::Config;
 use codex_core::config::types::McpServerTransportConfig;
+use codex_protocol::openai_models::ReasoningSummaryFormat;
 use codex_core::protocol::FileChange;
 use codex_core::protocol::McpAuthStatus;
 use codex_core::protocol::McpInvocation;
 use codex_core::protocol::SessionConfiguredEvent;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
-use codex_protocol::openai_models::ReasoningSummaryFormat;
 use codex_protocol::plan_tool::PlanItemArg;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
@@ -76,6 +76,7 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
         self.display_lines(width)
     }
 
+    #[allow(dead_code)]
     fn desired_transcript_height(&self, width: u16) -> u16 {
         let lines = self.transcript_lines(width);
         // Workaround for ratatui bug: if there's only one line and it's whitespace-only, ratatui gives 2 lines.
@@ -697,6 +698,11 @@ pub(crate) fn new_user_prompt(message: String) -> UserHistoryCell {
     UserHistoryCell { message }
 }
 
+#[allow(dead_code)]
+pub(crate) fn new_user_approval_decision(lines: Vec<Line<'static>>) -> PlainHistoryCell {
+    PlainHistoryCell { lines }
+}
+
 #[derive(Debug)]
 struct SessionHeaderHistoryCell {
     version: &'static str,
@@ -1021,9 +1027,9 @@ pub(crate) fn new_active_mcp_tool_call(
     McpToolCallCell::new(call_id, invocation, animations_enabled)
 }
 
-pub(crate) fn new_web_search_call(query: String) -> PrefixedWrappedHistoryCell {
-    let text: Text<'static> = Line::from(vec!["Searched".bold(), " ".into(), query.into()]).into();
-    PrefixedWrappedHistoryCell::new(text, "• ".dim(), "  ")
+pub(crate) fn new_web_search_call(query: String) -> PlainHistoryCell {
+    let lines: Vec<Line<'static>> = vec![Line::from(vec![padded_emoji("🌐").into(), query.into()])];
+    PlainHistoryCell { lines }
 }
 
 /// If the first content is an image, return a new cell with the image.
@@ -1285,14 +1291,58 @@ pub(crate) fn new_mcp_tools_output(
 
     PlainHistoryCell { lines }
 }
-pub(crate) fn new_info_event(message: String, hint: Option<String>) -> PlainHistoryCell {
-    let mut line = vec!["• ".dim(), message.into()];
-    if let Some(hint) = hint {
-        line.push(" ".into());
-        line.push(hint.dark_gray());
+#[derive(Debug)]
+pub(crate) struct InfoHistoryCell {
+    message: String,
+    hint: Option<String>,
+}
+
+impl HistoryCell for InfoHistoryCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let wrap_width = width.saturating_sub(2).max(1) as usize;
+        let mut source_lines: Vec<Line<'static>> = self
+            .message
+            .split('\n')
+            .map(|segment| Line::from(segment.to_string()))
+            .collect();
+        if source_lines.is_empty() {
+            source_lines.push(Line::from(""));
+        }
+
+        let mut wrapped = word_wrap_lines(&source_lines, RtOptions::new(wrap_width));
+        if wrapped.is_empty() {
+            wrapped.push(Line::from(""));
+        }
+
+        let bullet_prefix: Span<'static> = "• ".dim();
+        let indent_prefix: Span<'static> = "  ".into();
+        let mut lines = prefix_lines(wrapped, bullet_prefix, indent_prefix);
+
+        // Remove the bullet prefix on blank lines to keep spacing compact.
+        for line in &mut lines {
+            let has_content = line
+                .spans
+                .iter()
+                .skip(1)
+                .any(|span| span.content.chars().any(|ch| !ch.is_whitespace()));
+            if !has_content {
+                line.spans.clear();
+            }
+        }
+
+        if let Some(hint) = &self.hint
+            && let Some(first_line) = lines.first_mut()
+        {
+            first_line.spans.push(" ".into());
+            first_line.spans.push(hint.clone().dark_gray());
+        }
+
+        lines
     }
-    let lines: Vec<Line<'static>> = vec![line.into()];
-    PlainHistoryCell { lines }
+}
+
+pub(crate) fn new_info_event(message: String, hint: Option<String>) -> InfoHistoryCell {
+    InfoHistoryCell { message, hint }
 }
 
 pub(crate) fn new_error_event(message: String) -> PlainHistoryCell {
@@ -1421,8 +1471,13 @@ pub(crate) fn new_view_image_tool_call(path: PathBuf, cwd: &Path) -> PlainHistor
 
 pub(crate) fn new_reasoning_summary_block(
     full_reasoning_buffer: String,
-    reasoning_summary_format: ReasoningSummaryFormat,
+    config: &Config,
 ) -> Box<dyn HistoryCell> {
+    let reasoning_summary_format = config
+        .model_reasoning_summary_format
+        .as_ref()
+        .cloned()
+        .unwrap_or_default();
     if reasoning_summary_format == ReasoningSummaryFormat::Experimental {
         // Experimental format is following:
         // ** header **
@@ -1531,10 +1586,15 @@ mod tests {
     use mcp_types::TextContent;
     use mcp_types::Tool;
     use mcp_types::ToolInputSchema;
+    use toml::Value as TomlValue;
     async fn test_config() -> Config {
         let codex_home = std::env::temp_dir();
         ConfigBuilder::default()
             .codex_home(codex_home.clone())
+            .cli_overrides(vec![(
+                "tui.animations".to_string(),
+                TomlValue::Boolean(true),
+            )])
             .build()
             .await
             .expect("config")

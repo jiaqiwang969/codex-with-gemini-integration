@@ -401,6 +401,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::Tui2,
         key: "tui2",
         stage: Stage::Experimental,
-        default_enabled: true,
+        default_enabled: false,
     },
 ];

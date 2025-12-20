@@ -1,9 +1,6 @@
-#[cfg(target_os = "linux")]
-use crate::clipboard_paste::is_probably_wsl;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
 use crate::render::line_utils::prefix_lines;
-use crate::status::format_tokens_compact;
 use crate::ui_consts::FOOTER_INDENT_COLS;
 use crossterm::event::KeyCode;
 use ratatui::buffer::Buffer;
@@ -14,17 +11,14 @@ use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct FooterProps {
     pub(crate) mode: FooterMode,
     pub(crate) esc_backtrack_hint: bool,
     pub(crate) use_shift_enter_hint: bool,
     pub(crate) is_task_running: bool,
     pub(crate) context_window_percent: Option<i64>,
-    pub(crate) context_window_used_tokens: Option<i64>,
-    pub(crate) transcript_scrolled: bool,
-    pub(crate) transcript_selection_active: bool,
-    pub(crate) transcript_scroll_position: Option<(usize, usize)>,
+    pub(crate) delegate_label: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,11 +59,11 @@ pub(crate) fn reset_mode_after_activity(current: FooterMode) -> FooterMode {
     }
 }
 
-pub(crate) fn footer_height(props: FooterProps) -> u16 {
+pub(crate) fn footer_height(props: &FooterProps) -> u16 {
     footer_lines(props).len() as u16
 }
 
-pub(crate) fn render_footer(area: Rect, buf: &mut Buffer, props: FooterProps) {
+pub(crate) fn render_footer(area: Rect, buf: &mut Buffer, props: &FooterProps) {
     Paragraph::new(prefix_lines(
         footer_lines(props),
         " ".repeat(FOOTER_INDENT_COLS).into(),
@@ -78,7 +72,7 @@ pub(crate) fn render_footer(area: Rect, buf: &mut Buffer, props: FooterProps) {
     .render(area, buf);
 }
 
-fn footer_lines(props: FooterProps) -> Vec<Line<'static>> {
+fn footer_lines(props: &FooterProps) -> Vec<Line<'static>> {
     // Show the context indicator on the left, appended after the primary hint
     // (e.g., "? for shortcuts"). Keep it visible even when typing (i.e., when
     // the shortcut hint is hidden). Hide it only for the multi-line
@@ -88,56 +82,39 @@ fn footer_lines(props: FooterProps) -> Vec<Line<'static>> {
             is_task_running: props.is_task_running,
         })],
         FooterMode::ShortcutSummary => {
-            let mut line = context_window_line(
-                props.context_window_percent,
-                props.context_window_used_tokens,
-            );
-            line.push_span(" · ".dim());
-            line.extend(vec![
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            if let Some(label) = props.delegate_label.as_ref() {
+                spans.push(format!("In {label}").cyan());
+                spans.push(" · ".dim());
+            }
+            let context_line = context_window_line(props.context_window_percent);
+            for span in context_line {
+                spans.push(span);
+            }
+            spans.push(" · ".dim());
+            spans.extend(vec![
                 key_hint::plain(KeyCode::Char('?')).into(),
                 " for shortcuts".dim(),
             ]);
-            if props.transcript_scrolled {
-                line.push_span(" · ".dim());
-                line.push_span(key_hint::plain(KeyCode::PageUp));
-                line.push_span("/");
-                line.push_span(key_hint::plain(KeyCode::PageDown));
-                line.push_span(" scroll".dim());
-                line.push_span(" · ".dim());
-                line.push_span(key_hint::plain(KeyCode::Home));
-                line.push_span("/");
-                line.push_span(key_hint::plain(KeyCode::End));
-                line.push_span(" jump".dim());
-                if let Some((current, total)) = props.transcript_scroll_position {
-                    line.push_span(" · ".dim());
-                    line.push_span(Span::from(format!("{current}/{total}")).dim());
-                }
-            }
-            if props.transcript_selection_active {
-                line.push_span(" · ".dim());
-                line.push_span(key_hint::ctrl(KeyCode::Char('y')));
-                line.push_span(" copy selection".dim());
-            }
-            vec![line]
+            vec![Line::from(spans)]
         }
-        FooterMode::ShortcutOverlay => {
-            #[cfg(target_os = "linux")]
-            let is_wsl = is_probably_wsl();
-            #[cfg(not(target_os = "linux"))]
-            let is_wsl = false;
-
-            let state = ShortcutsState {
-                use_shift_enter_hint: props.use_shift_enter_hint,
-                esc_backtrack_hint: props.esc_backtrack_hint,
-                is_wsl,
-            };
-            shortcut_overlay_lines(state)
-        }
+        FooterMode::ShortcutOverlay => shortcut_overlay_lines(ShortcutsState {
+            use_shift_enter_hint: props.use_shift_enter_hint,
+            esc_backtrack_hint: props.esc_backtrack_hint,
+        }),
         FooterMode::EscHint => vec![esc_hint_line(props.esc_backtrack_hint)],
-        FooterMode::ContextOnly => vec![context_window_line(
-            props.context_window_percent,
-            props.context_window_used_tokens,
-        )],
+        FooterMode::ContextOnly => {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            if let Some(label) = props.delegate_label.as_ref() {
+                spans.push(format!("In {label}").cyan());
+                spans.push(" · ".dim());
+            }
+            let context_line = context_window_line(props.context_window_percent);
+            for span in context_line {
+                spans.push(span);
+            }
+            vec![Line::from(spans)]
+        }
     }
 }
 
@@ -150,7 +127,6 @@ struct CtrlCReminderState {
 struct ShortcutsState {
     use_shift_enter_hint: bool,
     esc_backtrack_hint: bool,
-    is_wsl: bool,
 }
 
 fn ctrl_c_reminder_line(state: CtrlCReminderState) -> Line<'static> {
@@ -265,18 +241,9 @@ fn build_columns(entries: Vec<Line<'static>>) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn context_window_line(percent: Option<i64>, used_tokens: Option<i64>) -> Line<'static> {
-    if let Some(percent) = percent {
-        let percent = percent.clamp(0, 100);
-        return Line::from(vec![Span::from(format!("{percent}% context left")).dim()]);
-    }
-
-    if let Some(tokens) = used_tokens {
-        let used_fmt = format_tokens_compact(tokens);
-        return Line::from(vec![Span::from(format!("{used_fmt} used")).dim()]);
-    }
-
-    Line::from(vec![Span::from("100% context left").dim()])
+fn context_window_line(percent: Option<i64>) -> Line<'static> {
+    let percent = percent.unwrap_or(100).clamp(0, 100);
+    Line::from(vec![Span::from(format!("{percent}% context left")).dim()])
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -307,7 +274,6 @@ enum DisplayCondition {
     Always,
     WhenShiftEnterHint,
     WhenNotShiftEnterHint,
-    WhenUnderWSL,
 }
 
 impl DisplayCondition {
@@ -316,7 +282,6 @@ impl DisplayCondition {
             DisplayCondition::Always => true,
             DisplayCondition::WhenShiftEnterHint => state.use_shift_enter_hint,
             DisplayCondition::WhenNotShiftEnterHint => !state.use_shift_enter_hint,
-            DisplayCondition::WhenUnderWSL => state.is_wsl,
         }
     }
 }
@@ -390,18 +355,10 @@ const SHORTCUTS: &[ShortcutDescriptor] = &[
     },
     ShortcutDescriptor {
         id: ShortcutId::PasteImage,
-        // Show Ctrl+Alt+V when running under WSL (terminals often intercept plain
-        // Ctrl+V); otherwise fall back to Ctrl+V.
-        bindings: &[
-            ShortcutBinding {
-                key: key_hint::ctrl_alt(KeyCode::Char('v')),
-                condition: DisplayCondition::WhenUnderWSL,
-            },
-            ShortcutBinding {
-                key: key_hint::ctrl(KeyCode::Char('v')),
-                condition: DisplayCondition::Always,
-            },
-        ],
+        bindings: &[ShortcutBinding {
+            key: key_hint::ctrl(KeyCode::Char('v')),
+            condition: DisplayCondition::Always,
+        }],
         prefix: "",
         label: " to paste images",
     },
@@ -442,12 +399,12 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     fn snapshot_footer(name: &str, props: FooterProps) {
-        let height = footer_height(props).max(1);
+        let height = footer_height(&props).max(1);
         let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
         terminal
             .draw(|f| {
                 let area = Rect::new(0, 0, f.area().width, height);
-                render_footer(area, f.buffer_mut(), props);
+                render_footer(area, f.buffer_mut(), &props);
             })
             .unwrap();
         assert_snapshot!(name, terminal.backend());
@@ -463,25 +420,7 @@ mod tests {
                 use_shift_enter_hint: false,
                 is_task_running: false,
                 context_window_percent: None,
-                context_window_used_tokens: None,
-                transcript_scrolled: false,
-                transcript_selection_active: false,
-                transcript_scroll_position: None,
-            },
-        );
-
-        snapshot_footer(
-            "footer_shortcuts_transcript_scrolled_and_selection",
-            FooterProps {
-                mode: FooterMode::ShortcutSummary,
-                esc_backtrack_hint: false,
-                use_shift_enter_hint: false,
-                is_task_running: false,
-                context_window_percent: None,
-                context_window_used_tokens: None,
-                transcript_scrolled: true,
-                transcript_selection_active: true,
-                transcript_scroll_position: Some((3, 42)),
+                delegate_label: None,
             },
         );
 
@@ -493,10 +432,7 @@ mod tests {
                 use_shift_enter_hint: true,
                 is_task_running: false,
                 context_window_percent: None,
-                context_window_used_tokens: None,
-                transcript_scrolled: false,
-                transcript_selection_active: false,
-                transcript_scroll_position: None,
+                delegate_label: None,
             },
         );
 
@@ -508,10 +444,7 @@ mod tests {
                 use_shift_enter_hint: false,
                 is_task_running: false,
                 context_window_percent: None,
-                context_window_used_tokens: None,
-                transcript_scrolled: false,
-                transcript_selection_active: false,
-                transcript_scroll_position: None,
+                delegate_label: None,
             },
         );
 
@@ -523,10 +456,7 @@ mod tests {
                 use_shift_enter_hint: false,
                 is_task_running: true,
                 context_window_percent: None,
-                context_window_used_tokens: None,
-                transcript_scrolled: false,
-                transcript_selection_active: false,
-                transcript_scroll_position: None,
+                delegate_label: None,
             },
         );
 
@@ -538,10 +468,7 @@ mod tests {
                 use_shift_enter_hint: false,
                 is_task_running: false,
                 context_window_percent: None,
-                context_window_used_tokens: None,
-                transcript_scrolled: false,
-                transcript_selection_active: false,
-                transcript_scroll_position: None,
+                delegate_label: None,
             },
         );
 
@@ -553,10 +480,7 @@ mod tests {
                 use_shift_enter_hint: false,
                 is_task_running: false,
                 context_window_percent: None,
-                context_window_used_tokens: None,
-                transcript_scrolled: false,
-                transcript_selection_active: false,
-                transcript_scroll_position: None,
+                delegate_label: None,
             },
         );
 
@@ -568,25 +492,19 @@ mod tests {
                 use_shift_enter_hint: false,
                 is_task_running: true,
                 context_window_percent: Some(72),
-                context_window_used_tokens: None,
-                transcript_scrolled: false,
-                transcript_selection_active: false,
-                transcript_scroll_position: None,
+                delegate_label: None,
             },
         );
 
         snapshot_footer(
-            "footer_context_tokens_used",
+            "footer_shortcuts_delegate",
             FooterProps {
                 mode: FooterMode::ShortcutSummary,
                 esc_backtrack_hint: false,
                 use_shift_enter_hint: false,
                 is_task_running: false,
-                context_window_percent: None,
-                context_window_used_tokens: Some(123_456),
-                transcript_scrolled: false,
-                transcript_selection_active: false,
-                transcript_scroll_position: None,
+                context_window_percent: Some(85),
+                delegate_label: Some("#critic".to_string()),
             },
         );
     }

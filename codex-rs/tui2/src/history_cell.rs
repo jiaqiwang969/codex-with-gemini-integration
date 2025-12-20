@@ -1531,10 +1531,15 @@ mod tests {
     use mcp_types::TextContent;
     use mcp_types::Tool;
     use mcp_types::ToolInputSchema;
+    use toml::Value as TomlValue;
     async fn test_config() -> Config {
         let codex_home = std::env::temp_dir();
         ConfigBuilder::default()
             .codex_home(codex_home.clone())
+            .cli_overrides(vec![(
+                "tui.animations".to_string(),
+                TomlValue::Boolean(true),
+            )])
             .build()
             .await
             .expect("config")

@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use crate::app::App;
 use crate::app_event::AppEvent;
-use crate::cxresume_picker_widget::SessionPickerOutcome;
+use crate::cxresume_picker_widget::SessionInfo;
+use crate::cxresume_picker_widget::{self};
 use crate::history_cell::SessionInfoCell;
 use crate::history_cell::UserHistoryCell;
 use crate::pager_overlay::Overlay;
@@ -17,6 +18,7 @@ use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
+use tracing::warn;
 
 /// Aggregates all backtrack-related state used by the App.
 #[derive(Default)]
@@ -52,11 +54,6 @@ impl App {
             && matches!(c, 'x' | 'q')
         {
             self.open_or_refresh_session_picker(tui);
-            return Ok(true);
-        }
-
-        if !matches!(self.overlay, Some(Overlay::Transcript(_))) {
-            self.overlay_forward_event(tui, event)?;
             return Ok(true);
         }
 
@@ -161,7 +158,8 @@ impl App {
     pub(crate) fn close_session_picker(
         &mut self,
         tui: &mut tui::Tui,
-        outcome: Option<SessionPickerOutcome>,
+        selection_id: Option<String>,
+        session: Option<SessionInfo>,
     ) -> Result<()> {
         let _ = tui.leave_alt_screen();
         if let Some(state) = self
@@ -178,58 +176,15 @@ impl App {
         self.overlay = None;
         self.reset_cxresume_idle();
         self.backtrack.overlay_preview_active = false;
-        if let Some(outcome) = outcome {
-            match outcome {
-                SessionPickerOutcome::Exit => {}
-                SessionPickerOutcome::NewSession => {
-                    if self.chat_widget.is_task_running() {
-                        self.chat_widget.add_error_message(
-                            "Cannot start a new session while a task is running.".to_string(),
-                        );
-                    } else {
-                        self.app_event_tx.send(AppEvent::NewSession);
-                    }
-                }
-                SessionPickerOutcome::Resume(path) => {
-                    if self.chat_widget.is_task_running() {
-                        self.chat_widget.add_error_message(
-                            "Cannot switch sessions while a task is running.".to_string(),
-                        );
-                    } else {
-                        self.app_event_tx.send(AppEvent::ResumeSession(path));
-                    }
-                }
-                SessionPickerOutcome::Rename { session_id } => {
-                    if self.chat_widget.is_task_running() {
-                        self.chat_widget.add_error_message(
-                            "Cannot rename a session while a task is running.".to_string(),
-                        );
-                    } else {
-                        let app_tx = self.app_event_tx.clone();
-                        self.chat_widget.show_session_alias_input_for_rename(
-                            session_id,
-                            Box::new(move |sid, alias| {
-                                app_tx.send(AppEvent::SaveSessionAlias {
-                                    session_id: sid,
-                                    alias,
-                                });
-                            }),
-                        );
-                    }
-                }
-                SessionPickerOutcome::Clone { source_path } => {
-                    if self.chat_widget.is_task_running() {
-                        self.chat_widget.add_error_message(
-                            "Cannot clone a session while a task is running.".to_string(),
-                        );
-                    } else {
-                        self.app_event_tx.send(AppEvent::CloneSession(source_path));
-                    }
-                }
-                SessionPickerOutcome::Refresh => {}
+        if let Some(id) = selection_id {
+            if id == cxresume_picker_widget::NEW_SESSION_SENTINEL {
+                self.app_event_tx.send(AppEvent::NewSession);
+            } else if let Some(info) = session {
+                self.app_event_tx.send(AppEvent::ResumeSession(info.path));
+            } else {
+                warn!("Selected session id {id} has no metadata");
             }
         }
-        self.refresh_session_bar();
         Ok(())
     }
 
@@ -315,7 +270,8 @@ impl App {
     fn overlay_forward_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()> {
         enum OverlayCloseAction {
             Session {
-                outcome: Option<SessionPickerOutcome>,
+                id: Option<String>,
+                session: Box<Option<SessionInfo>>,
             },
             Other,
         }
@@ -326,7 +282,8 @@ impl App {
             if overlay.is_done() {
                 close_action = Some(match overlay {
                     Overlay::SessionPicker(_) => OverlayCloseAction::Session {
-                        outcome: overlay.session_picker_outcome(),
+                        id: overlay.get_selected_session_id(),
+                        session: Box::new(overlay.get_selected_session()),
                     },
                     _ => OverlayCloseAction::Other,
                 });
@@ -335,13 +292,14 @@ impl App {
 
         if let Some(action) = close_action {
             match action {
-                OverlayCloseAction::Session { outcome } => {
-                    self.close_session_picker(tui, outcome)?;
+                OverlayCloseAction::Session { id, session } => {
+                    self.close_session_picker(tui, id, *session)?;
                 }
                 OverlayCloseAction::Other => self.close_transcript_overlay(tui),
             }
             tui.frame_requester().schedule_frame();
         }
+
         Ok(())
     }
 
@@ -427,6 +385,7 @@ impl App {
         match result {
             Ok(new_conv) => {
                 self.install_forked_conversation(tui, cfg, new_conv, nth_user_message, &prefill)
+                    .await
             }
             Err(e) => tracing::error!("error forking conversation: {e:#}"),
         }
@@ -445,7 +404,7 @@ impl App {
     }
 
     /// Install a forked conversation into the ChatWidget and update UI to reflect selection.
-    fn install_forked_conversation(
+    async fn install_forked_conversation(
         &mut self,
         tui: &mut tui::Tui,
         cfg: codex_core::config::Config,
@@ -455,23 +414,30 @@ impl App {
     ) {
         let conv = new_conv.conversation;
         let session_configured = new_conv.session_configured;
-        let model_family = self.chat_widget.get_model_family();
+        let model_slug = self.models_manager.get_model(&cfg.model, &cfg).await;
+        let model_family = self
+            .models_manager
+            .construct_model_family(&model_slug, &cfg)
+            .await;
         let init = crate::chatwidget::ChatWidgetInit {
             config: cfg,
-            model_family: model_family.clone(),
             frame_requester: tui.frame_requester(),
             app_event_tx: self.app_event_tx.clone(),
             initial_prompt: None,
             initial_images: Vec::new(),
             enhanced_keys_supported: self.enhanced_keys_supported,
             auth_manager: self.auth_manager.clone(),
-            models_manager: self.server.get_models_manager(),
+            models_manager: self.models_manager.clone(),
             feedback: self.feedback.clone(),
             is_first_run: false,
+            model_family,
         };
-        self.chat_widget =
-            crate::chatwidget::ChatWidget::new_from_existing(init, conv, session_configured);
-        self.current_model = model_family.get_model_slug().to_string();
+        self.chat_widget = crate::chatwidget::ChatWidget::new_from_existing(
+            init,
+            new_conv.conversation_id.to_string(),
+            conv,
+            session_configured,
+        );
         // Trim transcript up to the selected user message and re-render it.
         self.trim_transcript_for_backtrack(nth_user_message);
         self.render_transcript_once(tui);

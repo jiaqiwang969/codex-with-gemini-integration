@@ -635,10 +635,15 @@ mod tests {
     use codex_core::config::ProjectConfig;
     use serial_test::serial;
     use tempfile::TempDir;
+    use toml::Value as TomlValue;
 
     async fn build_config(temp_dir: &TempDir) -> std::io::Result<Config> {
         ConfigBuilder::default()
             .codex_home(temp_dir.path().to_path_buf())
+            .cli_overrides(vec![(
+                "tui.animations".to_string(),
+                TomlValue::Boolean(true),
+            )])
             .build()
             .await
     }

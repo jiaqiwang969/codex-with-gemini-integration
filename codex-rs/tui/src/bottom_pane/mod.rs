@@ -9,7 +9,6 @@ use crate::render::renderable::RenderableItem;
 use crate::tui::FrameRequester;
 use bottom_pane_view::BottomPaneView;
 use codex_core::features::Features;
-use codex_core::skills::model::SkillMetadata;
 use codex_file_search::FileMatch;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -29,9 +28,9 @@ mod file_search_popup;
 mod footer;
 mod list_selection_view;
 mod prompt_args;
-mod skill_popup;
 pub(crate) use list_selection_view::SelectionViewParams;
 mod feedback_view;
+mod session_alias_input;
 pub(crate) use feedback_view::feedback_selection_params;
 pub(crate) use feedback_view::feedback_upload_consent_params;
 mod paste_burst;
@@ -39,7 +38,6 @@ pub mod popup_consts;
 mod queued_user_messages;
 mod scroll_state;
 mod selection_popup_common;
-mod session_alias_input;
 mod textarea;
 pub(crate) use feedback_view::FeedbackNoteView;
 
@@ -52,6 +50,7 @@ pub(crate) enum CancellationEvent {
 pub(crate) use chat_composer::ChatComposer;
 pub(crate) use chat_composer::InputResult;
 use codex_protocol::custom_prompts::CustomPrompt;
+use codex_core::skills::model::SkillMetadata;
 
 use crate::status_indicator_widget::StatusIndicatorWidget;
 pub(crate) use list_selection_view::SelectionAction;
@@ -81,6 +80,7 @@ pub(crate) struct BottomPane {
     queued_user_messages: QueuedUserMessages,
     context_window_percent: Option<i64>,
     context_window_used_tokens: Option<i64>,
+    delegate_label: Option<String>,
 }
 
 pub(crate) struct BottomPaneParams {
@@ -114,7 +114,6 @@ impl BottomPane {
             disable_paste_burst,
         );
         composer.set_skill_mentions(skills);
-
         Self {
             composer,
             view_stack: Vec::new(),
@@ -129,20 +128,12 @@ impl BottomPane {
             animations_enabled,
             context_window_percent: None,
             context_window_used_tokens: None,
+            delegate_label: None,
         }
-    }
-
-    pub fn set_skills(&mut self, skills: Option<Vec<SkillMetadata>>) {
-        self.composer.set_skill_mentions(skills);
-        self.request_redraw();
     }
 
     pub fn status_widget(&self) -> Option<&StatusIndicatorWidget> {
         self.status.as_ref()
-    }
-
-    pub fn skills(&self) -> Option<&Vec<SkillMetadata>> {
-        self.composer.skills()
     }
 
     #[cfg(test)]
@@ -382,15 +373,14 @@ impl BottomPane {
         self.request_redraw();
     }
 
-    pub(crate) fn set_transcript_ui_state(
-        &mut self,
-        scrolled: bool,
-        selection_active: bool,
-        scroll_position: Option<(usize, usize)>,
-    ) {
-        self.composer
-            .set_transcript_ui_state(scrolled, selection_active, scroll_position);
-        self.request_redraw();
+    pub(crate) fn set_delegate_label(&mut self, label: Option<String>) {
+        if self.delegate_label == label {
+            return;
+        }
+        self.delegate_label = label.clone();
+        if self.composer.set_delegate_label(label) {
+            self.request_redraw();
+        }
     }
 
     /// Show a generic list selection view with the provided items.
@@ -434,13 +424,13 @@ impl BottomPane {
         self.push_view(view);
     }
 
+    /// Show session alias input dialog for naming a new session.
     pub(crate) fn show_session_alias_input(
         &mut self,
-        codex_home: PathBuf,
         session_id: String,
         on_submit: session_alias_input::AliasSubmitted,
     ) {
-        let view = session_alias_input::SessionAliasInput::new(codex_home, session_id, on_submit);
+        let view = session_alias_input::SessionAliasInput::new(session_id, on_submit);
         self.push_view(Box::new(view));
     }
 
@@ -613,7 +603,6 @@ mod tests {
     fn ctrl_c_on_modal_consumes_and_shows_quit_hint() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
-        let features = Features::with_defaults();
         let mut pane = BottomPane::new(BottomPaneParams {
             app_event_tx: tx,
             frame_requester: FrameRequester::test_dummy(),
@@ -622,8 +611,9 @@ mod tests {
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
             animations_enabled: true,
-            skills: Some(Vec::new()),
+            skills: None,
         });
+        let features = Features::with_defaults();
         pane.push_approval_request(exec_request(), &features);
         assert_eq!(CancellationEvent::Handled, pane.on_ctrl_c());
         assert!(pane.ctrl_c_quit_hint_visible());
@@ -636,7 +626,6 @@ mod tests {
     fn overlay_not_shown_above_approval_modal() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
-        let features = Features::with_defaults();
         let mut pane = BottomPane::new(BottomPaneParams {
             app_event_tx: tx,
             frame_requester: FrameRequester::test_dummy(),
@@ -645,10 +634,11 @@ mod tests {
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
             animations_enabled: true,
-            skills: Some(Vec::new()),
+            skills: None,
         });
 
         // Create an approval modal (active view).
+        let features = Features::with_defaults();
         pane.push_approval_request(exec_request(), &features);
 
         // Render and verify the top row does not include an overlay.
@@ -670,7 +660,6 @@ mod tests {
     fn composer_shown_after_denied_while_task_running() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
-        let features = Features::with_defaults();
         let mut pane = BottomPane::new(BottomPaneParams {
             app_event_tx: tx,
             frame_requester: FrameRequester::test_dummy(),
@@ -679,13 +668,14 @@ mod tests {
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
             animations_enabled: true,
-            skills: Some(Vec::new()),
+            skills: None,
         });
 
         // Start a running task so the status indicator is active above the composer.
         pane.set_task_running(true);
 
         // Push an approval modal (e.g., command approval) which should hide the status view.
+        let features = Features::with_defaults();
         pane.push_approval_request(exec_request(), &features);
 
         // Simulate pressing 'n' (No) on the modal.
@@ -746,7 +736,7 @@ mod tests {
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
             animations_enabled: true,
-            skills: Some(Vec::new()),
+            skills: None,
         });
 
         // Begin a task: show initial status.
@@ -773,7 +763,7 @@ mod tests {
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
             animations_enabled: true,
-            skills: Some(Vec::new()),
+            skills: None,
         });
 
         // Activate spinner (status view replaces composer) with no live ring.
@@ -804,7 +794,7 @@ mod tests {
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
             animations_enabled: true,
-            skills: Some(Vec::new()),
+            skills: None,
         });
 
         pane.set_task_running(true);
@@ -832,7 +822,7 @@ mod tests {
             placeholder_text: "Ask Codex to do anything".to_string(),
             disable_paste_burst: false,
             animations_enabled: true,
-            skills: Some(Vec::new()),
+            skills: None,
         });
 
         pane.set_task_running(true);

@@ -7,6 +7,7 @@ use additional_dirs::add_dir_warning_message;
 use app::App;
 pub use app::AppExitInfo;
 use codex_app_server_protocol::AuthMode;
+use codex_common::CliConfigOverrides;
 use codex_common::oss::ensure_oss_provider_ready;
 use codex_common::oss::get_default_model_for_oss_provider;
 use codex_core::AuthManager;
@@ -22,9 +23,14 @@ use codex_core::config::resolve_oss_provider;
 use codex_core::find_conversation_path_by_id_str;
 use codex_core::get_platform_sandbox;
 use codex_core::protocol::AskForApproval;
+use codex_core::protocol::SessionSource;
+use codex_multi_agent::AgentContext;
+use codex_multi_agent::AgentId;
+use codex_multi_agent::AgentOrchestrator;
 use codex_protocol::config_types::SandboxMode;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::error;
 use tracing_appender::non_blocking;
 use tracing_subscriber::EnvFilter;
@@ -40,7 +46,6 @@ mod ascii_animation;
 mod bottom_pane;
 mod chatwidget;
 mod cli;
-mod clipboard_copy;
 mod clipboard_paste;
 mod color;
 pub mod custom_terminal;
@@ -60,7 +65,6 @@ mod markdown;
 mod markdown_render;
 mod markdown_stream;
 mod model_migration;
-mod notifications;
 pub mod onboarding;
 mod oss_selection;
 mod pager_overlay;
@@ -219,14 +223,25 @@ pub async fn run_main(
         base_instructions: None,
         developer_instructions: None,
         compact_prompt: None,
-        include_delegate_tool: None,
+        include_delegate_tool: Some(true),
         include_apply_patch_tool: None,
         show_raw_agent_reasoning: cli.oss.then_some(true),
         tools_web_search_request: None,
         additional_writable_roots: additional_dirs,
     };
+    let mut delegate_config_overrides = overrides.clone();
+    delegate_config_overrides.include_delegate_tool = None;
+    let delegate_cli_overrides = cli.config_overrides.clone();
 
-    let config = load_config_or_exit(cli_kv_overrides.clone(), overrides.clone()).await;
+    let agent_context = load_agent_context_or_exit(
+        cli.agent.as_deref(),
+        &cli.config_overrides,
+        overrides.clone(),
+    )
+    .await;
+    let allowed_agents = agent_context.allowed_agents().to_vec();
+    let global_codex_home = agent_context.global_codex_home().to_path_buf();
+    let config = agent_context.into_config();
 
     if let Some(warning) = add_dir_warning_message(&cli.add_dir, &config.sandbox_policy) {
         #[allow(clippy::print_stderr)]
@@ -274,7 +289,6 @@ pub async fn run_main(
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(non_blocking)
         .with_target(false)
-        .with_ansi(false)
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
         .with_filter(env_filter());
 
@@ -314,7 +328,6 @@ pub async fn run_main(
     };
 
     let otel_logger_layer = otel.as_ref().and_then(|o| o.logger_layer());
-
     let otel_tracing_layer = otel.as_ref().and_then(|o| o.tracing_layer());
 
     let _ = tracing_subscriber::registry()
@@ -324,30 +337,36 @@ pub async fn run_main(
         .with(otel_logger_layer)
         .try_init();
 
-    let terminal_info = codex_core::terminal::terminal_info();
-    tracing::info!(terminal = ?terminal_info, "Detected terminal info");
-
     run_ratatui_app(
         cli,
         config,
         overrides,
-        cli_kv_overrides,
         active_profile,
         feedback,
+        global_codex_home,
+        delegate_cli_overrides,
+        delegate_config_overrides,
+        allowed_agents,
     )
     .await
     .map_err(|err| std::io::Error::other(err.to_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_ratatui_app(
     cli: Cli,
     initial_config: Config,
     overrides: ConfigOverrides,
-    cli_kv_overrides: Vec<(String, toml::Value)>,
     active_profile: Option<String>,
     feedback: codex_feedback::CodexFeedback,
+    global_codex_home: PathBuf,
+    delegate_cli_overrides: CliConfigOverrides,
+    delegate_config_overrides: ConfigOverrides,
+    allowed_agents: Vec<AgentId>,
 ) -> color_eyre::Result<AppExitInfo> {
     color_eyre::install()?;
+    let mut global_codex_home = global_codex_home;
+    let mut allowed_agents = allowed_agents;
 
     // Forward panic reports through tracing so they appear in the UI status
     // line, but do not swallow the default/color-eyre panic handler.
@@ -387,7 +406,7 @@ async fn run_ratatui_app(
     // Initialize high-fidelity session event logging if enabled.
     session_log::maybe_init(&initial_config);
 
-    let auth_manager = AuthManager::shared(
+    let mut auth_manager = AuthManager::shared(
         initial_config.codex_home.clone(),
         false,
         initial_config.cli_auth_credentials_store_mode,
@@ -420,19 +439,42 @@ async fn run_ratatui_app(
                 session_lines: Vec::new(),
             });
         }
-        // if the user acknowledged windows or made an explicit decision ato trust the directory, reload the config accordingly
+        // if the user made an explicit decision to trust the directory, reload the config accordingly
         if onboarding_result
             .directory_trust_decision
             .map(|d| d == TrustDirectorySelection::Trust)
             .unwrap_or(false)
         {
-            load_config_or_exit(cli_kv_overrides, overrides).await
+            let context = load_agent_context_or_exit(
+                cli.agent.as_deref(),
+                &delegate_cli_overrides,
+                overrides.clone(),
+            )
+            .await;
+            allowed_agents = context.allowed_agents().to_vec();
+            global_codex_home = context.global_codex_home().to_path_buf();
+            auth_manager = AuthManager::shared(
+                global_codex_home.clone(),
+                false,
+                initial_config.cli_auth_credentials_store_mode,
+            );
+            context.into_config()
         } else {
             initial_config
         }
     } else {
         initial_config
     };
+
+    let delegate_orchestrator = Arc::new(AgentOrchestrator::new(
+        global_codex_home.clone(),
+        auth_manager.clone(),
+        SessionSource::Cli,
+        delegate_cli_overrides,
+        delegate_config_overrides,
+        allowed_agents,
+        config.multi_agent.max_concurrent_delegates,
+    ));
 
     // Determine resume behavior: explicit id, then resume last, then picker.
     let resume_selection = if let Some(id_str) = cli.resume_session_id.as_deref() {
@@ -503,36 +545,20 @@ async fn run_ratatui_app(
 
     let Cli { prompt, images, .. } = cli;
 
-    // Run the main chat + transcript UI on the terminal's alternate screen so
-    // the entire viewport can be used without polluting normal scrollback. This
-    // mirrors the behavior of the legacy TUI but keeps inline mode available
-    // for smaller prompts like onboarding and model migration.
-    let _ = tui.enter_alt_screen();
-
     let app_result = App::run(
         &mut tui,
         auth_manager,
+        delegate_orchestrator,
         config,
         active_profile,
         prompt,
         images,
         resume_selection,
         feedback,
-        should_show_trust_screen, // Proxy to: is it a first run in this directory?
     )
     .await;
 
-    let _ = tui.leave_alt_screen();
     restore();
-    if let Ok(exit_info) = &app_result {
-        let mut stdout = std::io::stdout();
-        for line in exit_info.session_lines.iter() {
-            let _ = writeln!(stdout, "{line}");
-        }
-        if !exit_info.session_lines.is_empty() {
-            let _ = writeln!(stdout);
-        }
-    }
     // Mark the end of the recorded session.
     session_log::log_session_end();
     // ignore error when collecting usage – report underlying error instead
@@ -575,13 +601,14 @@ fn get_login_status(config: &Config) -> LoginStatus {
     }
 }
 
-async fn load_config_or_exit(
-    cli_kv_overrides: Vec<(String, toml::Value)>,
+async fn load_agent_context_or_exit(
+    agent_slug: Option<&str>,
+    cli_overrides: &CliConfigOverrides,
     overrides: ConfigOverrides,
-) -> Config {
+) -> AgentContext {
     #[allow(clippy::print_stderr)]
-    match Config::load_with_cli_overrides_and_harness_overrides(cli_kv_overrides, overrides).await {
-        Ok(config) => config,
+    match codex_multi_agent::load_agent_context(agent_slug, cli_overrides, overrides).await {
+        Ok(context) => context,
         Err(err) => {
             eprintln!("Error loading configuration: {err}");
             std::process::exit(1);
@@ -634,10 +661,15 @@ mod tests {
     use codex_core::config::ProjectConfig;
     use serial_test::serial;
     use tempfile::TempDir;
+    use toml::Value as TomlValue;
 
     async fn build_config(temp_dir: &TempDir) -> std::io::Result<Config> {
         ConfigBuilder::default()
             .codex_home(temp_dir.path().to_path_buf())
+            .cli_overrides(vec![(
+                "tui.animations".to_string(),
+                TomlValue::Boolean(true),
+            )])
             .build()
             .await
     }

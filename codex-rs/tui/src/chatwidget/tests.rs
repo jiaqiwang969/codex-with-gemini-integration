@@ -66,6 +66,7 @@ use tempfile::NamedTempFile;
 use tempfile::tempdir;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::unbounded_channel;
+use toml::Value as TomlValue;
 
 #[cfg(target_os = "windows")]
 fn set_windows_sandbox_enabled(enabled: bool) {
@@ -77,6 +78,10 @@ async fn test_config() -> Config {
     let codex_home = std::env::temp_dir();
     ConfigBuilder::default()
         .codex_home(codex_home.clone())
+        .cli_overrides(vec![(
+            "tui.animations".to_string(),
+            TomlValue::Boolean(true),
+        )])
         .build()
         .await
         .expect("config")
@@ -404,6 +409,14 @@ async fn make_chatwidget_manual(
         is_review_mode: false,
         pre_review_token_info: None,
         needs_final_message_separator: false,
+        delegate_run: None,
+        delegate_runs_with_stream: HashSet::new(),
+        delegate_status_owner: None,
+        delegate_previous_status_header: None,
+        delegate_context: None,
+        delegate_user_frames: Vec::new(),
+        delegate_agent_frames: Vec::new(),
+        pending_delegate_context: Vec::new(),
         last_rendered_width: std::cell::Cell::new(None),
         feedback: codex_feedback::CodexFeedback::new(),
         current_rollout_path: None,

@@ -20,10 +20,15 @@ use insta::assert_snapshot;
 use ratatui::prelude::*;
 use std::path::PathBuf;
 use tempfile::TempDir;
+use toml::Value as TomlValue;
 
 async fn test_config(temp_home: &TempDir) -> Config {
     ConfigBuilder::default()
         .codex_home(temp_home.path().to_path_buf())
+        .cli_overrides(vec![(
+            "tui.animations".to_string(),
+            TomlValue::Boolean(true),
+        )])
         .build()
         .await
         .expect("load config")

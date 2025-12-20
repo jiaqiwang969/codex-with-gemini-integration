@@ -10,7 +10,6 @@ use codex_core::ConversationsPage;
 use codex_core::Cursor;
 use codex_core::INTERACTIVE_SESSION_SOURCES;
 use codex_core::RolloutRecorder;
-use codex_core::path_utils;
 use codex_protocol::items::TurnItem;
 use color_eyre::eyre::Result;
 use crossterm::event::KeyCode;
@@ -114,7 +113,7 @@ pub async fn run_resume_picker(
         show_all,
         filter_cwd,
     );
-    state.start_initial_load();
+    state.load_initial_page().await?;
     state.request_frame();
 
     let mut tui_events = alt.tui.event_stream().fuse();
@@ -360,28 +359,25 @@ impl PickerState {
         Ok(None)
     }
 
-    fn start_initial_load(&mut self) {
+    async fn load_initial_page(&mut self) -> Result<()> {
+        let provider_filter = vec![self.default_provider.clone()];
+        let page = RolloutRecorder::list_conversations(
+            &self.codex_home,
+            PAGE_SIZE,
+            None,
+            INTERACTIVE_SESSION_SOURCES,
+            Some(provider_filter.as_slice()),
+            self.default_provider.as_str(),
+        )
+        .await?;
         self.reset_pagination();
         self.all_rows.clear();
         self.filtered_rows.clear();
         self.seen_paths.clear();
         self.search_state = SearchState::Idle;
         self.selected = 0;
-
-        let request_token = self.allocate_request_token();
-        self.pagination.loading = LoadingState::Pending(PendingLoad {
-            request_token,
-            search_token: None,
-        });
-        self.request_frame();
-
-        (self.page_loader)(PageLoadRequest {
-            codex_home: self.codex_home.clone(),
-            cursor: None,
-            request_token,
-            search_token: None,
-            default_provider: self.default_provider.clone(),
-        });
+        self.ingest_page(page);
+        Ok(())
     }
 
     fn handle_background_event(&mut self, event: BackgroundEvent) -> Result<()> {
@@ -671,10 +667,7 @@ fn extract_session_meta_from_head(head: &[serde_json::Value]) -> (Option<PathBuf
 }
 
 fn paths_match(a: &Path, b: &Path) -> bool {
-    if let (Ok(ca), Ok(cb)) = (
-        path_utils::normalize_for_path_comparison(a),
-        path_utils::normalize_for_path_comparison(b),
-    ) {
+    if let (Ok(ca), Ok(cb)) = (a.canonicalize(), b.canonicalize()) {
         return ca == cb;
     }
     a == b

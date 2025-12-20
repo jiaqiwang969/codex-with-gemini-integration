@@ -1609,7 +1609,7 @@ impl Config {
                 .as_ref()
                 .map(|t| t.notifications.clone())
                 .unwrap_or_default(),
-            animations: cfg.tui.as_ref().map(|t| t.animations).unwrap_or(true),
+            animations: cfg.tui.as_ref().map(|t| t.animations).unwrap_or(false),
             show_tooltips: cfg.tui.as_ref().map(|t| t.show_tooltips).unwrap_or(true),
             otel: {
                 let t: OtelConfigToml = cfg.otel.unwrap_or_default();
@@ -3397,7 +3397,7 @@ model_verbosity = "high"
             check_for_update_on_startup: true,
             disable_paste_burst: false,
             tui_notifications: Default::default(),
-            animations: true,
+            animations: false,
             show_tooltips: true,
             otel: OtelConfig::default(),
         };
@@ -3479,7 +3479,7 @@ model_verbosity = "high"
             check_for_update_on_startup: true,
             disable_paste_burst: false,
             tui_notifications: Default::default(),
-            animations: true,
+            animations: false,
             show_tooltips: true,
             otel: OtelConfig::default(),
         };
@@ -3576,7 +3576,7 @@ model_verbosity = "high"
             check_for_update_on_startup: true,
             disable_paste_burst: false,
             tui_notifications: Default::default(),
-            animations: true,
+            animations: false,
             show_tooltips: true,
             otel: OtelConfig::default(),
         };
@@ -3659,7 +3659,7 @@ model_verbosity = "high"
             check_for_update_on_startup: true,
             disable_paste_burst: false,
             tui_notifications: Default::default(),
-            animations: true,
+            animations: false,
             show_tooltips: true,
             otel: OtelConfig::default(),
         };

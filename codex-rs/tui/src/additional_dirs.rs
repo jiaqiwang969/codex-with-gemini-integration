@@ -34,7 +34,6 @@ fn format_warning(additional_dirs: &[PathBuf]) -> String {
 #[cfg(test)]
 mod tests {
     use super::add_dir_warning_message;
-    use codex_core::protocol::NetworkAccess;
     use codex_core::protocol::SandboxPolicy;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
@@ -49,15 +48,6 @@ mod tests {
     #[test]
     fn returns_none_for_danger_full_access() {
         let sandbox = SandboxPolicy::DangerFullAccess;
-        let dirs = vec![PathBuf::from("/tmp/example")];
-        assert_eq!(add_dir_warning_message(&dirs, &sandbox), None);
-    }
-
-    #[test]
-    fn returns_none_for_external_sandbox() {
-        let sandbox = SandboxPolicy::ExternalSandbox {
-            network_access: NetworkAccess::Enabled,
-        };
         let dirs = vec![PathBuf::from("/tmp/example")];
         assert_eq!(add_dir_warning_message(&dirs, &sandbox), None);
     }

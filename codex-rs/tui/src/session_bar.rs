@@ -2,49 +2,56 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use crossterm::event::KeyCode;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::style::Style;
-use ratatui::style::Stylize;
+use ratatui::style::Stylize; // Prefer Stylize helpers for consistent styling
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
-use ratatui::widgets::Widget as _;
+use ratatui::widgets::Widget;
 use ratatui::widgets::WidgetRef;
 use unicode_width::UnicodeWidthStr;
 
 use crate::cxresume_picker_widget::SessionInfo;
+use crate::cxresume_picker_widget::TumixState;
 use crate::cxresume_picker_widget::get_cwd_sessions;
 use crate::cxresume_picker_widget::last_user_snippet;
 use crate::cxresume_picker_widget::load_tumix_status_index;
-use crate::key_hint;
+use crate::key_hint; // Unify key-hint rendering
 use crate::session_alias_manager::SessionAliasManager;
+use crossterm::event::KeyCode;
 
-/// Bottom session bar (similar to tmux).
-pub(crate) struct SessionBar {
-    codex_home: PathBuf,
-    cwd: PathBuf,
-
+/// Bottom session bar (similar to tmux)
+pub struct SessionBar {
+    /// List of sessions in current working directory
     sessions: Vec<SessionInfo>,
+    /// Currently selected session index
     selected_index: usize,
+    /// Whether selection is on the special "新建" tab
     selected_on_new: bool,
+    /// Whether the bar has focus
     has_focus: bool,
+    /// Session loading state
     loading: bool,
+    /// Error message if any
     error: Option<String>,
+    /// Current active session ID (if any)
     current_session_id: Option<String>,
+    /// Status for the current session only
     current_session_status: Option<String>,
+    /// Cached labels derived from first user message (by path)
     label_cache: HashMap<PathBuf, String>,
+    /// Session alias manager
     alias_manager: SessionAliasManager,
 }
 
 impl SessionBar {
-    pub(crate) fn new(codex_home: PathBuf, cwd: PathBuf) -> Self {
+    pub fn new(_cwd: PathBuf) -> Self {
         let mut bar = Self {
-            codex_home: codex_home.clone(),
-            cwd,
             sessions: Vec::new(),
             selected_index: 0,
             selected_on_new: false,
@@ -54,29 +61,22 @@ impl SessionBar {
             current_session_id: None,
             current_session_status: None,
             label_cache: HashMap::new(),
-            alias_manager: SessionAliasManager::load(codex_home),
+            alias_manager: SessionAliasManager::load(),
         };
 
+        // Load sessions on creation
         bar.refresh_sessions();
         bar
     }
 
-    pub(crate) fn refresh_sessions(&mut self) {
-        let preserve_user_selection = self.has_focus;
-        let previous_selected_index = self.selected_index;
-        let previous_selected_on_new = self.selected_on_new;
-        let previous_selected_id = if self.selected_on_new {
-            None
-        } else {
-            self.sessions.get(self.selected_index).map(|s| s.id.clone())
-        };
-
+    /// Refresh the session list from disk
+    pub fn refresh_sessions(&mut self) {
         self.loading = true;
         self.error = None;
-        self.alias_manager = SessionAliasManager::load(self.codex_home.clone());
 
-        match get_cwd_sessions(&self.codex_home, &self.cwd) {
+        match get_cwd_sessions() {
             Ok(mut sessions) => {
+                // Add tumix status if available
                 let tumix_index = load_tumix_status_index();
                 for session in &mut sessions {
                     if let Some(indicator) = tumix_index.lookup(&session.id, &session.path) {
@@ -84,20 +84,28 @@ impl SessionBar {
                     }
                 }
 
+                // Sort is already mtime desc in provider; de-duplicate by id (keep newest)
                 let mut seen = HashSet::new();
                 sessions.retain(|s| seen.insert(s.id.clone()));
 
                 self.sessions = sessions;
                 self.loading = false;
 
-                self.reconcile_selection_after_refresh(
-                    previous_selected_id,
-                    previous_selected_index,
-                    previous_selected_on_new,
-                    preserve_user_selection,
-                );
+                // If current session is in history, select it by default
+                if let Some(cur) = self.current_session_id.as_ref()
+                    && let Some(pos) = self.sessions.iter().position(|s| &s.id == cur)
+                {
+                    self.selected_index = pos;
+                }
 
+                // Keep selection in bounds
+                if self.selected_index >= self.sessions.len() && !self.sessions.is_empty() {
+                    self.selected_index = self.sessions.len() - 1;
+                }
+
+                // Compute labels lazily for visible sessions (cache by path)
                 for s in &self.sessions {
+                    // Always recompute for the current session so alias follows latest user message
                     let must_update = self
                         .current_session_id
                         .as_ref()
@@ -105,6 +113,7 @@ impl SessionBar {
                         .unwrap_or(false)
                         || !self.label_cache.contains_key(&s.path);
                     if must_update && let Some(snippet) = last_user_snippet(&s.path, 5) {
+                        // Unicode-safe truncation to keep bar compact
                         let short = if snippet.chars().count() > 10 {
                             let truncated: String = snippet.chars().take(10).collect();
                             format!("{truncated}…")
@@ -123,64 +132,8 @@ impl SessionBar {
         }
     }
 
-    fn reconcile_selection_after_refresh(
-        &mut self,
-        previous_selected_id: Option<String>,
-        previous_selected_index: usize,
-        previous_selected_on_new: bool,
-        preserve_user_selection: bool,
-    ) {
-        let current_in_history = self
-            .current_session_id
-            .as_ref()
-            .is_some_and(|cur| self.sessions.iter().any(|s| s.id == *cur));
-
-        if current_in_history {
-            self.selected_on_new = false;
-            if preserve_user_selection
-                && previous_selected_on_new
-                && let Some(cur) = self.current_session_id.as_ref()
-                && let Some(pos) = self.sessions.iter().position(|s| &s.id == cur)
-            {
-                self.selected_index = pos;
-                return;
-            }
-        } else {
-            self.selected_on_new = previous_selected_on_new;
-        }
-
-        if preserve_user_selection {
-            if self.selected_on_new {
-                return;
-            }
-
-            if let Some(selected_id) = previous_selected_id
-                && let Some(pos) = self.sessions.iter().position(|s| s.id == selected_id)
-            {
-                self.selected_index = pos;
-                return;
-            }
-
-            if !self.sessions.is_empty() {
-                self.selected_index = previous_selected_index.min(self.sessions.len() - 1);
-            } else {
-                self.selected_index = 0;
-            }
-            return;
-        }
-
-        if let Some(cur) = self.current_session_id.as_ref()
-            && let Some(pos) = self.sessions.iter().position(|s| &s.id == cur)
-        {
-            self.selected_index = pos;
-        }
-
-        if self.selected_index >= self.sessions.len() && !self.sessions.is_empty() {
-            self.selected_index = self.sessions.len() - 1;
-        }
-    }
-
-    pub(crate) fn selected_session(&self) -> Option<&SessionInfo> {
+    /// Get the currently selected session
+    pub fn selected_session(&self) -> Option<&SessionInfo> {
         if self.selected_on_new {
             None
         } else {
@@ -188,17 +141,21 @@ impl SessionBar {
         }
     }
 
-    pub(crate) fn selected_is_new(&self) -> bool {
+    /// Is the special "新建" tab currently selected
+    pub fn selected_is_new(&self) -> bool {
         self.selected_on_new
     }
 
-    pub(crate) fn select_previous(&mut self) {
+    /// Move selection left
+    pub fn select_previous(&mut self) {
         if self.selected_on_new {
+            // already at the left-most before first session
             return;
         }
         if self.selected_index > 0 {
             self.selected_index -= 1;
         } else {
+            // At first session; if a New tab exists, move to it
             let has_new = self
                 .current_session_id
                 .as_deref()
@@ -210,8 +167,10 @@ impl SessionBar {
         }
     }
 
-    pub(crate) fn select_next(&mut self) {
+    /// Move selection right
+    pub fn select_next(&mut self) {
         if self.selected_on_new {
+            // Leave the New tab and go to the first session if any
             self.selected_on_new = false;
             if !self.sessions.is_empty() {
                 self.selected_index = 0;
@@ -223,24 +182,35 @@ impl SessionBar {
         }
     }
 
-    pub(crate) fn set_focus(&mut self, focused: bool) {
+    /// Set focus state
+    pub fn set_focus(&mut self, focused: bool) {
         self.has_focus = focused;
     }
 
-    pub(crate) fn set_current_session(&mut self, session_id: Option<String>) {
+    /// Get focus state
+    pub fn has_focus(&self) -> bool {
+        self.has_focus
+    }
+
+    /// Set current session ID
+    pub fn set_current_session(&mut self, session_id: Option<String>) {
+        // Clear status when switching sessions
         if self.current_session_id != session_id {
             self.current_session_status = None;
         }
         self.current_session_id = session_id;
     }
 
-    pub(crate) fn set_session_status(&mut self, session_id: String, status: String) {
+    /// Update status text for the current session only
+    pub fn set_session_status(&mut self, session_id: String, status: String) {
+        // Only update if it's the current session
         if self.current_session_id.as_ref() == Some(&session_id) {
             self.current_session_status = Some(status);
         }
     }
 
-    pub(crate) fn reset_selection_for_focus(&mut self, current_session_id: Option<&str>) {
+    /// Reset selection when the bar gains focus: select current if present, else select "新建".
+    pub fn reset_selection_for_focus(&mut self, current_session_id: Option<&str>) {
         if let Some(id) = current_session_id
             && let Some(pos) = self.sessions.iter().position(|s| s.id == id)
         {
@@ -248,20 +218,30 @@ impl SessionBar {
             self.selected_on_new = false;
             return;
         }
+        // Current not in history -> select New if visible
         self.selected_on_new = true;
         if !self.sessions.is_empty() {
             self.selected_index = 0;
         }
     }
 
-    pub(crate) fn set_session_alias(&mut self, session_id: String, alias: String) {
+    /// Set alias for a session
+    pub fn set_session_alias(&mut self, session_id: String, alias: String) {
         self.alias_manager.set_alias(session_id, alias);
     }
 
-    pub(crate) fn remove_session_alias(&mut self, session_id: &str) {
+    /// Remove alias for a session (e.g., when deleting a session)
+    pub fn remove_session_alias(&mut self, session_id: &str) {
         self.alias_manager.remove_alias(session_id);
     }
 
+    /// Build the session bar lines (similar to tmux status bar)
+    ///
+    /// Label format: Alias/ShortID (no numbering). The current session is
+    /// highlighted by style only. A standalone "新建" is shown only when the
+    /// current session is not present in history.
+    ///
+    /// Returns: (sessions_line, status_line, help_line, sel_start, sel_end, total_left_width)
     fn build_bar_lines(
         &self,
         current_session_id: Option<&str>,
@@ -275,7 +255,10 @@ impl SessionBar {
     ) {
         if let Some(error) = &self.error {
             return (
-                vec![Span::from(" Error: ").red().bold(), error.clone().red()].into(),
+                Line::from(vec![
+                    Span::from(" Error: ").red().bold(),
+                    Span::from(error.clone()).red(),
+                ]),
                 Line::from(""),
                 Line::from(""),
                 None,
@@ -294,11 +277,14 @@ impl SessionBar {
                 spans.push(Span::styled(text, style));
             };
 
+        // Determine whether the current session exists in history
         let current_in_history = current_session_id
             .map(|id| self.sessions.iter().any(|s| s.id == id))
             .unwrap_or(false);
 
+        // Only show a standalone "新建" when the current session is not in history
         if !current_in_history {
+            // Focused + selected → cyan + bold; otherwise dim to let theme drive appearance.
             let new_style = if self.has_focus && self.selected_on_new {
                 Style::default().cyan().add_modifier(Modifier::BOLD)
             } else {
@@ -320,18 +306,19 @@ impl SessionBar {
                 " ".to_string(),
                 Style::default(),
             );
-            left_spans.push("│".dim());
+            left_spans.push(Span::from("│").dim());
             add_left(
                 &mut left_spans,
                 &mut cur_x,
                 " ".to_string(),
                 Style::default(),
             );
-            left_spans.push("No history".italic().dim());
+            left_spans.push(Span::from("No history").italic().dim());
         } else {
             for (idx, session) in self.sessions.iter().enumerate() {
                 let is_selected = self.selected_index == idx;
 
+                // Add separator before each session except the first
                 if idx > 0 || !current_in_history {
                     add_left(
                         &mut left_spans,
@@ -355,40 +342,67 @@ impl SessionBar {
                 };
 
                 let is_current = current_session_id.is_some_and(|id| id == session.id);
+                // Selection/current styling aligned with Codex conventions:
+                // - Focused + selected: cyan + bold
+                // - Current session (regardless of focus): green + bold
+                // - Focused + selected (non-current): cyan + bold
+                // - Otherwise: default
                 let style = if is_current {
+                    // 当前会话始终用绿色高亮
                     Style::default().green().add_modifier(Modifier::BOLD)
                 } else if self.has_focus && is_selected {
+                    // 非当前会话但被选中时用青色
                     Style::default().cyan().add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
 
+                // Get display name: prefer alias, fall back to snippet or ID
                 let display_name = if let Some(alias) = self.alias_manager.get_alias(&session.id) {
                     alias
                 } else if let Some(snippet) = self.label_cache.get(&session.path) {
                     if snippet.is_empty() {
                         session_id.clone()
                     } else {
-                        snippet.clone()
+                        format!("{snippet} · {session_id}")
                     }
                 } else {
                     session_id.clone()
                 };
 
-                if self.has_focus && is_selected && sel_start.is_none() {
+                if is_selected && sel_start.is_none() {
                     sel_start = Some(cur_x);
                 }
                 add_left(&mut left_spans, &mut cur_x, display_name, style);
-                if self.has_focus && is_selected {
+                if is_selected {
                     sel_end = Some(cur_x);
+                }
+
+                if let Some(ind) = session.tumix.as_ref() {
+                    let (label, color) = match ind.state {
+                        TumixState::Running => ("运行", Color::Yellow),
+                        TumixState::Completed => ("完成", Color::Green),
+                        TumixState::Failed => ("失败", Color::Red),
+                        TumixState::Stalled => ("停滞", Color::Magenta),
+                    };
+                    left_spans.push(Span::styled(
+                        format!(" · {label}"),
+                        Style::default().fg(color),
+                    ));
+                }
+                if !is_selected && session.message_count > 0 {
+                    left_spans.push(Span::from(format!("({})", session.message_count)).dim());
                 }
             }
         }
 
+        // Build status line (right side of first line) - always show
         let mut status_spans: Vec<Span<'static>> = Vec::new();
-        status_spans.push(" 状态:".dim());
-        status_spans.push(" ".into());
+        status_spans.push(Span::from(" 状态:").dim());
+        status_spans.push(Span::from(" "));
+        // Build primary status label and current session short name
         let (status_label, status_name) = if let Some(cur_id) = current_session_id {
+            // 优先使用别名，否则使用短ID
             let display_name = if let Some(alias) = self.alias_manager.get_alias(cur_id) {
                 alias
             } else if cur_id.len() > 8 {
@@ -404,45 +418,45 @@ impl SessionBar {
         } else {
             ("就绪".to_string(), "新建".to_string())
         };
-        status_spans.push(status_label.green().bold());
-        status_spans.push("  ".into());
-        status_spans.push("会话:".dim());
-        status_spans.push(" ".into());
-        status_spans.push(status_name.bold());
+        status_spans.push(Span::from(status_label).green().bold());
+        status_spans.push(Span::from("  "));
+        status_spans.push(Span::from("会话:").dim());
+        status_spans.push(Span::from(" "));
+        status_spans.push(Span::from(status_name).bold());
 
+        // Build help line (second line with keyboard shortcuts)
         let mut help_spans: Vec<Span<'static>> = Vec::new();
         if self.has_focus {
+            // Shared key-hint style; all hint texts are dim like the rest of Codex UI
             help_spans.push(key_hint::plain(KeyCode::Left).into());
-            help_spans.push("/".dim());
+            help_spans.push(Span::from("/".to_string()).dim());
             help_spans.push(key_hint::plain(KeyCode::Right).into());
-            help_spans.push(" move  ".dim());
+            help_spans.push(Span::from(" move  ").dim());
 
             help_spans.push(key_hint::plain(KeyCode::Enter).into());
-            help_spans.push(" open  ".dim());
+            help_spans.push(Span::from(" open  ").dim());
 
             help_spans.push(key_hint::plain(KeyCode::Char('n')).into());
-            help_spans.push(" new  ".dim());
+            help_spans.push(Span::from(" new  ").dim());
 
             help_spans.push(key_hint::plain(KeyCode::Char('r')).into());
-            help_spans.push(" rename  ".dim());
-
-            help_spans.push(key_hint::plain(KeyCode::Char('c')).into());
-            help_spans.push(" clone  ".dim());
+            help_spans.push(Span::from(" rename  ").dim());
 
             help_spans.push(key_hint::plain(KeyCode::Char('x')).into());
-            help_spans.push(" delete  ".dim());
+            help_spans.push(Span::from(" delete  ").dim());
 
+            // Use Esc to exit session focus; Tab is reserved elsewhere and disabled here
             help_spans.push(key_hint::plain(KeyCode::Esc).into());
-            help_spans.push(" exit".dim());
+            help_spans.push(Span::from(" exit").dim());
         } else {
             help_spans.push(key_hint::ctrl(KeyCode::Char('p')).into());
-            help_spans.push(" Sessions".dim());
+            help_spans.push(Span::from(" Sessions").dim());
         }
 
         (
-            left_spans.into(),
-            status_spans.into(),
-            help_spans.into(),
+            Line::from(left_spans),
+            Line::from(status_spans),
+            Line::from(help_spans),
             sel_start,
             sel_end,
             cur_x,
@@ -456,12 +470,13 @@ impl WidgetRef for &SessionBar {
             return;
         }
 
+        // Draw a top border line to separate from chat area (dim, theme-friendly)
         let border_rect = Rect::new(area.x, area.y, area.width, 1);
-        "─"
-            .repeat(border_rect.width as usize)
+        Span::from("─".repeat(border_rect.width as usize))
             .dim()
             .render_ref(border_rect, buf);
 
+        // Adjust area to exclude the border line
         let bar_area = Rect {
             x: area.x,
             y: area.y.saturating_add(1),
@@ -469,19 +484,25 @@ impl WidgetRef for &SessionBar {
             height: area.height.saturating_sub(1),
         };
 
+        // Build the status bar lines and scrolling metadata
         let (sessions_line, status_line, help_line, sel_start, sel_end, total_left_width) =
             self.build_bar_lines(self.current_session_id.as_deref());
 
+        // Clear the bar area without forcing background colors so terminal themes apply.
         Clear.render(bar_area, buf);
 
+        // Render two lines: sessions/status on first line, help on second line
         if bar_area.height > 0 {
+            // First line: sessions list + status
+            let first_line_y = bar_area.y;
             let first_line_area = Rect {
                 x: bar_area.x,
-                y: bar_area.y,
+                y: first_line_y,
                 width: bar_area.width,
                 height: 1,
             };
 
+            // Measure status line width for right side
             let status_width: u16 = status_line
                 .spans
                 .iter()
@@ -490,7 +511,7 @@ impl WidgetRef for &SessionBar {
 
             let sessions_width = first_line_area
                 .width
-                .saturating_sub(status_width.saturating_add(3));
+                .saturating_sub(status_width.saturating_add(3)); // 3 for separator
             let sessions_area = Rect {
                 x: first_line_area.x,
                 y: first_line_area.y,
@@ -498,10 +519,11 @@ impl WidgetRef for &SessionBar {
                 height: 1,
             };
 
+            // Draw separator and status on right side (always show)
             if status_width > 0 && sessions_width < first_line_area.width {
                 let sep_x = first_line_area.x + sessions_width;
                 if sep_x < first_line_area.x + first_line_area.width {
-                    " │ "
+                    Span::from(" │ ")
                         .dim()
                         .render_ref(Rect::new(sep_x, first_line_area.y, 3, 1), buf);
                 }
@@ -514,6 +536,7 @@ impl WidgetRef for &SessionBar {
                 Paragraph::new(vec![status_line.clone()]).render(status_area, buf);
             }
 
+            // Compute horizontal scroll for sessions list: center selected when possible
             let mut scroll_x: u16 = 0;
             if let (Some(start), Some(end)) = (sel_start, sel_end) {
                 let sel_center = start.saturating_add(end).saturating_div(2);
@@ -521,21 +544,26 @@ impl WidgetRef for &SessionBar {
                 let desired = sel_center.saturating_sub(half);
                 let max_scroll = total_left_width.saturating_sub(sessions_area.width);
                 scroll_x = desired.min(max_scroll);
+            } else if total_left_width > sessions_area.width {
+                scroll_x = total_left_width.saturating_sub(sessions_area.width);
             }
 
             Paragraph::new(vec![sessions_line])
                 .scroll((0, scroll_x))
                 .render(sessions_area, buf);
 
+            // Second line: help/keyboard shortcuts (right-aligned)
             if bar_area.height > 1 {
                 let second_line_y = bar_area.y + 1;
 
+                // Calculate help text width
                 let help_width: u16 = help_line
                     .spans
                     .iter()
                     .map(|s| UnicodeWidthStr::width(s.content.as_ref()) as u16)
                     .sum();
 
+                // Right-align the help text
                 let help_area = if help_width < bar_area.width {
                     Rect {
                         x: bar_area.x + bar_area.width.saturating_sub(help_width),
@@ -554,117 +582,5 @@ impl WidgetRef for &SessionBar {
                 Paragraph::new(vec![help_line]).render(help_area, buf);
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use anyhow::Result;
-    use pretty_assertions::assert_eq;
-    use tempfile::TempDir;
-
-    fn make_session(id: &str, path: PathBuf) -> SessionInfo {
-        SessionInfo {
-            id: id.to_string(),
-            path,
-            cwd: ".".to_string(),
-            age: "0s".to_string(),
-            mtime: 0,
-            message_count: 0,
-            last_role: "user".to_string(),
-            total_tokens: 0,
-            model: "gpt-5.1-codex-max".to_string(),
-            tumix: None,
-        }
-    }
-
-    #[test]
-    fn refresh_selection_keeps_nearby_when_deleting_selected_session() -> Result<()> {
-        let codex_home = TempDir::new()?;
-        let cwd = TempDir::new()?;
-
-        let path = |name: &str| cwd.path().join(format!("{name}.json"));
-        let mut bar = SessionBar {
-            codex_home: codex_home.path().to_path_buf(),
-            cwd: cwd.path().to_path_buf(),
-            sessions: vec![
-                make_session("A", path("a")),
-                make_session("B", path("b")),
-                make_session("C", path("c")),
-                make_session("D", path("d")),
-            ],
-            selected_index: 2,
-            selected_on_new: false,
-            has_focus: true,
-            loading: false,
-            error: None,
-            current_session_id: Some("A".to_string()),
-            current_session_status: None,
-            label_cache: HashMap::new(),
-            alias_manager: SessionAliasManager::load(codex_home.path().to_path_buf()),
-        };
-
-        let previous_selected_id = bar.selected_session().map(|s| s.id.clone());
-        let previous_selected_index = bar.selected_index;
-        let previous_selected_on_new = bar.selected_on_new;
-
-        bar.sessions = vec![
-            make_session("A", path("a")),
-            make_session("B", path("b")),
-            make_session("D", path("d")),
-        ];
-        bar.reconcile_selection_after_refresh(
-            previous_selected_id,
-            previous_selected_index,
-            previous_selected_on_new,
-            true,
-        );
-
-        assert_eq!(bar.selected_index, 2);
-        assert_eq!(bar.selected_session().map(|s| s.id.as_str()), Some("D"));
-        Ok(())
-    }
-
-    #[test]
-    fn refresh_selection_clamps_when_deleting_last_session() -> Result<()> {
-        let codex_home = TempDir::new()?;
-        let cwd = TempDir::new()?;
-
-        let path = |name: &str| cwd.path().join(format!("{name}.json"));
-        let mut bar = SessionBar {
-            codex_home: codex_home.path().to_path_buf(),
-            cwd: cwd.path().to_path_buf(),
-            sessions: vec![
-                make_session("A", path("a")),
-                make_session("B", path("b")),
-                make_session("C", path("c")),
-            ],
-            selected_index: 2,
-            selected_on_new: false,
-            has_focus: true,
-            loading: false,
-            error: None,
-            current_session_id: Some("A".to_string()),
-            current_session_status: None,
-            label_cache: HashMap::new(),
-            alias_manager: SessionAliasManager::load(codex_home.path().to_path_buf()),
-        };
-
-        let previous_selected_id = bar.selected_session().map(|s| s.id.clone());
-        let previous_selected_index = bar.selected_index;
-        let previous_selected_on_new = bar.selected_on_new;
-
-        bar.sessions = vec![make_session("A", path("a")), make_session("B", path("b"))];
-        bar.reconcile_selection_after_refresh(
-            previous_selected_id,
-            previous_selected_index,
-            previous_selected_on_new,
-            true,
-        );
-
-        assert_eq!(bar.selected_index, 1);
-        assert_eq!(bar.selected_session().map(|s| s.id.as_str()), Some("B"));
-        Ok(())
     }
 }

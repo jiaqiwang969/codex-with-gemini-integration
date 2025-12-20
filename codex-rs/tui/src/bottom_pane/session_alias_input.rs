@@ -1,9 +1,6 @@
-//! Session alias input view.
+//! 会话别名输入视图
 //!
-//! Shown when creating a new session (or renaming an existing session) to let
-//! the user provide a friendly alias.
-
-use std::path::PathBuf;
+//! 当创建新会话时，显示一个简单的输入框让用户为会话命名
 
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -15,27 +12,36 @@ use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
-use ratatui::widgets::Widget as _;
+use ratatui::widgets::Widget;
 
 use super::CancellationEvent;
 use super::bottom_pane_view::BottomPaneView;
 use crate::render::renderable::Renderable;
-use crate::session_alias_manager::SessionAliasManager;
 
+/// 回调函数类型，当用户提交别名时调用
 pub(crate) type AliasSubmitted = Box<dyn Fn(String, String) + Send + Sync>;
 
+/// 会话别名输入视图
 pub(crate) struct SessionAliasInput {
+    /// 会话ID
     session_id: String,
+    /// 用户输入的别名
     input: String,
+    /// 提交回调
     on_submit: AliasSubmitted,
+    /// 是否完成输入
     complete: bool,
+    /// 光标位置
     cursor_position: usize,
+    /// 是否是重命名操作（初始时有别名）
     is_rename_mode: bool,
 }
 
 impl SessionAliasInput {
-    pub(crate) fn new(codex_home: PathBuf, session_id: String, on_submit: AliasSubmitted) -> Self {
-        let alias_manager = SessionAliasManager::load(codex_home);
+    /// 创建新的别名输入视图
+    pub(crate) fn new(session_id: String, on_submit: AliasSubmitted) -> Self {
+        // 尝试加载现有别名作为默认值
+        let alias_manager = crate::session_alias_manager::SessionAliasManager::load();
         let existing_alias = alias_manager.get_alias(&session_id).unwrap_or_default();
         let has_existing = !existing_alias.is_empty();
         let cursor_pos = existing_alias.chars().count();
@@ -50,18 +56,23 @@ impl SessionAliasInput {
         }
     }
 
+    /// 检查是否是重命名操作（初始时有别名）
     fn is_rename(&self) -> bool {
         self.is_rename_mode
     }
 
+    /// 清理和验证别名
     fn sanitize_alias(alias: &str) -> String {
         let trimmed = alias.trim();
+
+        // 限制长度为 30 个字符
         let truncated: String = if trimmed.chars().count() > 30 {
             trimmed.chars().take(30).collect()
         } else {
             trimmed.to_string()
         };
 
+        // 过滤控制字符，保留常见的字符
         truncated
             .chars()
             .filter(|c| !c.is_control() || *c == ' ')
@@ -86,6 +97,7 @@ impl BottomPaneView for SessionAliasInput {
             KeyEvent {
                 code: KeyCode::Esc, ..
             } => {
+                // 用户跳过命名
                 self.complete = true;
             }
             KeyEvent {
@@ -93,6 +105,7 @@ impl BottomPaneView for SessionAliasInput {
                 ..
             } => {
                 if self.cursor_position > 0 {
+                    // 获取光标前的字符边界
                     let mut chars: Vec<char> = self.input.chars().collect();
                     if self.cursor_position <= chars.len() {
                         chars.remove(self.cursor_position - 1);
@@ -145,6 +158,7 @@ impl BottomPaneView for SessionAliasInput {
             } if !modifiers.contains(KeyModifiers::CONTROL)
                 && !modifiers.contains(KeyModifiers::ALT) =>
             {
+                // 限制长度
                 if self.input.chars().count() < 30 && !c.is_control() {
                     let mut chars: Vec<char> = self.input.chars().collect();
                     chars.insert(self.cursor_position, c);
@@ -168,8 +182,10 @@ impl BottomPaneView for SessionAliasInput {
 
 impl Renderable for SessionAliasInput {
     fn render(&self, area: Rect, buf: &mut Buffer) {
+        // 清除背景
         Clear.render(area, buf);
 
+        // 计算内容区域（居中显示）
         let content_height = 6;
         let content_width = 40.min(area.width);
         let start_y = area
@@ -186,56 +202,65 @@ impl Renderable for SessionAliasInput {
             height: content_height,
         };
 
+        // 构建显示内容
         let title_text = if self.is_rename() {
-            "Rename session"
+            "重命名会话"
         } else {
-            "Name this session"
+            "给会话起个名字"
         };
         let mut lines = vec![
             Line::from(""),
-            vec![Span::from("✨ ").magenta(), title_text.cyan().bold()].into(),
+            Line::from(vec![
+                Span::from("✨ ").magenta(),
+                Span::from(title_text).cyan().bold(),
+            ]),
             Line::from(""),
         ];
 
+        // 输入行，包含光标
         let mut input_spans = vec![Span::from("  ")];
         let chars: Vec<char> = self.input.chars().collect();
 
+        // 添加光标前的文本
         if self.cursor_position > 0 {
             let before: String = chars[..self.cursor_position].iter().collect();
-            input_spans.push(before.into());
+            input_spans.push(Span::from(before));
         }
 
+        // 添加光标
         if self.cursor_position < chars.len() {
+            // 光标在字符上
             let cursor_char = chars[self.cursor_position].to_string();
-            input_spans.push(cursor_char.reversed());
+            input_spans.push(Span::from(cursor_char).reversed());
         } else {
-            input_spans.push("_".reversed());
+            // 光标在末尾
+            input_spans.push(Span::from("_").reversed());
         }
 
+        // 添加光标后的文本
         if self.cursor_position + 1 < chars.len() {
             let after: String = chars[self.cursor_position + 1..].iter().collect();
-            input_spans.push(after.into());
+            input_spans.push(Span::from(after));
         }
 
-        lines.push(input_spans.into());
+        lines.push(Line::from(input_spans));
         lines.push(Line::from(""));
 
-        lines.push(
-            vec![
-                "  Press ".dim(),
-                "Enter".green().bold(),
-                " to confirm · ".dim(),
-                "Esc".cyan(),
-                " to skip".dim(),
-            ]
-            .into(),
-        );
+        // 提示行
+        lines.push(Line::from(vec![
+            Span::from("  按 ").dim(),
+            Span::from("Enter").green().bold(),
+            Span::from(" 确认 · ").dim(),
+            Span::from("Esc").cyan(),
+            Span::from(" 跳过").dim(),
+        ]));
 
+        // 渲染
         Paragraph::new(lines).render(content_area, buf);
     }
 
     fn desired_height(&self, _width: u16) -> u16 {
-        8
+        8 // 弹出窗口高度
     }
 }
 
@@ -243,20 +268,23 @@ impl Renderable for SessionAliasInput {
 mod tests {
     use super::*;
 
-    use pretty_assertions::assert_eq;
-
     #[test]
-    fn sanitize_alias_trims_and_limits() {
+    fn test_sanitize_alias() {
+        // 测试正常输入
         assert_eq!(
             SessionAliasInput::sanitize_alias("购物车功能"),
             "购物车功能"
         );
+
+        // 测试去除首尾空格
         assert_eq!(SessionAliasInput::sanitize_alias("  test  "), "test");
 
+        // 测试长度限制
         let long_str = "a".repeat(50);
         let result = SessionAliasInput::sanitize_alias(&long_str);
         assert_eq!(result.chars().count(), 30);
 
+        // 测试空字符串
         assert_eq!(SessionAliasInput::sanitize_alias("   "), "");
     }
 }

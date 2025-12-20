@@ -3,13 +3,13 @@ source: tui/src/pager_overlay.rs
 expression: snapshot
 ---
 / T R A N S C R I P T / / / / / / / / / / / / / / / / / / / / / / / / / / / / /
-• Added foo.txt (+2 -0)
-    1 +hello
-    2 +world
+✓ Patch applied
+src/foo.txt
 
-• Added foo.txt (+2 -0)
-    1 +hello
-    2 +world
-─────────────────────────────────────────────────────────────────────────── 0% ─
- ↑/↓ to scroll   pgup/pgdn to page   home/end to jump
- q to quit   esc to edit prev
+$ ls
+src
+README.md
+✓ • 420ms
+───────────────────────────────────────────────────────────────────────── 100% ─
+ ↑/↓ scroll   PgUp/PgDn page   Home/End jump
+ q quit   Esc edit prev

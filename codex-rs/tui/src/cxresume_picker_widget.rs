@@ -1,6 +1,5 @@
 use crate::pager_overlay::Overlay;
 use crate::render::line_utils;
-use crate::session_alias_manager::SessionAliasManager;
 use codex_ansi_escape::ansi_escape_line;
 use ratatui::layout::Constraint;
 use ratatui::layout::Direction;
@@ -30,6 +29,7 @@ use tracing::warn;
 #[cfg(not(target_os = "android"))]
 use arboard::Clipboard;
 
+pub const NEW_SESSION_SENTINEL: &str = "__cxresume_new_session__";
 const FULL_PREVIEW_WRAP_WIDTH: usize = 76;
 const THEME_GRAY: Color = Color::Gray;
 const THEME_GREEN: Color = Color::Green;
@@ -75,14 +75,6 @@ fn session_id_span(id: &str) -> Span<'static> {
             .fg(THEME_ORANGE)
             .add_modifier(Modifier::BOLD),
     )
-}
-
-fn short_session_id(id: &str) -> String {
-    if id.len() > 8 {
-        format!("{}…", &id[..7])
-    } else {
-        id.to_string()
-    }
 }
 
 fn session_age_span(age: &str) -> Span<'static> {
@@ -592,7 +584,6 @@ impl Pagination {
 pub struct PickerState {
     pub sessions: Vec<SessionInfo>,
     pub selected_idx: usize,
-    alias_manager: SessionAliasManager,
     #[allow(dead_code)]
     pub scroll_offset_left: usize, // For left panel scrolling
     pub scroll_offset_right: usize, // For right panel scrolling
@@ -608,14 +599,13 @@ pub struct PickerState {
 
 impl PickerState {
     /// Create a new picker state from sessions list
-    pub fn new(sessions: Vec<SessionInfo>, alias_manager: SessionAliasManager) -> Self {
+    pub fn new(sessions: Vec<SessionInfo>) -> Self {
         let items_count = sessions.len();
         let pagination = Pagination::new(items_count, 30); // 30 items per page
         let running = has_running_tumix(&sessions);
         let mut picker_state = PickerState {
             sessions,
             selected_idx: 0,
-            alias_manager,
             scroll_offset_left: 0,
             scroll_offset_right: 0,
             pagination,
@@ -630,10 +620,6 @@ impl PickerState {
         // Prefetch the first visible page of sessions on initial load
         picker_state.prefetch_visible_page();
         picker_state
-    }
-
-    pub(crate) fn reload_aliases(&mut self, codex_home: &Path) {
-        self.alias_manager = SessionAliasManager::load(codex_home.to_path_buf());
     }
 
     /// Get currently selected session
@@ -731,15 +717,10 @@ impl PickerState {
     /// Open delete confirmation modal
     pub fn confirm_delete(&mut self) {
         if let Some(session) = self.sessions.get(self.selected_idx) {
-            let session_label = if let Some(alias) = self.alias_manager.get_alias(&session.id) {
-                let short_id = short_session_id(&session.id);
-                format!("{alias} ({short_id})")
-            } else {
-                session.id.clone()
-            };
             self.modal_active = true;
             self.modal_message = format!(
-                "Delete session '{session_label}'?\nThis action cannot be undone.\n\nPress 'y' to confirm or 'n' to cancel."
+                "Delete session '{}'?\nThis action cannot be undone.\n\nPress 'y' to confirm or 'n' to cancel.",
+                session.id
             );
         }
     }
@@ -816,7 +797,6 @@ impl PickerState {
         }
     }
 
-    #[allow(dead_code)]
     pub fn reload_sessions(&mut self, sessions: Vec<SessionInfo>) {
         let per_page = self.pagination.items_per_page;
         let previous_id = self.selected_session().map(|s| s.id.clone());
@@ -873,11 +853,20 @@ impl PickerState {
         self.animation_tick
     }
 
-    #[allow(dead_code)]
     fn refresh_running_flag(&mut self) {
         self.has_running_tumix = has_running_tumix(&self.sessions);
         if !self.has_running_tumix {
             self.animation_tick = 0;
+        }
+    }
+
+    pub fn has_running_tumix(&self) -> bool {
+        self.has_running_tumix
+    }
+
+    pub fn inherit_animation(&mut self, other: &PickerState) {
+        if self.has_running_tumix && other.has_running_tumix() {
+            self.animation_tick = other.animation_frame();
         }
     }
 }
@@ -902,18 +891,16 @@ pub enum PickerEvent {
     FocusRight,
 
     // Actions
-    Resume,        // Enter key - resume selected session
-    NewSession,    // n key - create new session
-    Rename,        // r key - rename (alias) selected session
-    Clone,         // c key - clone selected session
-    Delete,        // x/d key - confirm delete
-    CopySessionId, // y key - copy to clipboard
+    Resume, // Enter key - return selected session
+    Delete, // d key - confirm delete
     #[allow(dead_code)]
     ToggleViewMode, // f key - cycle through views
+    CopySessionId, // c key - copy to clipboard
+    NewSession, // n key - create new
 
     // Navigation modes
     CycleViewMode, // f key - Split → FullPreview → SessionOnly → Split
-    Refresh,       // R key - refresh sessions list
+    Refresh,       // r key - refresh sessions list
 
     // Dialog control
     ConfirmAction, // y key in modal
@@ -924,19 +911,10 @@ pub enum PickerEvent {
     Exit, // q or Esc
 }
 
-#[derive(Debug, Clone)]
-pub(crate) enum SessionPickerOutcome {
-    Exit,
-    NewSession,
-    Resume(PathBuf),
-    Rename { session_id: String },
-    Clone { source_path: PathBuf },
-    Refresh,
-}
-
 impl PickerState {
     /// Handle a picker event and update state accordingly
-    pub fn handle_event(&mut self, event: PickerEvent) -> Option<SessionPickerOutcome> {
+    /// Returns Some(session_id) when: (1) session to resume, (2) session to delete (empty string = exit)
+    pub fn handle_event(&mut self, event: PickerEvent) -> Option<String> {
         if self.modal_active {
             // In modal mode, only handle confirm/cancel
             match event {
@@ -945,7 +923,7 @@ impl PickerState {
                     if let Some(session) = self.sessions.get(self.selected_idx) {
                         let session_id = session.id.clone();
                         let session_path = session.path.clone();
-                        self.close_modal();
+                        self.modal_active = false;
 
                         // Remove from sessions list
                         self.sessions.remove(self.selected_idx);
@@ -960,7 +938,6 @@ impl PickerState {
 
                         // Delete the file
                         let _ = fs::remove_file(&session_path);
-                        self.alias_manager.remove_alias(&session_id);
 
                         // Clear cache entries for this session
                         self.cache.remove_preview(&session_id);
@@ -1040,9 +1017,9 @@ impl PickerState {
             }
 
             PickerEvent::Resume => {
-                return self
-                    .selected_session()
-                    .map(|session| SessionPickerOutcome::Resume(session.path.clone()));
+                if let Some(session) = self.selected_session() {
+                    return Some(session.id.clone());
+                }
             }
 
             PickerEvent::Delete => {
@@ -1058,31 +1035,15 @@ impl PickerState {
             }
 
             PickerEvent::NewSession => {
-                return Some(SessionPickerOutcome::NewSession);
-            }
-
-            PickerEvent::Rename => {
-                return self
-                    .selected_session()
-                    .map(|session| SessionPickerOutcome::Rename {
-                        session_id: session.id.clone(),
-                    });
-            }
-
-            PickerEvent::Clone => {
-                return self
-                    .selected_session()
-                    .map(|session| SessionPickerOutcome::Clone {
-                        source_path: session.path.clone(),
-                    });
+                return Some(NEW_SESSION_SENTINEL.to_string());
             }
 
             PickerEvent::Refresh => {
-                return Some(SessionPickerOutcome::Refresh);
+                // Would trigger refresh callback
             }
 
             PickerEvent::Exit => {
-                return Some(SessionPickerOutcome::Exit);
+                return Some(String::new()); // Signal exit
             }
 
             _ => {}
@@ -1114,13 +1075,11 @@ impl PickerState {
             KeyCode::Right => Some(PickerEvent::FocusRight),
 
             KeyCode::Enter => Some(PickerEvent::Resume),
-            KeyCode::Char('x') | KeyCode::Char('d') => Some(PickerEvent::Delete),
+            KeyCode::Char('d') => Some(PickerEvent::Delete),
             KeyCode::Char('f') => Some(PickerEvent::CycleViewMode),
-            KeyCode::Char('y') => Some(PickerEvent::CopySessionId),
+            KeyCode::Char('c') => Some(PickerEvent::CopySessionId),
             KeyCode::Char('n') => Some(PickerEvent::NewSession),
-            KeyCode::Char('r') => Some(PickerEvent::Rename),
-            KeyCode::Char('c') => Some(PickerEvent::Clone),
-            KeyCode::Char('R') => Some(PickerEvent::Refresh),
+            KeyCode::Char('r') => Some(PickerEvent::Refresh),
 
             KeyCode::Char('q') => Some(PickerEvent::Exit),
             KeyCode::Esc => Some(PickerEvent::Exit),
@@ -1128,6 +1087,17 @@ impl PickerState {
             _ => None,
         }
     }
+}
+
+/// Get current working directory
+fn get_cwd() -> Result<PathBuf, String> {
+    std::env::current_dir().map_err(|e| format!("Failed to get current directory: {e}"))
+}
+
+/// Get sessions directory
+fn get_sessions_dir() -> Result<PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|e| format!("Failed to get HOME: {e}"))?;
+    Ok(PathBuf::from(home).join(".codex/sessions"))
 }
 
 /// Extract enhanced session metadata from .jsonl file
@@ -1537,15 +1507,11 @@ fn format_relative_time(mtime: u64) -> String {
     }
 }
 
-/// Get sessions in `codex_home/sessions` scoped to `cwd`.
-pub(crate) fn get_cwd_sessions(
-    codex_home: &Path,
-    cwd_raw: &Path,
-) -> Result<Vec<SessionInfo>, String> {
-    let cwd = cwd_raw
-        .canonicalize()
-        .unwrap_or_else(|_| cwd_raw.to_path_buf());
-    let sessions_dir = codex_home.join("sessions");
+/// Get sessions in current working directory with enhanced metadata
+pub fn get_cwd_sessions() -> Result<Vec<SessionInfo>, String> {
+    let cwd_raw = get_cwd()?;
+    let cwd = cwd_raw.canonicalize().unwrap_or(cwd_raw);
+    let sessions_dir = get_sessions_dir()?;
     let mut sessions = Vec::new();
 
     fn find_sessions(
@@ -1977,16 +1943,7 @@ fn format_left_panel_sessions_paginated(
             line1_spans.push(tumix_badge_span());
             line1_spans.push(Span::from(" "));
         }
-        let alias = state.alias_manager.get_alias(&session.id);
-        if let Some(alias) = alias {
-            let short_id = short_session_id(session.id.as_str());
-            line1_spans.push(Span::from(alias).cyan().bold());
-            line1_spans.push(" ".into());
-            line1_spans.push(Span::from(format!("({short_id})")).dim());
-        } else {
-            let short_id = short_session_id(session.id.as_str());
-            line1_spans.push(session_id_span(short_id.as_str()));
-        }
+        line1_spans.push(session_id_span(session.id.as_str()));
         line1_spans.push(Span::from("  "));
         line1_spans.push(session_age_span(session.age.as_str()));
 
@@ -2029,24 +1986,13 @@ fn format_left_panel_sessions_paginated(
 }
 
 /// Format right panel: message preview with block-style format
-fn format_right_panel_preview(
-    session: &SessionInfo,
-    session_alias: Option<String>,
-    width: u16,
-) -> Vec<Line<'static>> {
+fn format_right_panel_preview(session: &SessionInfo, width: u16) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let effective_width = width.max(1);
 
-    let session_id = stylize_session_id(session.id.as_str());
-    let header_session = if let Some(alias) = session_alias {
-        let alias = alias.as_str().cyan().bold().to_string();
-        format!("{alias} ({session_id})")
-    } else {
-        session_id
-    };
-
     lines.push(ansi_escape_line(&format!(
-        "▸ Session: {header_session} │ Path: {session_path}",
+        "▸ Session: {session_id} │ Path: {session_path}",
+        session_id = stylize_session_id(session.id.as_str()),
         session_path = stylize_cwd(session.cwd.as_str()),
     )));
     lines.push(ansi_escape_line(&format!(
@@ -2344,22 +2290,16 @@ fn format_message_blocks(session: &SessionInfo, width: u16) -> Vec<Line<'static>
 }
 
 /// Format session preview with recent messages
-fn format_session_preview(
-    session: &SessionInfo,
-    session_alias: Option<String>,
-) -> Vec<Line<'static>> {
+fn format_session_preview(session: &SessionInfo) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     lines.push(Line::from(""));
     lines.push("SESSION PREVIEW - Recent Messages".bold().cyan().into());
     lines.push(Line::from(""));
-    let session_id = session.id.as_str().cyan();
-    let session_display = if let Some(alias) = session_alias {
-        format!("{} ({})", alias.as_str().cyan().bold(), session_id)
-    } else {
-        format!("{session_id}")
-    };
-    lines.push(ansi_escape_line(&format!("Session: {session_display}",)));
+    lines.push(ansi_escape_line(&format!(
+        "Session: {}",
+        session.id.as_str().cyan()
+    )));
     lines.push(ansi_escape_line(&format!(
         "Model: {}",
         session.model.as_str().cyan()
@@ -2407,30 +2347,22 @@ fn format_session_preview(
     lines
 }
 
-/// Build picker state for `codex_home/sessions` scoped to `cwd`.
-pub(crate) fn load_picker_state(codex_home: &Path, cwd: &Path) -> Result<PickerState, String> {
-    let mut sessions = get_cwd_sessions(codex_home, cwd)?;
+/// Build picker state for the current working directory.
+pub fn load_picker_state() -> Result<PickerState, String> {
+    let mut sessions = get_cwd_sessions()?;
     let tumix_index = load_tumix_status_index();
     for session in &mut sessions {
         if let Some(indicator) = tumix_index.lookup(&session.id, &session.path) {
             session.tumix = Some(indicator);
         }
     }
-    let alias_manager = SessionAliasManager::load(codex_home.to_path_buf());
-    Ok(PickerState::new(sessions, alias_manager))
+    Ok(PickerState::new(sessions))
 }
 
 /// Create a comprehensive Split View session picker overlay
-pub(crate) fn create_session_picker_overlay(
-    codex_home: &Path,
-    cwd: &Path,
-) -> Result<Overlay, String> {
-    let state = load_picker_state(codex_home, cwd)?;
-    let picker_overlay = crate::pager_overlay::SessionPickerOverlay::from_state(
-        codex_home.to_path_buf(),
-        cwd.to_path_buf(),
-        state,
-    );
+pub fn create_session_picker_overlay() -> Result<Overlay, String> {
+    let state = load_picker_state()?;
+    let picker_overlay = crate::pager_overlay::SessionPickerOverlay::from_state(state);
     Ok(Overlay::SessionPicker(Box::new(picker_overlay)))
 }
 
@@ -2502,13 +2434,7 @@ fn render_split_body(frame: &mut crate::custom_terminal::Frame, area: Rect, stat
     if area.width <= 2 || area.height == 0 {
         let fallback = state
             .selected_session()
-            .map(|session| {
-                format_right_panel_preview(
-                    session,
-                    state.alias_manager.get_alias(&session.id),
-                    area.width,
-                )
-            })
+            .map(|session| format_right_panel_preview(session, area.width))
             .unwrap_or_else(|| vec!["Select a session to preview messages".dim().into()]);
         Paragraph::new(fallback).render(area, frame.buffer_mut());
         return;
@@ -2546,13 +2472,7 @@ fn render_split_body(frame: &mut crate::custom_terminal::Frame, area: Rect, stat
     let right_width = regions[2].width.max(1);
     let right_lines = state
         .selected_session()
-        .map(|session| {
-            format_right_panel_preview(
-                session,
-                state.alias_manager.get_alias(&session.id),
-                right_width,
-            )
-        })
+        .map(|session| format_right_panel_preview(session, right_width))
         .unwrap_or_else(|| vec!["Select a session to preview messages".dim().into()]);
     let right_visible = slice_preview_lines(
         right_lines,
@@ -2580,7 +2500,7 @@ fn render_full_preview_body(
 ) {
     let lines = state
         .selected_session()
-        .map(|session| format_session_preview(session, state.alias_manager.get_alias(&session.id)))
+        .map(format_session_preview)
         .unwrap_or_else(|| vec!["No session selected".cyan().into()]);
     let offset = if state.focus == FocusPane::RightPreview {
         state.scroll_offset_right
@@ -2746,13 +2666,10 @@ fn build_footer_lines(state: &PickerState) -> Vec<Line<'static>> {
         "  ↑↓      Navigate sessions       Page↑/↓  Page jump       ←→      Switch focus",
     ));
     lines.push(ansi_escape_line(
-        "  Enter   Resume session         x      Delete              f        Full preview",
+        "  Enter   Resume session         d      Delete              f        Full preview",
     ));
     lines.push(ansi_escape_line(
-        "  n       New session            r      Rename              c        Clone",
-    ));
-    lines.push(ansi_escape_line(
-        "  y       Copy ID                R      Refresh             q/Esc    Close",
+        "  n       New session            c      Copy ID             q/Esc    Close",
     ));
     lines.push(Line::from(""));
     lines

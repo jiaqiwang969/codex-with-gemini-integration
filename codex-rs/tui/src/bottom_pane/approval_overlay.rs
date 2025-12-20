@@ -451,39 +451,45 @@ fn exec_options(
     proposed_execpolicy_amendment: Option<ExecPolicyAmendment>,
     features: &Features,
 ) -> Vec<ApprovalOption> {
-    vec![ApprovalOption {
-        label: "Yes, proceed".to_string(),
-        decision: ApprovalDecision::Review(ReviewDecision::Approved),
-        display_shortcut: None,
-        additional_shortcuts: vec![key_hint::plain(KeyCode::Char('y'))],
-    }]
-    .into_iter()
-    .chain(
-        proposed_execpolicy_amendment
-            .filter(|_| features.enabled(Feature::ExecPolicy))
-            .map(|prefix| {
-                let rendered_prefix = strip_bash_lc_and_escape(prefix.command());
-                ApprovalOption {
-                    label: format!(
-                        "Yes, and don't ask again for commands that start with `{rendered_prefix}`"
-                    ),
-                    decision: ApprovalDecision::Review(
-                        ReviewDecision::ApprovedExecpolicyAmendment {
-                            proposed_execpolicy_amendment: prefix,
-                        },
-                    ),
-                    display_shortcut: None,
-                    additional_shortcuts: vec![key_hint::plain(KeyCode::Char('p'))],
-                }
+    let mut options = vec![
+        ApprovalOption {
+            label: "Yes, proceed".to_string(),
+            decision: ApprovalDecision::Review(ReviewDecision::Approved),
+            display_shortcut: None,
+            additional_shortcuts: vec![key_hint::plain(KeyCode::Char('y'))],
+        },
+        ApprovalOption {
+            label: "Yes, and don't ask again for this command".to_string(),
+            decision: ApprovalDecision::Review(ReviewDecision::ApprovedForSession),
+            display_shortcut: None,
+            additional_shortcuts: vec![key_hint::plain(KeyCode::Char('a'))],
+        },
+    ];
+
+    if let Some(prefix) = proposed_execpolicy_amendment
+        .filter(|_| features.enabled(Feature::ExecPolicy))
+    {
+        let rendered_prefix = strip_bash_lc_and_escape(prefix.command());
+        options.push(ApprovalOption {
+            label: format!(
+                "Yes, and don't ask again for commands that start with `{rendered_prefix}`"
+            ),
+            decision: ApprovalDecision::Review(ReviewDecision::ApprovedExecpolicyAmendment {
+                proposed_execpolicy_amendment: prefix,
             }),
-    )
-    .chain([ApprovalOption {
+            display_shortcut: None,
+            additional_shortcuts: vec![key_hint::plain(KeyCode::Char('p'))],
+        });
+    }
+
+    options.push(ApprovalOption {
         label: "No, and tell Codex what to do differently".to_string(),
         decision: ApprovalDecision::Review(ReviewDecision::Abort),
         display_shortcut: Some(key_hint::plain(KeyCode::Esc)),
         additional_shortcuts: vec![key_hint::plain(KeyCode::Char('n'))],
-    }])
-    .collect()
+    });
+
+    options
 }
 
 fn patch_options() -> Vec<ApprovalOption> {
@@ -629,7 +635,7 @@ mod tests {
                 features
             },
         );
-        assert_eq!(view.options.len(), 2);
+        assert_eq!(view.options.len(), 3);
         view.handle_key_event(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
         assert!(!view.is_complete());
         assert!(rx.try_recv().is_err());
