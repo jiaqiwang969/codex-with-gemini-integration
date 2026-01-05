@@ -375,6 +375,10 @@ pub(crate) struct ChatWidget {
     last_generated_image_path: Option<PathBuf>,
     // UI-level view of the active reference image set for this session.
     ref_images: RefImageManager,
+    // Batch image processing state
+    batch_image_state: Option<BatchImageState>,
+    // Pending PDF update state for async processing
+    pending_pdf_update: Option<PendingPdfUpdate>,
 }
 
 struct UserMessage {
@@ -389,6 +393,94 @@ struct UserMessage {
 /// via `Op::SetReferenceImages` / `Op::ClearReferenceImages`.
 struct RefImageManager {
     active_paths: Vec<PathBuf>,
+}
+
+/// State for batch image processing via `/ref-image-batch`.
+struct BatchImageState {
+    /// Directory containing images to process.
+    source_dir: PathBuf,
+    /// Queue of remaining image paths to process.
+    pending_images: VecDeque<PathBuf>,
+    /// The prompt to use for each image.
+    prompt: String,
+    /// Total count for progress display.
+    total_count: usize,
+    /// Number of images successfully processed.
+    processed_count: usize,
+    /// Currently processing image path.
+    current_image: Option<PathBuf>,
+    /// If this is a PDF update operation, the original PDF path for output.
+    original_pdf_path: Option<PathBuf>,
+}
+
+impl BatchImageState {
+    fn new(source_dir: PathBuf, images: Vec<PathBuf>, prompt: String) -> Self {
+        let total_count = images.len();
+        Self {
+            source_dir,
+            pending_images: images.into(),
+            prompt,
+            total_count,
+            processed_count: 0,
+            current_image: None,
+            original_pdf_path: None,
+        }
+    }
+
+    fn new_for_pdf(source_dir: PathBuf, images: Vec<PathBuf>, prompt: String, pdf_path: PathBuf) -> Self {
+        let total_count = images.len();
+        Self {
+            source_dir,
+            pending_images: images.into(),
+            prompt,
+            total_count,
+            processed_count: 0,
+            current_image: None,
+            original_pdf_path: Some(pdf_path),
+        }
+    }
+
+    fn next_image(&mut self) -> Option<PathBuf> {
+        self.current_image = self.pending_images.pop_front();
+        self.current_image.clone()
+    }
+
+    fn mark_current_processed(&mut self) {
+        if self.current_image.is_some() {
+            self.processed_count += 1;
+            self.current_image = None;
+        }
+    }
+
+    fn progress_message(&self) -> String {
+        format!(
+            "[Batch] Processing {}/{}: {:?}",
+            self.processed_count + 1,
+            self.total_count,
+            self.current_image
+                .as_ref()
+                .map(|p| p.file_name().unwrap_or_default())
+                .unwrap_or_default()
+        )
+    }
+
+    fn completion_message(&self) -> String {
+        format!(
+            "[Batch] Complete! Processed {} images in {:?}",
+            self.processed_count,
+            self.source_dir.file_name().unwrap_or_default()
+        )
+    }
+}
+
+/// State for pending PDF update operation via `/pdf-update`.
+struct PendingPdfUpdate {
+    /// Path to the PDF file.
+    pdf_path: PathBuf,
+    /// Directory where processed images will be stored.
+    images_output_dir: PathBuf,
+    /// The prompt to use for batch image processing.
+    prompt: String,
 }
 
 impl RefImageManager {
@@ -668,6 +760,724 @@ impl ChatWidget {
         }
     }
 
+    pub(crate) fn handle_image_quality_command(&mut self, args: Option<String>) {
+        let valid_options = "1K, 2K, 4K";
+
+        let size_arg = args.as_deref().map(|s| s.trim().to_uppercase());
+        match size_arg {
+            None => {
+                let message = format!(
+                    "Usage: /image-quality <size>\n\
+                     • `1K` — 1024x1024 (default, fastest)\n\
+                     • `2K` — 2048x2048 (balanced)\n\
+                     • `4K` — 4096x4096 (highest quality, slower)\n\n\
+                     Valid options: {valid_options}"
+                );
+                self.add_info_message(message, None);
+            }
+            Some(ref s) if s.is_empty() => {
+                let message = format!(
+                    "Usage: /image-quality <size>\n\
+                     • `1K` — 1024x1024 (default, fastest)\n\
+                     • `2K` — 2048x2048 (balanced)\n\
+                     • `4K` — 4096x4096 (highest quality, slower)\n\n\
+                     Valid options: {valid_options}"
+                );
+                self.add_info_message(message, None);
+            }
+            Some(size) => {
+                if matches!(size.as_str(), "1K" | "2K" | "4K") {
+                    self.submit_op(Op::SetImageQuality { size: size.clone() });
+                    self.add_info_message(format!("Image quality set to {size}"), None);
+                } else {
+                    self.add_info_message(
+                        format!(
+                            "Invalid image quality '{}'. Valid options: {valid_options}",
+                            size
+                        ),
+                        None,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Handle `/ref-image-batch <path> -- <prompt>` command for batch image processing.
+    pub(crate) fn handle_ref_image_batch_command(&mut self, args: Option<String>) {
+        let raw = args.unwrap_or_default();
+        let trimmed = raw.trim();
+
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("help") {
+            let help = "Usage: /ref-image-batch <folder_path> -- <prompt>\n\n\
+                        Batch process all images in a folder with the same prompt.\n\
+                        Images are processed one by one to avoid rate limits.\n\
+                        Output images are saved as `<original_name>_processed.<ext>`.\n\n\
+                        Supported formats: .png, .jpg, .jpeg, .webp, .gif\n\n\
+                        Example:\n\
+                        /ref-image-batch ./photos -- Convert to oil painting style";
+            self.add_info_message(help.to_string(), None);
+            return;
+        }
+
+        // Parse: <path> -- <prompt>
+        let Some((path_raw, prompt_raw)) = trimmed.split_once("--") else {
+            self.add_info_message(
+                "Error: Missing prompt. Use: /ref-image-batch <folder> -- <prompt>".to_string(),
+                None,
+            );
+            return;
+        };
+
+        let path_str = path_raw.trim();
+        let prompt = prompt_raw.trim().to_string();
+
+        if prompt.is_empty() {
+            self.add_info_message("Error: Prompt cannot be empty.".to_string(), None);
+            return;
+        }
+
+        // Resolve the path
+        let source_dir = if path_str.starts_with('/') {
+            PathBuf::from(path_str)
+        } else if let Some(stripped) = path_str.strip_prefix("~/") {
+            if let Some(home) = dirs::home_dir() {
+                home.join(stripped)
+            } else {
+                self.config.cwd.join(path_str)
+            }
+        } else {
+            self.config.cwd.join(path_str)
+        };
+
+        if !source_dir.exists() {
+            self.add_info_message(
+                format!("Error: Path does not exist: {}", source_dir.display()),
+                None,
+            );
+            return;
+        }
+
+        if !source_dir.is_dir() {
+            self.add_info_message(
+                format!("Error: Path is not a directory: {}", source_dir.display()),
+                None,
+            );
+            return;
+        }
+
+        // Scan for image files
+        let image_extensions = ["png", "jpg", "jpeg", "webp", "gif"];
+        let mut images: Vec<PathBuf> = Vec::new();
+
+        if let Ok(entries) = std::fs::read_dir(&source_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                        let ext_lower = ext.to_lowercase();
+                        // Skip already processed files
+                        if !path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.ends_with("_processed"))
+                            .unwrap_or(false)
+                            && image_extensions.contains(&ext_lower.as_str())
+                        {
+                            images.push(path);
+                        }
+                    }
+                }
+            }
+        }
+
+        if images.is_empty() {
+            self.add_info_message(
+                format!(
+                    "No images found in: {}\nSupported formats: {:?}",
+                    source_dir.display(),
+                    image_extensions
+                ),
+                None,
+            );
+            return;
+        }
+
+        // Sort by filename for consistent ordering
+        images.sort();
+
+        let total = images.len();
+        self.add_info_message(
+            format!(
+                "[Batch] Starting batch processing of {} images in {}\nPrompt: {}",
+                total,
+                source_dir.display(),
+                prompt
+            ),
+            None,
+        );
+
+        // Initialize batch state
+        self.batch_image_state = Some(BatchImageState::new(source_dir, images, prompt));
+
+        // Start processing the first image
+        self.process_next_batch_image();
+    }
+
+    /// Handle the /pdf-update command for PDF watermark removal and batch processing.
+    ///
+    /// Usage: /pdf-update <pdf_path> -- <prompt>
+    ///
+    /// This command:
+    /// 1. Converts PDF to images and removes watermarks (via watermark-remover MCP server)
+    /// 2. Processes each image with the given prompt (via Gemini)
+    /// 3. Merges processed images back into a PDF
+    pub(crate) fn handle_pdf_update_command(&mut self, args: Option<String>) {
+        let raw = args.unwrap_or_default();
+        let trimmed = raw.trim();
+
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("help") {
+            let help = "Usage: /pdf-update <pdf_path> -- <prompt>\n\n\
+                        Process PDF: remove watermarks and apply image transformations.\n\n\
+                        ═══════════════════════════════════════════════════════════════\n\
+                        SETUP REQUIRED:\n\
+                        ═══════════════════════════════════════════════════════════════\n\n\
+                        1. Install Python dependencies:\n\
+                           pip install pdf2image img2pdf opencv-python-headless numpy Pillow\n\n\
+                        2. Install poppler (for PDF processing):\n\
+                           macOS:  brew install poppler\n\
+                           Ubuntu: sudo apt install poppler-utils\n\n\
+                        3. Configure MCP server in ~/.codex/config.toml:\n\
+                           [mcp_servers.watermark-remover]\n\
+                           command = \"/path/to/watermark-remover-mcp-server\"\n\
+                           env = { WATERMARK_SCRIPTS_DIR = \"/path/to/scripts\" }\n\n\
+                        ═══════════════════════════════════════════════════════════════\n\n\
+                        Example:\n\
+                        /pdf-update ~/Documents/report.pdf -- Convert to oil painting style";
+            self.add_info_message(help.to_string(), None);
+            return;
+        }
+
+        // Parse: <path> -- <prompt>
+        let Some((path_raw, prompt_raw)) = trimmed.split_once("--") else {
+            self.add_info_message(
+                "Error: Missing prompt. Use: /pdf-update <pdf_path> -- <prompt>".to_string(),
+                None,
+            );
+            return;
+        };
+
+        let path_str = path_raw.trim();
+        let prompt = prompt_raw.trim().to_string();
+
+        if prompt.is_empty() {
+            self.add_info_message("Error: Prompt cannot be empty.".to_string(), None);
+            return;
+        }
+
+        // Resolve the PDF path
+        let pdf_path = if path_str.starts_with('/') {
+            PathBuf::from(path_str)
+        } else if let Some(stripped) = path_str.strip_prefix("~/") {
+            if let Some(home) = dirs::home_dir() {
+                home.join(stripped)
+            } else {
+                self.config.cwd.join(path_str)
+            }
+        } else {
+            self.config.cwd.join(path_str)
+        };
+
+        if !pdf_path.exists() {
+            self.add_info_message(
+                format!("Error: PDF file does not exist: {}", pdf_path.display()),
+                None,
+            );
+            return;
+        }
+
+        if !pdf_path.is_file() {
+            self.add_info_message(
+                format!("Error: Path is not a file: {}", pdf_path.display()),
+                None,
+            );
+            return;
+        }
+
+        // Check file extension
+        let extension = pdf_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_lowercase());
+
+        if extension.as_deref() != Some("pdf") {
+            self.add_info_message(
+                format!(
+                    "Error: File does not appear to be a PDF: {}",
+                    pdf_path.display()
+                ),
+                None,
+            );
+            return;
+        }
+
+        // Build the images output directory path: ~/.codex/images/{session_id}/{pdf_stem}_images/
+        let pdf_stem = pdf_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("pdf");
+        let session_id = self
+            .conversation_id
+            .as_ref()
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let images_output_dir = self
+            .config
+            .codex_home
+            .join("images")
+            .join(&session_id)
+            .join(format!("{}_images", pdf_stem));
+
+        self.add_info_message(
+            format!(
+                "[PDF Update] Starting PDF processing...\n\
+                 Input: {}\n\
+                 Output: {}\n\
+                 Prompt: {}\n\n\
+                 Step 1: Removing watermarks...",
+                pdf_path.display(),
+                images_output_dir.display(),
+                prompt
+            ),
+            None,
+        );
+
+        // Store the pending PDF update state for async processing
+        self.pending_pdf_update = Some(PendingPdfUpdate {
+            pdf_path,
+            images_output_dir,
+            prompt,
+        });
+
+        // Trigger the async PDF processing
+        self.start_pdf_watermark_removal();
+    }
+
+    /// Start the async PDF watermark removal process
+    fn start_pdf_watermark_removal(&mut self) {
+        let Some(pending) = self.pending_pdf_update.as_ref() else {
+            return;
+        };
+
+        let pdf_path = pending.pdf_path.clone();
+        let images_output_dir = pending.images_output_dir.clone();
+
+        // Create output directory
+        if let Err(e) = std::fs::create_dir_all(&images_output_dir) {
+            self.add_info_message(
+                format!("Error creating output directory: {}", e),
+                None,
+            );
+            self.pending_pdf_update = None;
+            return;
+        }
+
+        // Embedded Python script for PDF processing and watermark removal
+        const PDF_PROCESS_SCRIPT: &str = r#"
+import sys
+import os
+from pathlib import Path
+
+def main():
+    if len(sys.argv) < 3:
+        print("Usage: python script.py <input_pdf> <output_dir> [dpi]", file=sys.stderr)
+        sys.exit(1)
+
+    input_pdf = sys.argv[1]
+    output_dir = sys.argv[2]
+    dpi = int(sys.argv[3]) if len(sys.argv) > 3 else 200
+
+    if not os.path.exists(input_pdf):
+        print(f"Error: Input PDF not found: {input_pdf}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        from pdf2image import convert_from_path
+        import cv2
+        import numpy as np
+    except ImportError as e:
+        print(f"Error: Missing dependency: {e}", file=sys.stderr)
+        print("Run: pip install pdf2image opencv-python-headless numpy", file=sys.stderr)
+        sys.exit(1)
+
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    print(f"Converting PDF to images (DPI={dpi})...")
+    try:
+        images = convert_from_path(input_pdf, dpi=dpi)
+    except Exception as e:
+        print(f"Error converting PDF: {e}", file=sys.stderr)
+        print("Make sure poppler is installed (brew install poppler)", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Total pages: {len(images)}")
+    print("Removing watermarks...")
+    processed_count = 0
+
+    for i, image in enumerate(images):
+        temp_path = os.path.join(output_dir, f"_temp_{i}.png")
+        output_path = os.path.join(output_dir, f"page_{i+1:03d}.png")
+        image.save(temp_path, "PNG")
+
+        img = cv2.imread(temp_path)
+        height, width = img.shape[:2]
+        roi_x, roi_y = int(width * 0.80), int(height * 0.92)
+        roi = img[roi_y:height, roi_x:width]
+        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        mask_roi = cv2.inRange(gray_roi, 150, 240)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        mask_roi = cv2.dilate(mask_roi, kernel, iterations=2)
+        mask = np.zeros((height, width), dtype=np.uint8)
+        mask[roi_y:height, roi_x:width] = mask_roi
+
+        if np.sum(mask) > 100:
+            kernel_expand = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+            mask = cv2.dilate(mask, kernel_expand, iterations=1)
+            result = cv2.inpaint(img, mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+            cv2.imwrite(output_path, result)
+            processed_count += 1
+            print(f"  page_{i+1:03d}.png: watermark removed")
+        else:
+            cv2.imwrite(output_path, img)
+            print(f"  page_{i+1:03d}.png: no watermark")
+        os.remove(temp_path)
+
+    print(f"Done! {len(images)} pages, {processed_count} watermarks removed")
+
+if __name__ == "__main__":
+    main()
+"#;
+
+        // Write script to temp file and execute
+        let temp_dir = std::env::temp_dir();
+        let script_path = temp_dir.join("codex_pdf_process.py");
+
+        if let Err(e) = std::fs::write(&script_path, PDF_PROCESS_SCRIPT) {
+            self.add_info_message(
+                format!("Error writing temp script: {}", e),
+                None,
+            );
+            self.pending_pdf_update = None;
+            return;
+        }
+
+        // Run Python script
+        let output = std::process::Command::new("python3")
+            .arg(&script_path)
+            .arg(pdf_path.to_string_lossy().to_string())
+            .arg(images_output_dir.to_string_lossy().to_string())
+            .arg("200") // DPI
+            .output();
+
+        match output {
+            Ok(output) => {
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    self.add_info_message(
+                        format!("[PDF Update] Step 1 Complete!\n{}", stdout),
+                        None,
+                    );
+                    // Now start batch processing
+                    self.start_batch_after_pdf_processing();
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    self.add_info_message(
+                        format!("Error processing PDF: {}", stderr),
+                        None,
+                    );
+                    self.pending_pdf_update = None;
+                }
+            }
+            Err(e) => {
+                self.add_info_message(
+                    format!("Error running Python script: {}", e),
+                    None,
+                );
+                self.pending_pdf_update = None;
+            }
+        }
+    }
+
+    /// Start batch image processing after PDF watermark removal
+    fn start_batch_after_pdf_processing(&mut self) {
+        let Some(pending) = self.pending_pdf_update.take() else {
+            return;
+        };
+
+        let source_dir = pending.images_output_dir;
+        let prompt = pending.prompt;
+        let pdf_path = pending.pdf_path;
+
+        // Scan for image files
+        let image_extensions = ["png", "jpg", "jpeg", "webp", "gif"];
+        let mut images: Vec<PathBuf> = Vec::new();
+
+        if let Ok(entries) = std::fs::read_dir(&source_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                        let ext_lower = ext.to_lowercase();
+                        // Skip already processed files
+                        if !path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.ends_with("_processed"))
+                            .unwrap_or(false)
+                            && image_extensions.contains(&ext_lower.as_str())
+                        {
+                            images.push(path);
+                        }
+                    }
+                }
+            }
+        }
+
+        if images.is_empty() {
+            self.add_info_message(
+                format!(
+                    "No images found after PDF processing in: {}",
+                    source_dir.display()
+                ),
+                None,
+            );
+            return;
+        }
+
+        // Sort by filename for consistent ordering
+        images.sort();
+
+        let total = images.len();
+        self.add_info_message(
+            format!(
+                "[PDF Update] Step 2: Starting batch processing of {} images\n\
+                 Directory: {}\n\
+                 Prompt: {}",
+                total,
+                source_dir.display(),
+                prompt
+            ),
+            None,
+        );
+
+        // Initialize batch state with PDF path for final merge
+        self.batch_image_state = Some(BatchImageState::new_for_pdf(source_dir, images, prompt, pdf_path));
+
+        // Start processing the first image
+        self.process_next_batch_image();
+    }
+
+    /// Process the next image in the batch queue.
+    fn process_next_batch_image(&mut self) {
+        // Extract values to avoid borrow checker issues
+        let (image_path, progress_msg, prompt, batch_complete_info) = {
+            let Some(batch_state) = self.batch_image_state.as_mut() else {
+                return;
+            };
+
+            if let Some(image_path) = batch_state.next_image() {
+                let progress = batch_state.progress_message();
+                let prompt = batch_state.prompt.clone();
+                (Some(image_path), Some(progress), Some(prompt), None)
+            } else {
+                // Batch is complete, extract info for PDF merge if needed
+                let completion_msg = batch_state.completion_message();
+                let pdf_info = batch_state.original_pdf_path.as_ref().map(|pdf_path| {
+                    (batch_state.source_dir.clone(), pdf_path.clone())
+                });
+                (None, None, None, Some((completion_msg, pdf_info)))
+            }
+        };
+
+        if let Some((completion_msg, pdf_info)) = batch_complete_info {
+            self.batch_image_state = None;
+            self.add_info_message(completion_msg, None);
+
+            // If this was a PDF update, merge processed images back to PDF
+            if let Some((source_dir, original_pdf_path)) = pdf_info {
+                self.merge_processed_images_to_pdf(source_dir, original_pdf_path);
+            }
+            return;
+        }
+
+        if let (Some(image_path), Some(progress_msg), Some(prompt)) = (image_path, progress_msg, prompt) {
+            // Show progress
+            self.add_info_message(progress_msg, None);
+
+            // Set the reference image
+            self.ref_images.set_paths(vec![image_path.clone()]);
+            self.submit_op(Op::SetReferenceImages {
+                paths: vec![image_path],
+            });
+
+            // Submit the prompt
+            let user_message = UserMessage {
+                text: prompt,
+                image_paths: Vec::new(),
+            };
+            self.queue_user_message(user_message);
+        }
+    }
+
+    /// Called when a turn completes to continue batch processing if active.
+    pub(crate) fn on_turn_complete_for_batch(&mut self) {
+        if self.batch_image_state.is_some() {
+            // Mark current as processed
+            if let Some(batch_state) = self.batch_image_state.as_mut() {
+                batch_state.mark_current_processed();
+            }
+            // Process next
+            self.process_next_batch_image();
+        }
+    }
+
+    /// Merge processed images back into a PPTX file
+    fn merge_processed_images_to_pdf(&mut self, source_dir: PathBuf, original_pdf_path: PathBuf) {
+        self.add_info_message(
+            "[PDF Update] Step 3: Creating PPTX from processed images...".to_string(),
+            None,
+        );
+
+        // Embedded Python script for merging images to PPTX
+        const MERGE_SCRIPT: &str = r#"
+import sys
+import os
+
+def main():
+    if len(sys.argv) < 3:
+        print("Usage: python script.py <image_dir> <output_pptx>", file=sys.stderr)
+        sys.exit(1)
+
+    image_dir = sys.argv[1]
+    output_pptx = sys.argv[2]
+
+    try:
+        from pptx import Presentation
+        from pptx.util import Inches, Pt
+        from PIL import Image
+    except ImportError as e:
+        print(f"Error: Missing dependency: {e}", file=sys.stderr)
+        print("Run: pip install python-pptx Pillow", file=sys.stderr)
+        sys.exit(1)
+
+    # Find all processed images
+    images = sorted([
+        os.path.join(image_dir, f) for f in os.listdir(image_dir)
+        if f.endswith('_processed.png')
+    ])
+
+    if not images:
+        print("Error: No processed images found", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Found {len(images)} processed images")
+
+    # Create presentation
+    prs = Presentation()
+
+    # Get image dimensions from first image to set slide size
+    with Image.open(images[0]) as img:
+        img_width, img_height = img.size
+
+    # Set slide size based on image aspect ratio (in EMUs)
+    # Standard width is 10 inches
+    slide_width = Inches(10)
+    slide_height = Inches(10 * img_height / img_width)
+    prs.slide_width = slide_width
+    prs.slide_height = slide_height
+
+    # Blank slide layout
+    blank_layout = prs.slide_layouts[6]  # Usually the blank layout
+
+    for img_path in images:
+        slide = prs.slides.add_slide(blank_layout)
+
+        # Add image to fill the slide
+        slide.shapes.add_picture(
+            img_path,
+            Inches(0),
+            Inches(0),
+            width=slide_width,
+            height=slide_height
+        )
+        print(f"  Added: {os.path.basename(img_path)}")
+
+    prs.save(output_pptx)
+    print(f"PPTX created: {output_pptx}")
+
+if __name__ == "__main__":
+    main()
+"#;
+
+        // Determine output PPTX path (same directory as original, with _processed suffix)
+        let pdf_stem = original_pdf_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("output");
+        let output_pptx = original_pdf_path
+            .parent()
+            .unwrap_or(&original_pdf_path)
+            .join(format!("{}_processed.pptx", pdf_stem));
+
+        // Write script to temp file
+        let temp_dir = std::env::temp_dir();
+        let script_path = temp_dir.join("codex_merge_pptx.py");
+
+        if let Err(e) = std::fs::write(&script_path, MERGE_SCRIPT) {
+            self.add_info_message(
+                format!("Error writing merge script: {}", e),
+                None,
+            );
+            return;
+        }
+
+        // Run Python script
+        let output = std::process::Command::new("python3")
+            .arg(&script_path)
+            .arg(source_dir.to_string_lossy().to_string())
+            .arg(output_pptx.to_string_lossy().to_string())
+            .output();
+
+        match output {
+            Ok(output) => {
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    self.add_info_message(
+                        format!(
+                            "[PDF Update] Complete!\n\
+                             Output PPTX: {}\n\
+                             {}",
+                            output_pptx.display(),
+                            stdout
+                        ),
+                        None,
+                    );
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    self.add_info_message(
+                        format!("Error creating PPTX: {}", stderr),
+                        None,
+                    );
+                }
+            }
+            Err(e) => {
+                self.add_info_message(
+                    format!("Error running merge script: {}", e),
+                    None,
+                );
+            }
+        }
+    }
+
     fn flush_answer_stream_with_separator(&mut self) {
         if let Some(mut controller) = self.stream_controller.take()
             && let Some(cell) = controller.finalize()
@@ -943,6 +1753,9 @@ impl ChatWidget {
 
         let notification_response = last_agent_message.unwrap_or_default();
         // If there is a queued user message, send exactly one now to begin the next turn.
+        // Continue batch image processing if active
+        self.on_turn_complete_for_batch();
+
         self.maybe_send_next_queued_input();
         // Emit a notification when the turn completes (suppressed if focused).
         self.notify(Notification::AgentTurnComplete {
@@ -1764,6 +2577,8 @@ impl ChatWidget {
             next_generated_image_index: 0,
             last_generated_image_path: None,
             ref_images: RefImageManager::new(),
+            batch_image_state: None,
+            pending_pdf_update: None,
         };
 
         widget.prefetch_rate_limits();
@@ -1868,6 +2683,8 @@ impl ChatWidget {
             next_generated_image_index: 0,
             last_generated_image_path: None,
             ref_images: RefImageManager::new(),
+            batch_image_state: None,
+            pending_pdf_update: None,
         };
 
         widget.prefetch_rate_limits();
@@ -2063,6 +2880,15 @@ impl ChatWidget {
             }
             SlashCommand::RefImage => {
                 self.handle_ref_image_command(args);
+            }
+            SlashCommand::RefImageBatch => {
+                self.handle_ref_image_batch_command(args);
+            }
+            SlashCommand::PdfUpdate => {
+                self.handle_pdf_update_command(args);
+            }
+            SlashCommand::ImageQuality => {
+                self.handle_image_quality_command(args);
             }
             SlashCommand::ClearRef => {
                 self.ref_images.clear();
@@ -2548,6 +3374,28 @@ impl ChatWidget {
             }
         };
 
+        // If batch processing is active, save to source directory with _processed suffix
+        if let Some(batch_state) = &self.batch_image_state {
+            if let Some(current_image) = &batch_state.current_image {
+                let source_dir = &batch_state.source_dir;
+                let original_stem = current_image
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("output");
+                let processed_filename = format!("{original_stem}_processed.{ext}");
+                let path = source_dir.join(processed_filename);
+                if let Err(err) = std::fs::write(&path, &bytes) {
+                    tracing::warn!(
+                        "failed to write batch processed image to {}: {err}",
+                        path.display()
+                    );
+                    return None;
+                }
+                return Some(path);
+            }
+        }
+
+        // Default behavior: save to ~/.codex/images/{conversation_id}/
         let dir = self
             .config
             .codex_home

@@ -1812,6 +1812,9 @@ impl ChatWidget {
             SlashCommand::RefImage => {
                 self.handle_ref_image_command(args);
             }
+            SlashCommand::ImageQuality => {
+                self.handle_image_quality_command(args);
+            }
             SlashCommand::ClearRef => {
                 self.ref_images.clear();
                 self.submit_op(Op::ClearReferenceImages);
@@ -3401,6 +3404,53 @@ impl ChatWidget {
                         image_paths: Vec::new(),
                     };
                     self.queue_user_message(user_message);
+                }
+            }
+        }
+    }
+
+    fn handle_image_quality_command(&mut self, args: Option<String>) {
+        let valid_options = "1K, 2K, 4K";
+
+        let size_arg = args.as_deref().map(|s| s.trim().to_uppercase());
+        match size_arg {
+            None => {
+                // Show help
+                let message = format!(
+                    "Usage: /image-quality <size>\n\
+                     • `1K` — 1024x1024 (default, fastest)\n\
+                     • `2K` — 2048x2048 (balanced)\n\
+                     • `4K` — 4096x4096 (highest quality, slower)\n\n\
+                     Valid options: {valid_options}"
+                );
+                self.add_info_message(message, None);
+            }
+            Some(ref s) if s.is_empty() => {
+                // Show help
+                let message = format!(
+                    "Usage: /image-quality <size>\n\
+                     • `1K` — 1024x1024 (default, fastest)\n\
+                     • `2K` — 2048x2048 (balanced)\n\
+                     • `4K` — 4096x4096 (highest quality, slower)\n\n\
+                     Valid options: {valid_options}"
+                );
+                self.add_info_message(message, None);
+            }
+            Some(size) => {
+                if matches!(size.as_str(), "1K" | "2K" | "4K") {
+                    self.submit_op(Op::SetImageQuality { size: size.clone() });
+                    self.add_info_message(
+                        format!("Image quality set to {size}"),
+                        None,
+                    );
+                } else {
+                    self.add_info_message(
+                        format!(
+                            "Invalid image quality '{}'. Valid options: {valid_options}",
+                            size
+                        ),
+                        None,
+                    );
                 }
             }
         }

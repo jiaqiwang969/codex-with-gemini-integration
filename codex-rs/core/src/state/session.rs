@@ -2,6 +2,8 @@
 
 use codex_protocol::models::ResponseItem;
 
+use crate::client::GeminiAspectRatio;
+use crate::client::GeminiImageSize;
 use crate::codex::SessionConfiguration;
 use crate::context_manager::ContextManager;
 use crate::protocol::RateLimitSnapshot;
@@ -18,6 +20,10 @@ pub(crate) struct SessionState {
     /// per-turn heuristics for selecting image inlineData in image-capable
     /// models.
     pub(crate) active_reference_images: Vec<String>,
+    /// Output image size for Gemini image generation (1K, 2K, 4K).
+    pub(crate) image_size: Option<GeminiImageSize>,
+    /// Aspect ratio for Gemini image generation.
+    pub(crate) aspect_ratio: Option<GeminiAspectRatio>,
 }
 
 impl SessionState {
@@ -29,6 +35,8 @@ impl SessionState {
             history,
             latest_rate_limits: None,
             active_reference_images: Vec::new(),
+            image_size: None,
+            aspect_ratio: None,
         }
     }
 
@@ -97,6 +105,24 @@ impl SessionState {
 
     pub(crate) fn reference_images(&self) -> &[String] {
         &self.active_reference_images
+    }
+
+    // Image generation config helpers
+
+    pub(crate) fn set_image_size(&mut self, size: Option<GeminiImageSize>) {
+        self.image_size = size;
+    }
+
+    pub(crate) fn image_size(&self) -> Option<GeminiImageSize> {
+        self.image_size
+    }
+
+    pub(crate) fn set_aspect_ratio(&mut self, ratio: Option<GeminiAspectRatio>) {
+        self.aspect_ratio = ratio;
+    }
+
+    pub(crate) fn aspect_ratio(&self) -> Option<GeminiAspectRatio> {
+        self.aspect_ratio
     }
 }
 

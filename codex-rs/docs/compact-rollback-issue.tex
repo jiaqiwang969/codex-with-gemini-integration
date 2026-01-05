@@ -1,0 +1,760 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage{xeCJK}
+\usepackage{geometry}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{tcolorbox}
+\usepackage{enumitem}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{fancyhdr}
+\usetikzlibrary{shapes.geometric, arrows, positioning, calc}
+
+\geometry{margin=2.5cm}
+\setCJKmainfont{PingFang SC}
+\setmainfont{Helvetica Neue}
+
+\definecolor{codebg}{RGB}{245,245,245}
+\definecolor{warnbg}{RGB}{255,243,224}
+\definecolor{dangerbg}{RGB}{255,235,238}
+\definecolor{infobg}{RGB}{227,242,253}
+\definecolor{successbg}{RGB}{232,245,233}
+
+\tcbuselibrary{skins,breakable}
+
+\newtcolorbox{warningbox}{
+  colback=warnbg,
+  colframe=orange!70!black,
+  title={\textbf{警告}},
+  fonttitle=\bfseries,
+  breakable
+}
+
+\newtcolorbox{dangerbox}{
+  colback=dangerbg,
+  colframe=red!70!black,
+  title={\textbf{严重问题}},
+  fonttitle=\bfseries,
+  breakable
+}
+
+\newtcolorbox{infobox}{
+  colback=infobg,
+  colframe=blue!70!black,
+  title={\textbf{说明}},
+  fonttitle=\bfseries,
+  breakable
+}
+
+\newtcolorbox{successbox}{
+  colback=successbg,
+  colframe=green!60!black,
+  title={\textbf{解决方案}},
+  fonttitle=\bfseries,
+  breakable
+}
+
+\newtcolorbox{keybox}{
+  colback=red!5,
+  colframe=red!80!black,
+  title={\textbf{关键发现}},
+  fonttitle=\bfseries,
+  breakable
+}
+
+\newtcolorbox{conclusionbox}{
+  colback=blue!5,
+  colframe=blue!80!black,
+  title={\textbf{结论}},
+  fonttitle=\bfseries,
+  breakable
+}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue,
+    citecolor=blue
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{Codex Compact 回滚问题分析}
+\fancyhead[R]{\thepage}
+\fancyfoot[C]{基于源码分析与官方 GitHub Issues 调研}
+
+\title{\textbf{Codex CLI Compact 机制\\导致代码自动回滚问题分析报告}}
+\author{技术问题报告 v4.0\\[1em]\small 基于 codex-rs 源码分析、官方 GitHub Issues 调研与第一性原理分析}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+本报告分析了 Codex CLI 在 tmux 多窗口环境下，由于 compact（上下文压缩）机制触发后，agent 自动执行 \texttt{git diff} 并主动回滚代码的问题。经过源码分析和官方 GitHub Issues 调研，确认\textbf{这是一个已知的普遍问题}。本报告进一步通过\textbf{第一性原理分析}，解释了为什么官方提供的 execpolicy 方案\textbf{无法根本解决问题}，并指出真正需要修复的是 Compact 机制本身。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%==============================================================================
+\section{问题概述}
+%==============================================================================
+
+\subsection{问题现象}
+
+\begin{keybox}
+\textbf{核心现象}：Codex compact 后，agent 会自动执行 \texttt{git diff}，然后\textbf{主动回滚}代码到之前的状态，导致用户的工作丢失。
+
+\vspace{0.5em}
+\textbf{用户反馈}：
+\begin{itemize}
+    \item "codex compact后开始git diff然后回滚这个问题 看来依然没有修复"
+    \item "我的自动git push及时避免了一次灾难回滚的发生"
+    \item "临时解决不回滚就行了，先不耽误干活就成"
+\end{itemize}
+\end{keybox}
+
+\subsection{问题触发条件}
+
+\begin{warningbox}
+该问题\textbf{主要发生在 tmux 多窗口环境}下：
+\begin{itemize}
+    \item 多个 agent 同时工作，加速 token 消耗
+    \item 更容易触发 auto-compact
+    \item 多 agent 共享同一个 git 仓库，状态更复杂
+\end{itemize}
+\end{warningbox}
+
+\subsection{问题影响}
+
+\begin{enumerate}
+    \item \textbf{代码丢失}：Agent 之前的修改被撤销
+    \item \textbf{重复工作}：Agent 忘记之前做了什么，重复执行相同操作
+    \item \textbf{信任危机}：用户不敢让 agent 长时间独立工作
+\end{enumerate}
+
+%==============================================================================
+\section{问题发生流程}
+%==============================================================================
+
+\subsection{完整流程图}
+
+\begin{center}
+\begin{tikzpicture}[
+    node distance=0.6cm,
+    box/.style={rectangle, draw, rounded corners, minimum width=3cm, minimum height=0.8cm, align=center, font=\small},
+    arrow/.style={->, thick, >=stealth},
+]
+
+% Row 1 - Normal work
+\node[box, fill=green!20] (t1) {T1: 开始工作\\创建 Ghost Snapshot};
+\node[box, fill=blue!20, right=0.4cm of t1] (t2) {T2: 修改代码\\写了很多文件};
+\node[box, fill=blue!20, right=0.4cm of t2] (t3) {T3: 继续工作\\可能已 commit};
+\node[box, fill=orange!40, right=0.4cm of t3] (t4) {T4: Token 超限\\触发 Compact};
+
+% Row 2 - After compact
+\node[box, fill=yellow!30, below=1.2cm of t1] (t5) {T5: Agent "失忆"\\只有模糊摘要};
+\node[box, fill=yellow!30, right=0.4cm of t5] (t6) {T6: 执行 git diff\\查看当前状态};
+\node[box, fill=red!30, right=0.4cm of t6] (t7) {T7: 发现"异常"\\有未知的修改};
+\node[box, fill=red!50, right=0.4cm of t7] (t8) {T8: 主动回滚\\git checkout .};
+
+% Row 3 - Result
+\node[box, fill=gray!40, below=1.2cm of t6, minimum width=6cm] (t9) {T9: 代码丢失，工作白费};
+
+% Arrows
+\draw[arrow] (t1) -- (t2);
+\draw[arrow] (t2) -- (t3);
+\draw[arrow] (t3) -- (t4);
+\draw[arrow] (t4.south) -- ++(0,-0.4) -| (t5.north);
+\draw[arrow] (t5) -- (t6);
+\draw[arrow] (t6) -- (t7);
+\draw[arrow] (t7) -- (t8);
+\draw[arrow] (t8.south) -- ++(0,-0.4) -| (t9.east);
+
+% Labels
+\node[above=0.1cm of t1, font=\footnotesize\bfseries, color=green!50!black] {正常工作阶段};
+\node[above=0.1cm of t5, font=\footnotesize\bfseries, color=red!50!black] {Compact 后的错误行为};
+
+\end{tikzpicture}
+\end{center}
+
+\subsection{Agent 的错误"思考过程"}
+
+\begin{infobox}
+Compact 后 agent 的"推理"：
+
+\begin{enumerate}
+    \item 我只记得一个模糊的摘要："正在进行代码开发..."
+    \item 让我执行 \texttt{git diff} 看看当前状态
+    \item 发现有很多文件被修改了
+    \item \textbf{但我不记得这些是我做的}
+    \item 这些修改可能是：
+    \begin{itemize}
+        \item 遗留的脏数据？
+        \item 其他人/进程的修改？
+        \item 需要清理的异常状态？
+    \end{itemize}
+    \item 为了保持工作区干净，我来执行 \texttt{git checkout .}
+    \item \textbf{结果：所有修改被撤销！}
+\end{enumerate}
+\end{infobox}
+
+%==============================================================================
+\section{根本原因分析}
+%==============================================================================
+
+\subsection{问题链条}
+
+\begin{center}
+\begin{tikzpicture}[
+    node distance=0.8cm,
+    cause/.style={rectangle, draw, rounded corners, fill=red!10, minimum width=10cm, minimum height=0.9cm, align=center, font=\small},
+    arrow/.style={->, thick, >=stealth},
+]
+
+\node[cause] (c1) {\textbf{根因1}：Compact 机制只保留文字摘要，丢失关键上下文};
+\node[cause, below=0.5cm of c1] (c2) {\textbf{根因2}：摘要中没有 git 状态、修改文件列表、操作历史};
+\node[cause, below=0.5cm of c2] (c3) {\textbf{根因3}：AGENTS.md 在 compact 后不会被重新读取};
+\node[cause, below=0.5cm of c3] (c4) {\textbf{根因4}：Agent 对当前状态产生误判};
+\node[cause, below=0.5cm of c4, fill=red!30] (c5) {\textbf{后果}：Agent 执行破坏性 git 命令（checkout/reset/restore）};
+
+\draw[arrow] (c1) -- (c2);
+\draw[arrow] (c2) -- (c3);
+\draw[arrow] (c3) -- (c4);
+\draw[arrow] (c4) -- (c5);
+
+\end{tikzpicture}
+\end{center}
+
+\subsection{技术细节}
+
+\subsubsection{Compact 摘要内容不足}
+
+Compact 后，agent 的对话历史被压缩成类似这样的内容：
+
+\begin{lstlisting}[backgroundcolor=\color{codebg},basicstyle=\ttfamily\small]
+Another language model started to solve this problem
+and produced a summary of its thinking process.
+Use this to build on the work that has already been done...
+
+[摘要内容]
+"正在进行代码开发任务，修改了一些文件..."
+\end{lstlisting}
+
+\textbf{缺失的关键信息}：
+\begin{itemize}
+    \item 当前 git 分支名
+    \item 最近的 commit hash
+    \item 已修改的文件清单
+    \item 明确说明"这些修改是之前工作的结果"
+\end{itemize}
+
+\subsubsection{AGENTS.md 在 Compact 后被忽略}
+
+根据 GitHub Issue \#2927 和 \#5772：
+\begin{itemize}
+    \item Compact 后系统\textbf{不会重新读取} AGENTS.md
+    \item 即使在 AGENTS.md 中写了"禁止执行 git checkout"
+    \item Compact 后这些指令就失效了
+\end{itemize}
+
+%==============================================================================
+\section{官方 GitHub Issues 调研}
+%==============================================================================
+
+经过搜索 OpenAI 官方 Codex CLI 的 GitHub issues，确认\textbf{这是一个已知的普遍问题}。
+
+\subsection{高度相关的 Issues}
+
+\begin{center}
+\begin{tabular}{p{1.2cm}p{4.5cm}p{7.5cm}}
+\toprule
+\textbf{Issue} & \textbf{标题} & \textbf{问题描述} \\
+\midrule
+\href{https://github.com/openai/codex/issues/5957}{\#5957} & Auto compaction causes model to lose the plot & Agent 工作1小时，做了23个文件编辑，compact 后\textbf{否认做过任何修改} \\
+\midrule
+\href{https://github.com/openai/codex/issues/1736}{\#1736} & Codex sometimes reverting changes & Agent 执行 \texttt{git checkout}、\texttt{git reset} 回滚代码 \\
+\midrule
+\href{https://github.com/openai/codex/issues/6022}{\#6022} & Agent ignores AGENTS.md & 尽管明确禁止，agent 仍\textbf{重复执行}破坏性命令 \\
+\midrule
+\href{https://github.com/openai/codex/issues/4969}{\#4969} & Codex deleting uncommitted files & Agent 删除了 6GB 未提交文件 \\
+\midrule
+\href{https://github.com/openai/codex/issues/2927}{\#2927} & AGENTS.md ignored after compact & Compact 后 AGENTS.md 不会被重新读取 \\
+\midrule
+\href{https://github.com/openai/codex/issues/4106}{\#4106} & Control over auto-compaction & 用户要求能完全关闭 auto-compact \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Issue \#5957 详情}
+
+\begin{dangerbox}
+\textbf{用户报告}：
+
+Agent 使用 GPT-5-Codex 模型工作了\textbf{超过一个小时}，对 6 个文件进行了 \textbf{23 次编辑}。然后 auto compaction 触发。
+
+\textbf{Compact 后 agent 的回答}：
+\begin{itemize}
+    \item "我什么都没做，只是在等待批准"
+    \item "那些编辑在指令之前就已经存在"
+    \item "是之前的 assistant session 做的"
+\end{itemize}
+
+\textbf{用户评论}：模型并非恶意，它是\textbf{真的失去了上下文意识}。
+\end{dangerbox}
+
+\subsection{Issue \#1736 详情}
+
+用户报告 agent 会执行以下破坏性命令：
+
+\begin{lstlisting}[backgroundcolor=\color{codebg},basicstyle=\ttfamily\small]
+git checkout -- file1.php
+git checkout -- file2.php
+git status
+rm untracked_file.txt
+\end{lstlisting}
+
+一位用户评论：
+
+\begin{quote}
+\textit{"Getting to a point where I'm frantically committing every few lines of codes."}
+
+（我现在每写几行代码就疯狂地 commit 一次）
+\end{quote}
+
+\textbf{这与我们用户的"定时自动 commit \& push"方案完全一致！}
+
+%==============================================================================
+\section{官方的"解决方案"评估}
+%==============================================================================
+
+\subsection{方案对比}
+
+\begin{center}
+\begin{tabular}{p{3cm}p{4cm}p{2cm}p{4cm}}
+\toprule
+\textbf{方案} & \textbf{描述} & \textbf{效果} & \textbf{问题} \\
+\midrule
+AGENTS.md 指令 & 在 AGENTS.md 中写禁止回滚的指令 & \textcolor{red}{❌ 不可靠} & Compact 后会被忽略；Agent 经常无视 \\
+\midrule
+Execution Policy & 用 .rules 文件禁止特定命令 & \textcolor{orange}{⚠️ 部分有效} & 只能阻止命令，不能修复误判逻辑 \\
+\midrule
+关闭 auto-compact & 完全禁用自动压缩 & \textcolor{orange}{⚠️ 有副作用} & 会导致 token 超限错误 \\
+\midrule
+修复 compact 逻辑 & 在摘要中保留关键信息 & \textcolor{gray}{❓ 未实现} & 官方没有从根本上修复 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Execution Policy 配置示例}
+
+OpenAI 在 2025 年底添加了 execpolicy 功能：
+
+\begin{lstlisting}[backgroundcolor=\color{codebg},basicstyle=\ttfamily\small]
+# ~/.codex/rules/no-rollback.rules
+
+# 禁止 git checkout
+prefix_rule(
+    pattern = ["git", "checkout"],
+    decision = "forbidden",
+)
+
+# 禁止 git reset
+prefix_rule(
+    pattern = ["git", "reset"],
+    decision = "forbidden",
+)
+
+# 禁止 git restore
+prefix_rule(
+    pattern = ["git", "restore"],
+    decision = "forbidden",
+)
+\end{lstlisting}
+
+\begin{warningbox}
+\textbf{局限性}：execpolicy 只能阻止命令执行，但不能解决 agent 的误判问题。Agent 仍然会"想要"回滚，只是被阻止了。这可能导致 agent 尝试其他方式来"清理"状态。
+\end{warningbox}
+
+\subsection{官方实际做了什么}
+
+\begin{enumerate}
+    \item \textbf{添加了 execpolicy 功能}（2025年底）
+    \begin{itemize}
+        \item 可以配置命令黑名单
+        \item 但这是"堵漏洞"而不是"修根本"
+    \end{itemize}
+
+    \item \textbf{关闭了很多 Issues 但没真正解决}
+    \begin{itemize}
+        \item Issue \#2927 被标记为 "stale" 后关闭
+        \item Issue \#1736 被关闭但用户继续报告问题存在
+        \item Issue \#6022 只是说"反馈已转交给模型训练团队"
+    \end{itemize}
+
+    \item \textbf{没有从根本上改进 compact 机制}
+    \begin{itemize}
+        \item 没有在 compact 摘要中加入 git 状态
+        \item 没有在 compact 后重新读取 AGENTS.md
+        \item 没有在 compact 后创建新的 snapshot
+    \end{itemize}
+\end{enumerate}
+
+%==============================================================================
+\section{用户的临时解决方案}
+%==============================================================================
+
+\subsection{定时自动 Commit \& Push}
+
+用户设置了定时任务，每隔几分钟自动执行：
+
+\begin{lstlisting}[backgroundcolor=\color{codebg},basicstyle=\ttfamily\small]
+# 每隔几分钟自动执行
+git add .
+git commit -m "Auto-commit @ $(date)"
+git push origin main
+\end{lstlisting}
+
+\begin{successbox}
+\textbf{优点}：
+\begin{itemize}
+    \item 简单有效，能保住大部分代码
+    \item 不需要修改 Codex 源码
+    \item 即使本地被回滚，远程还有备份
+\end{itemize}
+
+\textbf{缺点}：
+\begin{itemize}
+    \item 产生大量碎片 commit
+    \item 本地代码仍可能丢失，需要手动 pull
+    \item 不是根本解决方案，"还有漏洞"
+\end{itemize}
+\end{successbox}
+
+%==============================================================================
+\section{第一性原理分析：为什么 Execpolicy 不起作用}
+%==============================================================================
+
+用户反馈：\textbf{"policy和rule那个我试了，不起作用"}。本节从第一性原理分析为什么 execpolicy 无法解决这个问题。
+
+\subsection{Execpolicy 的工作原理}
+
+根据源码分析（\texttt{core/src/exec\_policy.rs}），execpolicy 的工作机制如下：
+
+\begin{lstlisting}[backgroundcolor=\color{codebg},basicstyle=\ttfamily\small]
+// exec_policy.rs 核心逻辑
+pub(crate) async fn create_exec_approval_requirement_for_command(
+    exec_policy: &Arc<RwLock<Policy>>,
+    ...
+    command: &[String],  // <-- 只检查 shell 命令
+    ...
+)
+\end{lstlisting}
+
+\begin{keybox}
+\textbf{关键发现}：Execpolicy \textbf{只能检查和阻止 shell 命令}，它作用于 \texttt{shell} 和 \texttt{shell\_command} 工具调用。
+\end{keybox}
+
+\subsection{Agent 的多种"回滚"手段}
+
+问题的核心不是 agent 执行了 \texttt{git checkout}，而是 \textbf{agent 认为当前状态是"异常"需要"修复"}。
+
+Agent 可以通过多种方式实现"修复"：
+
+\begin{center}
+\begin{tabular}{p{4.5cm}p{3cm}p{4.5cm}}
+\toprule
+\textbf{操作方式} & \textbf{被 Execpolicy 检查？} & \textbf{能造成回滚？} \\
+\midrule
+\texttt{git checkout .} & \textcolor{green!60!black}{是} & \textcolor{red}{是} \\
+\texttt{git reset --hard} & \textcolor{green!60!black}{是} & \textcolor{red}{是} \\
+\texttt{git restore} & \textcolor{green!60!black}{是} & \textcolor{red}{是} \\
+\midrule
+Edit 工具直接覆写文件 & \textcolor{red}{否} & \textcolor{red}{是} \\
+Write 工具重写文件 & \textcolor{red}{否} & \textcolor{red}{是} \\
+\texttt{rm} 删除文件后重建 & \textcolor{red}{否} & \textcolor{red}{是} \\
+手动读取"原始内容"后覆盖 & \textcolor{red}{否} & \textcolor{red}{是} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{dangerbox}
+\textbf{Execpolicy 的根本局限}：
+
+\begin{enumerate}
+    \item 只能阻止 \textbf{shell 命令}，无法阻止 Edit、Write、Read 等其他工具
+    \item Agent 如果被禁止用 \texttt{git checkout}，可能转而用 \textbf{Edit 工具} 逐个"修复"文件
+    \item 即使禁止了所有 git 回滚命令，agent 仍然可以用 \textbf{Write 工具重写文件}
+    \item \textbf{治标不治本}：只是堵住了部分"回滚手段"，没有解决"误判"问题
+\end{enumerate}
+\end{dangerbox}
+
+\subsection{问题链条的完整分析}
+
+\begin{center}
+\begin{tikzpicture}[
+    node distance=0.5cm,
+    box/.style={rectangle, draw, rounded corners, minimum width=12cm, minimum height=0.8cm, align=center, font=\small},
+    arrow/.style={->, thick, >=stealth},
+]
+
+\node[box, fill=orange!20] (p1) {\textbf{触发}：Token 超限，触发 Compact};
+\node[box, fill=yellow!20, below=0.4cm of p1] (p2) {\textbf{结果}：对话历史被压缩成简短的文字摘要};
+\node[box, fill=yellow!20, below=0.4cm of p2] (p3) {\textbf{缺失}：摘要中没有 git 状态、修改文件列表、"这是我做的"声明};
+\node[box, fill=red!15, below=0.4cm of p3] (p4) {\textbf{误判}：Agent 看到工作区有修改，但不知道是自己之前做的};
+\node[box, fill=red!30, below=0.4cm of p4] (p5) {\textbf{行为}：Agent 尝试"清理"它认为的"异常状态"};
+\node[box, fill=gray!30, below=0.4cm of p5] (p6) {\textbf{后果}：代码被回滚/覆写，工作丢失};
+
+\draw[arrow] (p1) -- (p2);
+\draw[arrow] (p2) -- (p3);
+\draw[arrow] (p3) -- (p4);
+\draw[arrow] (p4) -- (p5);
+\draw[arrow] (p5) -- (p6);
+
+% 标注 execpolicy 能阻止的位置
+\node[right=0.3cm of p5, text=green!50!black, font=\footnotesize] {← Execpolicy 只能在这里阻止部分操作};
+\node[right=0.3cm of p4, text=red!70!black, font=\footnotesize] {← 真正的问题在这里！};
+
+\end{tikzpicture}
+\end{center}
+
+\subsection{Compact Prompt 的源码分析}
+
+根据源码（\texttt{core/templates/compact/prompt.md}），Compact 时使用的 prompt 内容：
+
+\begin{lstlisting}[backgroundcolor=\color{codebg},basicstyle=\ttfamily\small]
+You are performing a CONTEXT CHECKPOINT COMPACTION.
+Create a handoff summary for another LLM that will resume the task.
+
+Include:
+- Current progress and key decisions made
+- Important context, constraints, or user preferences
+- What remains to be done (clear next steps)
+- Any critical data, examples, or references needed to continue
+
+Be concise, structured, and focused on helping the next LLM
+seamlessly continue the work.
+\end{lstlisting}
+
+\begin{warningbox}
+\textbf{问题}：这个 prompt \textbf{没有要求} agent 记录：
+\begin{enumerate}
+    \item 当前 git 工作区状态
+    \item 已修改的文件列表
+    \item "这些修改是我（之前的 agent）做的"的明确声明
+    \item 当前 git 分支和最近 commit hash
+\end{enumerate}
+
+这就是为什么 Compact 后的 agent 会"失忆"——它根本没有被要求记住这些关键信息！
+\end{warningbox}
+
+\subsection{问题发生的完整机制图}
+
+\begin{center}
+\begin{tikzpicture}[
+    node distance=0.4cm,
+    phase/.style={rectangle, draw, rounded corners, minimum width=14cm, minimum height=2.2cm, align=left, font=\small},
+    arrow/.style={->, thick, >=stealth},
+]
+
+% Phase 1
+\node[phase, fill=green!10] (ph1) {
+\textbf{阶段 1：正常工作}\\[0.3em]
+Agent A 工作中：\\
+\hspace{1em}• 修改了 file1.rs, file2.rs, file3.rs\\
+\hspace{1em}• 执行了 git diff 看过状态\\
+\hspace{1em}• \textbf{知道}这些修改是自己做的
+};
+
+% Phase 2
+\node[phase, fill=yellow!15, below=0.6cm of ph1] (ph2) {
+\textbf{阶段 2：Compact（Token 超限）}\\[0.3em]
+生成 Summary："正在进行代码开发任务，已完成部分功能实现..."\\[0.3em]
+\textcolor{red}{\textbf{没有记录}}：哪些文件被修改了、这些修改是之前 agent 做的、当前 git 状态
+};
+
+% Phase 3
+\node[phase, fill=red!10, below=0.6cm of ph2] (ph3) {
+\textbf{阶段 3：Compact 后的 Agent B（新的上下文）}\\[0.3em]
+Agent B 看到的上下文：\\
+\hspace{1em}1. Summary prefix: "Another language model started to solve..."\\
+\hspace{1em}2. Summary: "正在进行代码开发任务..."（没有文件列表）\\
+\hspace{1em}3. Ghost snapshots（只有 commit ID，没有文件列表）
+};
+
+% Phase 4
+\node[phase, fill=red!25, below=0.6cm of ph3] (ph4) {
+\textbf{阶段 4：Agent B 执行 git status / git diff}\\[0.3em]
+→ 发现有很多文件被修改了\\
+→ 但 summary 里没说这些是之前做的\\
+→ Agent B 的推理："这些可能是遗留的脏数据？需要清理？"\\
+→ \textbf{执行"修复"操作}（git checkout 或 Edit 覆写）
+};
+
+\draw[arrow] (ph1) -- node[right, font=\footnotesize] {Token 超限} (ph2);
+\draw[arrow] (ph2) -- node[right, font=\footnotesize] {上下文丢失} (ph3);
+\draw[arrow] (ph3) -- node[right, font=\footnotesize] {误判} (ph4);
+
+\end{tikzpicture}
+\end{center}
+
+\subsection{为什么用户的临时方案有效}
+
+用户的"定时 git add \&\& git commit \&\& git push"方案之所以有效，是因为：
+
+\begin{enumerate}
+    \item 即使 agent 执行 \texttt{git checkout}，只会回到\textbf{最近的 commit}
+    \item 最近的 commit 就是\textbf{几分钟前}自动保存的版本
+    \item 损失的只是\textbf{最近几分钟}的工作，而不是全部
+    \item 远程有\textbf{完整备份}，即使本地被破坏也能恢复
+\end{enumerate}
+
+\begin{infobox}
+这个方案本质上是\textbf{缩短了"回滚窗口"}，让回滚造成的损失可控。但它\textbf{没有解决根本问题}——agent 仍然会尝试回滚，只是回滚后的损失变小了。
+\end{infobox}
+
+\subsection{第一性原理结论}
+
+\begin{conclusionbox}
+\textbf{问题的本质}：
+
+不是"agent 执行了 git checkout"，而是\textbf{"agent 误判了当前状态"}。
+
+\vspace{0.5em}
+\textbf{Execpolicy 为什么不够}：
+
+\begin{center}
+\begin{tabular}{p{4cm}p{4cm}p{3cm}}
+\toprule
+\textbf{问题层面} & \textbf{具体问题} & \textbf{Execpolicy 能解决？} \\
+\midrule
+根本原因 & Compact summary 没有 git 状态信息 & \textcolor{red}{否} \\
+直接原因 & Agent 误判当前修改是"异常" & \textcolor{red}{否} \\
+表象（部分） & Agent 执行 git checkout & \textcolor{green!60!black}{部分} \\
+表象（部分） & Agent 用 Edit/Write 改文件 & \textcolor{red}{否} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.5em}
+\textbf{真正需要修复的}：
+
+\textbf{Compact 机制本身}——确保 compact 后的 agent 知道：
+\begin{enumerate}
+    \item 当前工作区的修改是什么
+    \item 这些修改是之前工作的成果
+    \item \textbf{不应该"清理"或"恢复"这些修改}
+\end{enumerate}
+\end{conclusionbox}
+
+%==============================================================================
+\section{建议的根本修复方向}
+%==============================================================================
+
+\begin{center}
+\begin{tikzpicture}[
+    node distance=0.6cm,
+    fix/.style={rectangle, draw, rounded corners, fill=green!15, minimum width=12cm, minimum height=1cm, align=left, font=\small},
+]
+
+\node[fix] (f1) {\textbf{修复1}：Compact 摘要内容增强\\
+\hspace{1em}• 记录当前 git branch 和最近 commit hash\\
+\hspace{1em}• 列出已修改的文件清单\\
+\hspace{1em}• 明确说明"这些修改是之前工作的结果，不要撤销"};
+
+\node[fix, below=0.4cm of f1] (f2) {\textbf{修复2}：Compact 后重新加载 AGENTS.md\\
+\hspace{1em}• 确保禁止指令始终生效\\
+\hspace{1em}• 或将关键指令写入 compact 摘要};
+
+\node[fix, below=0.4cm of f2] (f3) {\textbf{修复3}：Compact 后创建新的 Ghost Snapshot\\
+\hspace{1em}• 保护当前状态\\
+\hspace{1em}• 即使 agent 误操作，也能通过 /undo 恢复};
+
+\node[fix, below=0.4cm of f3] (f4) {\textbf{修复4}：对破坏性命令增加保护\\
+\hspace{1em}• Compact 后一段时间内禁止 git checkout/reset/restore\\
+\hspace{1em}• 或要求 agent 在执行前必须确认};
+
+\end{tikzpicture}
+\end{center}
+
+%==============================================================================
+\section{结论}
+%==============================================================================
+
+\begin{conclusionbox}
+\textbf{问题性质}：
+
+这是 Codex CLI 的一个\textbf{已知的、普遍存在的设计缺陷}，在官方 GitHub 上有大量用户报告。
+
+\vspace{1em}
+\textbf{根本原因（第一性原理）}：
+
+Compact 机制在压缩对话历史时，只保留简短的文字摘要，\textbf{丢失了关于 git 工作区状态的关键信息}。Compact 后的 agent 看到工作区有修改，但不知道这些是自己之前的工作，于是\textbf{主动执行操作进行"清理"}。
+
+\vspace{1em}
+\textbf{为什么 Execpolicy 不够}：
+
+\begin{enumerate}
+    \item Execpolicy \textbf{只能阻止 shell 命令}，无法阻止 Edit/Write 等工具
+    \item Agent 如果被禁止用 git checkout，可能转而用其他方式"修复"
+    \item \textbf{治标不治本}：只是堵住了部分回滚手段，没有解决误判问题
+    \item 真正的问题是 \textbf{Compact prompt 没有要求记录 git 状态}
+\end{enumerate}
+
+\vspace{1em}
+\textbf{触发条件}：
+
+\textbf{tmux 多窗口环境}下多 agent 并行工作会加速 token 消耗，更频繁触发 compact；共享仓库使得状态更复杂，agent 更容易误判。
+
+\vspace{1em}
+\textbf{当前可行方案}：
+
+\begin{enumerate}
+    \item \textbf{定时自动 commit \& push}（最有效的临时方案）
+    \item 配置 execpolicy 禁止 git checkout/reset/restore 命令（部分有效）
+    \item 增大 token limit 减少 compact 频率
+    \item 在 AGENTS.md 中添加保护指令（效果有限，compact 后会被忽略）
+\end{enumerate}
+
+\vspace{1em}
+\textbf{真正需要修复的}：
+
+\textbf{Compact 机制本身}——需要在 compact prompt 中增加要求，让 agent 记录：
+\begin{itemize}
+    \item 当前 git 工作区状态和修改文件列表
+    \item 明确声明"这些修改是之前工作的成果，不要撤销"
+    \item 当前 git 分支和最近 commit hash
+\end{itemize}
+\end{conclusionbox}
+
+\vspace{1cm}
+\begin{center}
+\rule{0.8\textwidth}{0.4pt}
+
+\textit{本报告基于 codex-rs 源码分析、OpenAI 官方 GitHub Issues 调研与第一性原理分析}
+
+\textit{版本 4.0 - \today}
+
+\vspace{0.5em}
+\small
+相关 Issues：
+\href{https://github.com/openai/codex/issues/5957}{\#5957},
+\href{https://github.com/openai/codex/issues/1736}{\#1736},
+\href{https://github.com/openai/codex/issues/6022}{\#6022},
+\href{https://github.com/openai/codex/issues/4969}{\#4969},
+\href{https://github.com/openai/codex/issues/2927}{\#2927},
+\href{https://github.com/openai/codex/issues/4106}{\#4106}
+
+\vspace{0.5em}
+\small
+关键源码文件：
+\texttt{core/src/compact.rs},
+\texttt{core/src/exec\_policy.rs},
+\texttt{core/templates/compact/prompt.md}
+\end{center}
+
+\end{document}

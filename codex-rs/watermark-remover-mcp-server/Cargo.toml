@@ -1,0 +1,38 @@
+[package]
+edition = "2024"
+name = "watermark-remover-mcp-server"
+version = { workspace = true }
+
+[[bin]]
+name = "watermark-remover-mcp-server"
+path = "src/main.rs"
+
+[lib]
+name = "watermark_remover_mcp_server"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+codex-arg0 = { workspace = true }
+codex-common = { workspace = true, features = ["cli"] }
+mcp-types = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = [
+    "fs",
+    "io-std",
+    "macros",
+    "process",
+    "rt-multi-thread",
+    "signal",
+] }
+tracing = { workspace = true, features = ["log"] }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tokio-test = { workspace = true }

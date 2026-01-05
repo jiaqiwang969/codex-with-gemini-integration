@@ -427,6 +427,21 @@ impl ModelClient {
             // Valid options: media_resolution_low (280 tokens), media_resolution_medium (560),
             // media_resolution_high (1120), media_resolution_ultra_high (2240, per-part only).
             media_resolution: None, // Let Gemini auto-select based on media type
+            // For image-capable models, enable both TEXT and IMAGE response modalities
+            // and configure the output image size based on the prompt settings.
+            response_modalities: if api_model.contains("image") {
+                Some(vec![GeminiResponseModality::Text, GeminiResponseModality::Image])
+            } else {
+                None
+            },
+            image_config: if api_model.contains("image") {
+                Some(GeminiImageConfig {
+                    image_size: prompt.image_size,
+                    aspect_ratio: prompt.aspect_ratio,
+                })
+            } else {
+                None
+            },
         });
 
         // Default safety settings to allow code-related content
@@ -1611,10 +1626,10 @@ fn ensure_active_loop_has_thought_signatures(
         return new_contents;
     }
 
-    // For every subsequent `model` turn in the active loop, ensure the first
-    // `functionCall` part has a `thoughtSignature`. If the model did not
-    // produce one (for example when history was injected), synthesize the
-    // recommended dummy signature so Gemini accepts the request.
+    // For every subsequent `model` turn in the active loop, ensure parts that
+    // require thoughtSignature (functionCall and inlineData/image parts) have one.
+    // If the model did not produce one (for example when history was injected),
+    // synthesize the recommended dummy signature so Gemini accepts the request.
     for content in &mut new_contents[start..] {
         if !content
             .role
@@ -1626,6 +1641,7 @@ fn ensure_active_loop_has_thought_signatures(
 
         let mut patched_first_call = false;
         for part in &mut content.parts {
+            // Patch function_call parts (only the first one needs it per Gemini docs)
             if part.function_call.is_some() && !patched_first_call {
                 patched_first_call = true;
                 if part.thought_signature.is_none() {
@@ -1639,6 +1655,18 @@ fn ensure_active_loop_has_thought_signatures(
                     }
                 } else if part.compat_thought_signature.is_none() {
                     part.compat_thought_signature = part.thought_signature.clone();
+                }
+            }
+
+            // Patch inline_data (image) parts - each image part needs a thought_signature
+            if part.inline_data.is_some() && part.thought_signature.is_none() {
+                let signature = part
+                    .compat_thought_signature
+                    .clone()
+                    .unwrap_or_else(|| SYNTHETIC_THOUGHT_SIGNATURE.to_string());
+                part.thought_signature = Some(signature.clone());
+                if part.compat_thought_signature.is_none() {
+                    part.compat_thought_signature = Some(signature);
                 }
             }
         }
@@ -1869,7 +1897,7 @@ enum GeminiFunctionCallingMode {
     Any,
 }
 
-/// Media resolution for image/PDF processing.
+/// Media resolution for image/PDF processing (input images).
 /// Per Gemini 3 docs: media_resolution_low=280 tokens, media_resolution_medium=560,
 /// media_resolution_high=1120, media_resolution_ultra_high=2240.
 #[derive(Debug, Serialize, Clone, Copy)]
@@ -1890,6 +1918,62 @@ enum GeminiMediaResolution {
     UltraHigh,
 }
 
+/// Image size for generated images (output images).
+/// Per Gemini 3 docs: https://ai.google.dev/gemini-api/docs/image-generation#generate-4k-images
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum GeminiImageSize {
+    /// 1024x1024 (default, fastest)
+    #[default]
+    #[serde(rename = "1K")]
+    Size1K,
+    /// 2048x2048 (balanced quality/speed)
+    #[serde(rename = "2K")]
+    Size2K,
+    /// 4096x4096 (highest quality, slower)
+    #[serde(rename = "4K")]
+    Size4K,
+}
+
+/// Image aspect ratio for generated images.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum GeminiAspectRatio {
+    #[default]
+    #[serde(rename = "1:1")]
+    Square,
+    #[serde(rename = "16:9")]
+    Landscape,
+    #[serde(rename = "9:16")]
+    Portrait,
+    #[serde(rename = "4:3")]
+    Standard,
+    #[serde(rename = "3:4")]
+    StandardPortrait,
+}
+
+/// Configuration for generated image output.
+#[derive(Debug, Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct GeminiImageConfig {
+    /// Output image size (1K, 2K, 4K)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_size: Option<GeminiImageSize>,
+    /// Aspect ratio of generated images
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aspect_ratio: Option<GeminiAspectRatio>,
+}
+
+/// Response modalities for Gemini 3 image generation.
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum GeminiResponseModality {
+    #[serde(rename = "TEXT")]
+    Text,
+    #[serde(rename = "IMAGE")]
+    Image,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GeminiGenerationConfig {
@@ -1903,10 +1987,16 @@ struct GeminiGenerationConfig {
     max_output_tokens: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking_config: Option<GeminiThinkingConfig>,
-    /// Media resolution for image/PDF processing.
+    /// Media resolution for image/PDF processing (input).
     /// Higher resolution provides better detail but uses more tokens.
     #[serde(skip_serializing_if = "Option::is_none")]
     media_resolution: Option<GeminiMediaResolution>,
+    /// Response modalities (e.g., TEXT, IMAGE) for image generation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_modalities: Option<Vec<GeminiResponseModality>>,
+    /// Configuration for generated images (output size, aspect ratio).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_config: Option<GeminiImageConfig>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]

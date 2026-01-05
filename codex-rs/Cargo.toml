@@ -22,6 +22,7 @@ members = [
     "keyring-store",
     "file-search",
     "hunyuan-mcp-server",
+    "watermark-remover-mcp-server",
     "linux-sandbox",
     "lmstudio",
     "login",

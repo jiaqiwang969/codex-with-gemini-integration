@@ -7995,6 +7995,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "watermark-remover-mcp-server"
+version = "0.76.0-alpha.7"
+dependencies = [
+ "anyhow",
+ "codex-arg0",
+ "codex-common",
+ "mcp-types",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "wayland-backend"
 version = "0.3.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"

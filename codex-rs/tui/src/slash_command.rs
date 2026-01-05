@@ -24,6 +24,9 @@ pub enum SlashCommand {
     Diff,
     OpenImage,
     RefImage,
+    RefImageBatch,
+    PdfUpdate,
+    ImageQuality,
     ClearRef,
     Mention,
     Agent,
@@ -53,6 +56,9 @@ impl SlashCommand {
             SlashCommand::Diff => "show git diff (including untracked files)",
             SlashCommand::OpenImage => "open the most recently generated image",
             SlashCommand::RefImage => "set reference images for image models",
+            SlashCommand::RefImageBatch => "batch process images in a folder with same prompt",
+            SlashCommand::PdfUpdate => "process PDF: remove watermark + batch image processing (requires watermark-remover MCP server)",
+            SlashCommand::ImageQuality => "set output image quality (1K, 2K, 4K)",
             SlashCommand::ClearRef => "clear active reference images",
             SlashCommand::Mention => "mention a file",
             SlashCommand::Agent => "switch into a delegated agent session",
@@ -73,7 +79,12 @@ impl SlashCommand {
     /// context-aware way.
     pub fn accepts_args(self) -> bool {
         match self {
-            SlashCommand::Tumix | SlashCommand::TumixStop | SlashCommand::RefImage => true,
+            SlashCommand::Tumix
+            | SlashCommand::TumixStop
+            | SlashCommand::RefImage
+            | SlashCommand::RefImageBatch
+            | SlashCommand::PdfUpdate
+            | SlashCommand::ImageQuality => true,
             _ => false,
         }
     }
@@ -95,9 +106,12 @@ impl SlashCommand {
             | SlashCommand::Model
             | SlashCommand::Approvals
             | SlashCommand::Review
+            | SlashCommand::RefImageBatch
+            | SlashCommand::PdfUpdate
             | SlashCommand::Logout => false,
             SlashCommand::Diff
             | SlashCommand::OpenImage
+            | SlashCommand::ImageQuality
             | SlashCommand::RefImage
             | SlashCommand::ClearRef
             | SlashCommand::Mention

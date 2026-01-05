@@ -225,6 +225,13 @@ pub enum Op {
     /// assistant image) when selecting inlineData.
     ClearReferenceImages,
 
+    /// Set the image generation quality (output size) for Gemini image models.
+    /// Valid values: "1K" (1024x1024), "2K" (2048x2048), "4K" (4096x4096).
+    SetImageQuality {
+        /// Image size string (e.g., "1K", "2K", "4K")
+        size: String,
+    },
+
     /// Request to shut down codex instance.
     Shutdown,
 

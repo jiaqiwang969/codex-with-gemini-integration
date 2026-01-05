@@ -26,6 +26,7 @@ pub enum SlashCommand {
     Diff,
     OpenImage,
     RefImage,
+    ImageQuality,
     ClearRef,
     Mention,
     Agent,
@@ -56,6 +57,7 @@ impl SlashCommand {
             SlashCommand::Diff => "show git diff (including untracked files)",
             SlashCommand::OpenImage => "open the most recently generated image",
             SlashCommand::RefImage => "set reference images for image models",
+            SlashCommand::ImageQuality => "set output image quality (1K, 2K, 4K)",
             SlashCommand::ClearRef => "clear active reference images",
             SlashCommand::Mention => "mention a file",
             SlashCommand::Agent => "switch into a delegated agent session",
@@ -78,7 +80,10 @@ impl SlashCommand {
     pub fn accepts_args(self) -> bool {
         matches!(
             self,
-            SlashCommand::Tumix | SlashCommand::TumixStop | SlashCommand::RefImage
+            SlashCommand::Tumix
+                | SlashCommand::TumixStop
+                | SlashCommand::RefImage
+                | SlashCommand::ImageQuality
         )
     }
 
@@ -104,6 +109,7 @@ impl SlashCommand {
             SlashCommand::Diff
             | SlashCommand::OpenImage
             | SlashCommand::RefImage
+            | SlashCommand::ImageQuality
             | SlashCommand::ClearRef
             | SlashCommand::Mention
             | SlashCommand::Agent

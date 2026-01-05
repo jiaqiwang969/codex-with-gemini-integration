@@ -48,6 +48,8 @@ async fn run_remote_compact_task_inner_impl(
         parallel_tool_calls: false,
         base_instructions_override: turn_context.base_instructions.clone(),
         output_schema: None,
+        image_size: None,
+        aspect_ratio: None,
     };
 
     let mut new_history = turn_context

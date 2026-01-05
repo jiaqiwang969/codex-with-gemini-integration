@@ -1827,6 +1827,9 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
             Op::ClearReferenceImages => {
                 handlers::clear_reference_images(&sess).await;
             }
+            Op::SetImageQuality { size } => {
+                handlers::set_image_quality(&sess, &size).await;
+            }
             Op::RunUserShellCommand { command } => {
                 handlers::run_user_shell_command(
                     &sess,
@@ -2025,6 +2028,23 @@ mod handlers {
     pub async fn clear_reference_images(sess: &Arc<Session>) {
         let mut state = sess.state.lock().await;
         state.clear_reference_images();
+    }
+
+    pub async fn set_image_quality(sess: &Arc<Session>, size: &str) {
+        use crate::client::GeminiImageSize;
+
+        let parsed_size = match size.to_uppercase().as_str() {
+            "1K" => Some(GeminiImageSize::Size1K),
+            "2K" => Some(GeminiImageSize::Size2K),
+            "4K" => Some(GeminiImageSize::Size4K),
+            _ => {
+                warn!("Invalid image quality '{}'. Valid options: 1K, 2K, 4K", size);
+                return;
+            }
+        };
+
+        let mut state = sess.state.lock().await;
+        state.set_image_size(parsed_size);
     }
 
     pub async fn resolve_elicitation(
@@ -2627,6 +2647,13 @@ async fn run_turn(
     } else {
         persisted_reference_images
     };
+
+    // Get image generation settings from session state
+    let (image_size, aspect_ratio) = {
+        let state = sess.state.lock().await;
+        (state.image_size(), state.aspect_ratio())
+    };
+
     let prompt = Prompt {
         input,
         reference_images,
@@ -2634,6 +2661,8 @@ async fn run_turn(
         parallel_tool_calls: model_supports_parallel && sess.enabled(Feature::ParallelToolCalls),
         base_instructions_override: turn_context.base_instructions.clone(),
         output_schema: turn_context.final_output_json_schema.clone(),
+        image_size,
+        aspect_ratio,
     };
 
     let mut retries = 0;
