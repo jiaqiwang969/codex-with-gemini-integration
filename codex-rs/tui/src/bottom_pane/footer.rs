@@ -21,9 +21,6 @@ pub(crate) struct FooterProps {
     pub(crate) context_window_percent: Option<i64>,
     pub(crate) context_window_used_tokens: Option<i64>,
     pub(crate) delegate_label: Option<String>,
-    pub(crate) transcript_scrolled: bool,
-    pub(crate) transcript_selection_active: bool,
-    pub(crate) transcript_scroll_position: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,27 +101,6 @@ fn footer_lines(props: &FooterProps) -> Vec<Line<'static>> {
                 key_hint::plain(KeyCode::Char('?')).into(),
                 " for shortcuts".dim(),
             ]);
-            if props.transcript_scrolled {
-                spans.push(" · ".dim());
-                spans.push(key_hint::plain(KeyCode::PageUp).into());
-                spans.push("/".into());
-                spans.push(key_hint::plain(KeyCode::PageDown).into());
-                spans.push(" scroll".dim());
-                spans.push(" · ".dim());
-                spans.push(key_hint::plain(KeyCode::Home).into());
-                spans.push("/".into());
-                spans.push(key_hint::plain(KeyCode::End).into());
-                spans.push(" jump".dim());
-                if let Some((current, total)) = props.transcript_scroll_position {
-                    spans.push(" · ".dim());
-                    spans.push(Span::from(format!("{current}/{total}")).dim());
-                }
-            }
-            if props.transcript_selection_active {
-                spans.push(" · ".dim());
-                spans.push(key_hint::ctrl(KeyCode::Char('y')).into());
-                spans.push(" copy selection".dim());
-            }
             vec![Line::from(spans)]
         }
         FooterMode::ShortcutOverlay => shortcut_overlay_lines(ShortcutsState {
@@ -463,9 +439,6 @@ mod tests {
                 context_window_percent: None,
                 context_window_used_tokens: None,
                 delegate_label: None,
-                transcript_scrolled: false,
-                transcript_selection_active: false,
-                transcript_scroll_position: None,
             },
         );
 
@@ -479,9 +452,6 @@ mod tests {
                 context_window_percent: None,
                 context_window_used_tokens: None,
                 delegate_label: None,
-                transcript_scrolled: false,
-                transcript_selection_active: false,
-                transcript_scroll_position: None,
             },
         );
 
@@ -495,9 +465,6 @@ mod tests {
                 context_window_percent: None,
                 context_window_used_tokens: None,
                 delegate_label: None,
-                transcript_scrolled: false,
-                transcript_selection_active: false,
-                transcript_scroll_position: None,
             },
         );
 
@@ -511,9 +478,6 @@ mod tests {
                 context_window_percent: None,
                 context_window_used_tokens: None,
                 delegate_label: None,
-                transcript_scrolled: false,
-                transcript_selection_active: false,
-                transcript_scroll_position: None,
             },
         );
 
@@ -527,9 +491,6 @@ mod tests {
                 context_window_percent: None,
                 context_window_used_tokens: None,
                 delegate_label: None,
-                transcript_scrolled: false,
-                transcript_selection_active: false,
-                transcript_scroll_position: None,
             },
         );
 
@@ -543,9 +504,6 @@ mod tests {
                 context_window_percent: None,
                 context_window_used_tokens: None,
                 delegate_label: None,
-                transcript_scrolled: false,
-                transcript_selection_active: false,
-                transcript_scroll_position: None,
             },
         );
 
@@ -559,9 +517,6 @@ mod tests {
                 context_window_percent: Some(72),
                 context_window_used_tokens: None,
                 delegate_label: None,
-                transcript_scrolled: false,
-                transcript_selection_active: false,
-                transcript_scroll_position: None,
             },
         );
 
@@ -575,9 +530,6 @@ mod tests {
                 context_window_percent: Some(85),
                 context_window_used_tokens: None,
                 delegate_label: Some("#critic".to_string()),
-                transcript_scrolled: false,
-                transcript_selection_active: false,
-                transcript_scroll_position: None,
             },
         );
     }

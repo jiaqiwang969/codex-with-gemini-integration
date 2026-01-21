@@ -5,8 +5,6 @@ use crate::bottom_pane::ApprovalRequest;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::ChatWidgetInit;
 use crate::chatwidget::DelegateDisplayLabel;
-use crate::clipboard_copy;
-use crate::custom_terminal::Frame;
 use crate::diff_render::DiffSummary;
 use crate::exec_command::strip_bash_lc_and_escape;
 use crate::file_search::FileSearchManager;
@@ -22,12 +20,7 @@ use crate::resume_picker::ResumeSelection;
 use crate::session_bar::SessionBar;
 use crate::tui;
 use crate::tui::TuiEvent;
-use crate::tui::scrolling::TranscriptLineMeta;
-use crate::tui::scrolling::TranscriptScroll;
 use crate::update_action::UpdateAction;
-use crate::wrapping::RtOptions;
-use crate::wrapping::word_wrap_line;
-use crate::wrapping::word_wrap_lines_borrowed;
 use codex_ansi_escape::ansi_escape_line;
 use codex_app_server_protocol::AuthMode;
 use codex_core::AuthManager;
@@ -62,8 +55,6 @@ use color_eyre::eyre::WrapErr;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
-use crossterm::event::MouseButton;
-use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
@@ -117,26 +108,23 @@ pub(crate) enum LayoutMode {
     Collapsed,
 }
 
-/// Content-relative selection within the inline transcript viewport.
-///
-/// Selection endpoints are expressed in terms of flattened, wrapped transcript
-/// line indices and columns, so the highlight tracks logical conversation
-/// content even when the viewport scrolls or the terminal is resized.
-#[derive(Debug, Clone, Copy, Default)]
-struct TranscriptSelection {
-    anchor: Option<TranscriptSelectionPoint>,
-    head: Option<TranscriptSelectionPoint>,
+/// Per-flattened-line metadata for transcript output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptLineMeta {
+    CellLine {
+        cell_index: usize,
+        line_in_cell: usize,
+    },
+    Spacer,
 }
 
-/// A single endpoint of a transcript selection.
-///
-/// `line_index` is an index into the flattened wrapped transcript lines, and
-/// `column` is a zero-based column offset within that visual line, counted from
-/// the first content column to the right of the transcript gutter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TranscriptSelectionPoint {
-    line_index: usize,
-    column: u16,
+impl TranscriptLineMeta {
+    fn cell_index(&self) -> Option<usize> {
+        match *self {
+            Self::CellLine { cell_index, .. } => Some(cell_index),
+            Self::Spacer => None,
+        }
+    }
 }
 
 fn session_summary(
@@ -314,11 +302,6 @@ pub(crate) struct App {
     pub(crate) file_search: FileSearchManager,
 
     pub(crate) transcript_cells: Vec<Arc<dyn HistoryCell>>,
-
-    transcript_scroll: TranscriptScroll,
-    transcript_selection: TranscriptSelection,
-    transcript_view_top: usize,
-    transcript_total_lines: usize,
 
     // Session panel components
     pub(crate) session_bar: SessionBar,
@@ -594,10 +577,6 @@ impl App {
             file_search,
             enhanced_keys_supported,
             transcript_cells: Vec::new(),
-            transcript_scroll: TranscriptScroll::default(),
-            transcript_selection: TranscriptSelection::default(),
-            transcript_view_top: 0,
-            transcript_total_lines: 0,
             overlay: None,
             deferred_history_lines: Vec::new(),
             has_emitted_history_lines: false,
@@ -767,9 +746,7 @@ impl App {
                     let pasted = pasted.replace("\r", "\n");
                     self.chat_widget.handle_paste(pasted);
                 }
-                TuiEvent::Mouse(mouse_event) => {
-                    self.handle_mouse_event(tui, mouse_event);
-                }
+                TuiEvent::Mouse(_) => {}
                 TuiEvent::Draw => {
                     self.chat_widget.maybe_post_pending_notification(tui);
                     if self
@@ -788,46 +765,42 @@ impl App {
                             .set_session_status(id, self.chat_widget.sidebar_status());
                     }
 
-                    // Clone is needed here due to borrow checker constraints:
-                    // the closure captures `self` mutably for render_transcript_cells,
-                    // but we also need to read transcript_cells. Using Arc means only
-                    // pointer counts are cloned, not the underlying HistoryCell data.
-                    let cells = self.transcript_cells.clone();
-                    tui.draw(tui.terminal.size()?.height, |frame| {
-                        let session_height = 4u16.min(frame.area().height);
-                        let available_for_chat = frame.area().height.saturating_sub(session_height);
-                        let chat_height = self
-                            .chat_widget
-                            .desired_height(frame.area().width)
-                            .min(available_for_chat);
+                    let screen = tui.terminal.size()?;
+                    let session_height = 4u16.min(screen.height);
+                    let available_for_chat = screen.height.saturating_sub(session_height);
+                    let chat_height = self
+                        .chat_widget
+                        .desired_height(screen.width)
+                        .min(available_for_chat);
 
-                        let chat_top = self.render_transcript_cells(
-                            frame,
-                            &cells,
-                            chat_height.saturating_add(session_height),
-                        );
+                    tui.draw(chat_height.saturating_add(session_height), |frame| {
+                        let session_height = 4u16.min(frame.area().height);
                         let session_area = Rect {
                             x: frame.area().x,
                             y: frame.area().bottom().saturating_sub(session_height),
                             width: frame.area().width,
                             height: session_height,
                         };
-                        let chat_max_height = session_area.y.saturating_sub(chat_top);
+                        let available_for_chat = session_area.y.saturating_sub(frame.area().y);
+                        let chat_height = self
+                            .chat_widget
+                            .desired_height(frame.area().width)
+                            .min(available_for_chat);
                         let chat_area = Rect {
                             x: frame.area().x,
-                            y: chat_top,
+                            y: frame.area().y,
                             width: frame.area().width,
-                            height: chat_height.min(chat_max_height),
+                            height: chat_height,
                         };
                         self.chat_widget.render(chat_area, frame.buffer);
-                        let chat_bottom = chat_area.y.saturating_add(chat_area.height);
-                        if chat_bottom < frame.area().bottom() {
+                        let chat_bottom = chat_area.bottom();
+                        if chat_bottom < session_area.y {
                             Clear.render_ref(
                                 Rect {
                                     x: frame.area().x,
                                     y: chat_bottom,
                                     width: frame.area().width,
-                                    height: frame.area().bottom().saturating_sub(chat_bottom),
+                                    height: session_area.y.saturating_sub(chat_bottom),
                                 },
                                 frame.buffer,
                             );
@@ -843,334 +816,10 @@ impl App {
                             frame.set_cursor_position((x, y));
                         }
                     })?;
-                    let transcript_scrolled =
-                        !matches!(self.transcript_scroll, TranscriptScroll::ToBottom);
-                    let selection_active = matches!(
-                        (self.transcript_selection.anchor, self.transcript_selection.head),
-                        (Some(a), Some(b)) if a != b
-                    );
-                    let scroll_position = if self.transcript_total_lines == 0 {
-                        None
-                    } else {
-                        Some((
-                            self.transcript_view_top.saturating_add(1),
-                            self.transcript_total_lines,
-                        ))
-                    };
-                    self.chat_widget.set_transcript_ui_state(
-                        transcript_scrolled,
-                        selection_active,
-                        scroll_position,
-                    );
                 }
             }
         }
         Ok(true)
-    }
-
-    pub(crate) fn render_transcript_cells(
-        &mut self,
-        frame: &mut Frame,
-        cells: &[Arc<dyn HistoryCell>],
-        chat_height: u16,
-    ) -> u16 {
-        let area = frame.area();
-        if area.width == 0 || area.height == 0 {
-            self.transcript_scroll = TranscriptScroll::default();
-            self.transcript_view_top = 0;
-            self.transcript_total_lines = 0;
-            return area.bottom().saturating_sub(chat_height);
-        }
-
-        let chat_height = chat_height.min(area.height);
-        let max_transcript_height = area.height.saturating_sub(chat_height);
-        if max_transcript_height == 0 {
-            self.transcript_scroll = TranscriptScroll::default();
-            self.transcript_view_top = 0;
-            self.transcript_total_lines = 0;
-            return area.y;
-        }
-
-        let transcript_area = Rect {
-            x: area.x,
-            y: area.y,
-            width: area.width,
-            height: max_transcript_height,
-        };
-
-        let (lines, line_meta) = Self::build_transcript_lines(cells, transcript_area.width);
-        if lines.is_empty() {
-            Clear.render_ref(transcript_area, frame.buffer);
-            self.transcript_scroll = TranscriptScroll::default();
-            self.transcript_view_top = 0;
-            self.transcript_total_lines = 0;
-            return area.y;
-        }
-
-        let wrapped = word_wrap_lines_borrowed(&lines, transcript_area.width.max(1) as usize);
-        if wrapped.is_empty() {
-            self.transcript_scroll = TranscriptScroll::default();
-            self.transcript_view_top = 0;
-            self.transcript_total_lines = 0;
-            return area.y;
-        }
-
-        let is_user_cell: Vec<bool> = cells
-            .iter()
-            .map(|cell| cell.as_any().is::<UserHistoryCell>())
-            .collect();
-        let wrapped_line_meta =
-            Self::build_wrapped_line_meta(&lines, &line_meta, transcript_area.width);
-        debug_assert_eq!(wrapped.len(), wrapped_line_meta.len());
-        let wrapped_is_user_row: Vec<bool> = wrapped_line_meta
-            .iter()
-            .map(TranscriptLineMeta::cell_index)
-            .map(|cell_index| {
-                cell_index
-                    .and_then(|idx| is_user_cell.get(idx).copied())
-                    .unwrap_or(false)
-            })
-            .collect();
-
-        let total_lines = wrapped_line_meta.len();
-        self.transcript_total_lines = total_lines;
-        let max_visible = std::cmp::min(max_transcript_height as usize, total_lines);
-        let max_start = total_lines.saturating_sub(max_visible);
-
-        let (scroll_state, top_offset) = self
-            .transcript_scroll
-            .resolve_top(&wrapped_line_meta, max_start);
-        self.transcript_scroll = scroll_state;
-        self.transcript_view_top = top_offset;
-
-        let transcript_visible_height = max_visible as u16;
-        let chat_top = if total_lines <= max_transcript_height as usize {
-            let gap = if transcript_visible_height == 0 { 0 } else { 1 };
-            area.y
-                .saturating_add(transcript_visible_height)
-                .saturating_add(gap)
-        } else {
-            area.bottom().saturating_sub(chat_height)
-        };
-
-        let clear_height = chat_top.saturating_sub(area.y);
-        if clear_height > 0 {
-            Clear.render_ref(
-                Rect {
-                    x: area.x,
-                    y: area.y,
-                    width: area.width,
-                    height: clear_height,
-                },
-                frame.buffer,
-            );
-        }
-
-        let transcript_area = Rect {
-            x: area.x,
-            y: area.y,
-            width: area.width,
-            height: transcript_visible_height,
-        };
-
-        for (row_index, line_index) in (top_offset..total_lines).enumerate() {
-            if row_index >= max_visible {
-                break;
-            }
-
-            let y = transcript_area.y + row_index as u16;
-            let row_area = Rect {
-                x: transcript_area.x,
-                y,
-                width: transcript_area.width,
-                height: 1,
-            };
-
-            if wrapped_is_user_row
-                .get(line_index)
-                .copied()
-                .unwrap_or(false)
-            {
-                let base_style = crate::style::user_message_style();
-                for x in row_area.x..row_area.right() {
-                    let cell = &mut frame.buffer[(x, y)];
-                    let style = cell.style().patch(base_style);
-                    cell.set_style(style);
-                }
-            }
-
-            wrapped[line_index].render_ref(row_area, frame.buffer);
-        }
-
-        self.apply_transcript_selection(transcript_area, frame.buffer);
-        chat_top
-    }
-
-    fn handle_mouse_event(
-        &mut self,
-        tui: &mut tui::Tui,
-        mouse_event: crossterm::event::MouseEvent,
-    ) {
-        use crossterm::event::MouseEventKind;
-
-        if self.overlay.is_some() {
-            return;
-        }
-
-        let viewport = tui.terminal.viewport_area;
-        let width = viewport.width;
-        let height = viewport.height;
-        if width == 0 || height == 0 {
-            return;
-        }
-
-        let session_height = 4u16.min(height);
-        let available_for_chat = height.saturating_sub(session_height);
-        let chat_height = self
-            .chat_widget
-            .desired_height(width)
-            .min(available_for_chat);
-        let reserved = chat_height.saturating_add(session_height);
-        if reserved >= height {
-            return;
-        }
-
-        let transcript_height = height.saturating_sub(reserved);
-        if transcript_height == 0 {
-            return;
-        }
-
-        let transcript_area = Rect {
-            x: viewport.x,
-            y: viewport.y,
-            width,
-            height: transcript_height,
-        };
-        let base_x = transcript_area.x.saturating_add(2);
-        let max_x = transcript_area.right().saturating_sub(1);
-
-        let mut clamped_x = mouse_event.column;
-        let mut clamped_y = mouse_event.row;
-
-        if clamped_y < transcript_area.y || clamped_y >= transcript_area.bottom() {
-            clamped_y = transcript_area.y;
-        }
-        if clamped_x < base_x {
-            clamped_x = base_x;
-        }
-        if clamped_x > max_x {
-            clamped_x = max_x;
-        }
-
-        let streaming = self.chat_widget.is_task_running();
-
-        match mouse_event.kind {
-            MouseEventKind::ScrollUp => {
-                self.scroll_transcript(
-                    tui,
-                    -3,
-                    transcript_area.height as usize,
-                    transcript_area.width,
-                );
-            }
-            MouseEventKind::ScrollDown => {
-                self.scroll_transcript(
-                    tui,
-                    3,
-                    transcript_area.height as usize,
-                    transcript_area.width,
-                );
-            }
-            MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(point) = self.transcript_point_from_coordinates(
-                    transcript_area,
-                    base_x,
-                    clamped_x,
-                    clamped_y,
-                ) {
-                    self.transcript_selection.anchor = Some(point);
-                    self.transcript_selection.head = Some(point);
-                    tui.frame_requester().schedule_frame();
-                }
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                if let Some(anchor) = self.transcript_selection.anchor
-                    && let Some(point) = self.transcript_point_from_coordinates(
-                        transcript_area,
-                        base_x,
-                        clamped_x,
-                        clamped_y,
-                    )
-                {
-                    if streaming
-                        && matches!(self.transcript_scroll, TranscriptScroll::ToBottom)
-                        && point != anchor
-                    {
-                        self.lock_transcript_scroll_to_current_view(
-                            transcript_area.height as usize,
-                            transcript_area.width,
-                        );
-                    }
-                    self.transcript_selection.head = Some(point);
-                    tui.frame_requester().schedule_frame();
-                }
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                if self.transcript_selection.anchor == self.transcript_selection.head {
-                    self.transcript_selection = TranscriptSelection::default();
-                    tui.frame_requester().schedule_frame();
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn scroll_transcript(
-        &mut self,
-        tui: &mut tui::Tui,
-        delta_lines: i32,
-        visible_lines: usize,
-        width: u16,
-    ) {
-        if visible_lines == 0 {
-            return;
-        }
-
-        let (lines, line_meta) = Self::build_transcript_lines(&self.transcript_cells, width);
-        let wrapped_line_meta = Self::build_wrapped_line_meta(&lines, &line_meta, width);
-        self.transcript_scroll =
-            self.transcript_scroll
-                .scrolled_by(delta_lines, &wrapped_line_meta, visible_lines);
-
-        tui.frame_requester().schedule_frame();
-    }
-
-    fn lock_transcript_scroll_to_current_view(&mut self, visible_lines: usize, width: u16) {
-        if self.transcript_cells.is_empty() || visible_lines == 0 || width == 0 {
-            return;
-        }
-
-        let (lines, line_meta) = Self::build_transcript_lines(&self.transcript_cells, width);
-        let wrapped_line_meta = Self::build_wrapped_line_meta(&lines, &line_meta, width);
-        if wrapped_line_meta.is_empty() {
-            return;
-        }
-
-        let total_lines = wrapped_line_meta.len();
-        let max_visible = std::cmp::min(visible_lines, total_lines);
-        if max_visible == 0 {
-            return;
-        }
-
-        let max_start = total_lines.saturating_sub(max_visible);
-        let top_offset = match self.transcript_scroll {
-            TranscriptScroll::ToBottom => max_start,
-            TranscriptScroll::Scrolled { .. } => return,
-        };
-
-        if let Some(scroll_state) = TranscriptScroll::anchor_for(&wrapped_line_meta, top_offset) {
-            self.transcript_scroll = scroll_state;
-        }
     }
 
     fn build_transcript_lines(
@@ -1208,191 +857,6 @@ impl App {
         (lines, line_meta)
     }
 
-    fn copy_transcript_selection(&mut self, tui: &tui::Tui) {
-        let (anchor, head) = match (
-            self.transcript_selection.anchor,
-            self.transcript_selection.head,
-        ) {
-            (Some(a), Some(h)) if a != h => (a, h),
-            _ => return,
-        };
-
-        let viewport = tui.terminal.viewport_area;
-        let width = viewport.width;
-        let height = viewport.height;
-        if width == 0 || height == 0 {
-            return;
-        }
-
-        let session_height = 4u16.min(height);
-        let available_for_chat = height.saturating_sub(session_height);
-        let chat_height = self
-            .chat_widget
-            .desired_height(width)
-            .min(available_for_chat);
-        let reserved = chat_height.saturating_add(session_height);
-        if reserved >= height {
-            return;
-        }
-
-        let transcript_height = height.saturating_sub(reserved);
-        if transcript_height == 0 {
-            return;
-        }
-
-        let transcript_area = Rect {
-            x: viewport.x,
-            y: viewport.y,
-            width,
-            height: transcript_height,
-        };
-
-        let cells = self.transcript_cells.clone();
-        let (lines, _) = Self::build_transcript_lines(&cells, transcript_area.width);
-        if lines.is_empty() {
-            return;
-        }
-
-        let wrapped = word_wrap_lines_borrowed(&lines, transcript_area.width.max(1) as usize);
-        let total_lines = wrapped.len();
-        if total_lines == 0 {
-            return;
-        }
-
-        let max_visible = transcript_area.height as usize;
-        let visible_start = self
-            .transcript_view_top
-            .min(total_lines.saturating_sub(max_visible));
-        let visible_end = std::cmp::min(visible_start + max_visible, total_lines);
-
-        let mut buf = Buffer::empty(transcript_area);
-        Clear.render_ref(transcript_area, &mut buf);
-
-        for (row_index, line_index) in (visible_start..visible_end).enumerate() {
-            let row_area = Rect {
-                x: transcript_area.x,
-                y: transcript_area.y + row_index as u16,
-                width: transcript_area.width,
-                height: 1,
-            };
-            wrapped[line_index].render_ref(row_area, &mut buf);
-        }
-
-        let base_x = transcript_area.x.saturating_add(2);
-        let max_x = transcript_area.right().saturating_sub(1);
-
-        let mut start = anchor;
-        let mut end = head;
-        if (end.line_index < start.line_index)
-            || (end.line_index == start.line_index && end.column < start.column)
-        {
-            std::mem::swap(&mut start, &mut end);
-        }
-
-        let mut lines_out: Vec<String> = Vec::new();
-
-        for (row_index, line_index) in (visible_start..visible_end).enumerate() {
-            if line_index < start.line_index || line_index > end.line_index {
-                continue;
-            }
-
-            let y = transcript_area.y + row_index as u16;
-
-            let line_start_col = if line_index == start.line_index {
-                start.column
-            } else {
-                0
-            };
-            let line_end_col = if line_index == end.line_index {
-                end.column
-            } else {
-                max_x.saturating_sub(base_x)
-            };
-
-            let row_sel_start = base_x.saturating_add(line_start_col);
-            let row_sel_end = base_x.saturating_add(line_end_col).min(max_x);
-
-            if row_sel_start > row_sel_end {
-                continue;
-            }
-
-            let mut first_text_x = None;
-            let mut last_text_x = None;
-            for x in base_x..=max_x {
-                let cell = &buf[(x, y)];
-                if cell.symbol() != " " {
-                    if first_text_x.is_none() {
-                        first_text_x = Some(x);
-                    }
-                    last_text_x = Some(x);
-                }
-            }
-
-            let (text_start, text_end) = match (first_text_x, last_text_x) {
-                (Some(_), Some(e)) => (base_x, e),
-                _ => {
-                    lines_out.push(String::new());
-                    continue;
-                }
-            };
-
-            let from_x = row_sel_start.max(text_start);
-            let to_x = row_sel_end.min(text_end);
-            if from_x > to_x {
-                continue;
-            }
-
-            let mut line_text = String::new();
-            for x in from_x..=to_x {
-                let cell = &buf[(x, y)];
-                let symbol = cell.symbol();
-                if !symbol.is_empty() {
-                    line_text.push_str(symbol);
-                }
-            }
-
-            lines_out.push(line_text);
-        }
-
-        if lines_out.is_empty() {
-            return;
-        }
-
-        let text = lines_out.join("\n");
-        if let Err(err) = clipboard_copy::copy_text(text) {
-            tracing::error!(error = %err, "failed to copy selection to clipboard");
-        }
-    }
-
-    fn transcript_point_from_coordinates(
-        &self,
-        transcript_area: Rect,
-        base_x: u16,
-        x: u16,
-        y: u16,
-    ) -> Option<TranscriptSelectionPoint> {
-        if self.transcript_total_lines == 0 {
-            return None;
-        }
-
-        let mut row_index = y.saturating_sub(transcript_area.y);
-        if row_index >= transcript_area.height {
-            if transcript_area.height == 0 {
-                return None;
-            }
-            row_index = transcript_area.height.saturating_sub(1);
-        }
-
-        let max_line = self.transcript_total_lines.saturating_sub(1);
-        let line_index = self
-            .transcript_view_top
-            .saturating_add(usize::from(row_index))
-            .min(max_line);
-        let column = x.saturating_sub(base_x);
-
-        Some(TranscriptSelectionPoint { line_index, column })
-    }
-
     async fn handle_event(&mut self, tui: &mut tui::Tui, event: AppEvent) -> Result<bool> {
         match event {
             AppEvent::UpdateSessionStatus {
@@ -1416,14 +880,9 @@ impl App {
                     self.chat_widget.token_usage(),
                     self.chat_widget.conversation_id(),
                 );
-                self.render_transcript_once(tui);
                 self.transcript_cells.clear();
                 self.deferred_history_lines.clear();
                 self.has_emitted_history_lines = false;
-                self.transcript_scroll = TranscriptScroll::default();
-                self.transcript_selection = TranscriptSelection::default();
-                self.transcript_view_top = 0;
-                self.transcript_total_lines = 0;
                 self.reset_backtrack_state();
                 self.shutdown_current_conversation().await;
                 let model = self
@@ -1511,6 +970,8 @@ impl App {
                     }
                     if self.overlay.is_some() {
                         self.deferred_history_lines.extend(display);
+                    } else {
+                        tui.insert_history_lines(display);
                     }
                 }
             }
@@ -2366,14 +1827,9 @@ impl App {
             .await
             .wrap_err_with(|| format!("Failed to resume session from {}", path.display()))?;
 
-        self.render_transcript_once(tui);
         self.transcript_cells.clear();
         self.deferred_history_lines.clear();
         self.has_emitted_history_lines = false;
-        self.transcript_scroll = TranscriptScroll::default();
-        self.transcript_selection = TranscriptSelection::default();
-        self.transcript_view_top = 0;
-        self.transcript_total_lines = 0;
         self.reset_backtrack_state();
 
         let model = self
@@ -2525,95 +1981,6 @@ impl App {
                 } else {
                     self.chat_widget.handle_key_event(key_event);
                 }
-            }
-            KeyEvent {
-                code: KeyCode::Char('y'),
-                modifiers: crossterm::event::KeyModifiers::CONTROL,
-                kind: KeyEventKind::Press | KeyEventKind::Repeat,
-                ..
-            } if self.panel_focus != PanelFocus::Sessions => {
-                self.copy_transcript_selection(tui);
-            }
-            KeyEvent {
-                code: KeyCode::PageUp,
-                kind: KeyEventKind::Press | KeyEventKind::Repeat,
-                ..
-            } if self.panel_focus != PanelFocus::Sessions => {
-                let viewport = tui.terminal.viewport_area;
-                let width = viewport.width;
-                let height = viewport.height;
-                if width > 0 && height > 0 {
-                    let session_height = 4u16.min(height);
-                    let available_for_chat = height.saturating_sub(session_height);
-                    let chat_height = self
-                        .chat_widget
-                        .desired_height(width)
-                        .min(available_for_chat);
-                    let reserved = chat_height.saturating_add(session_height);
-                    if reserved < height {
-                        let transcript_height = height.saturating_sub(reserved);
-                        if transcript_height > 0 {
-                            let delta = -i32::from(transcript_height);
-                            self.scroll_transcript(
-                                tui,
-                                delta,
-                                usize::from(transcript_height),
-                                width,
-                            );
-                        }
-                    }
-                }
-            }
-            KeyEvent {
-                code: KeyCode::PageDown,
-                kind: KeyEventKind::Press | KeyEventKind::Repeat,
-                ..
-            } if self.panel_focus != PanelFocus::Sessions => {
-                let viewport = tui.terminal.viewport_area;
-                let width = viewport.width;
-                let height = viewport.height;
-                if width > 0 && height > 0 {
-                    let session_height = 4u16.min(height);
-                    let available_for_chat = height.saturating_sub(session_height);
-                    let chat_height = self
-                        .chat_widget
-                        .desired_height(width)
-                        .min(available_for_chat);
-                    let reserved = chat_height.saturating_add(session_height);
-                    if reserved < height {
-                        let transcript_height = height.saturating_sub(reserved);
-                        if transcript_height > 0 {
-                            let delta = i32::from(transcript_height);
-                            self.scroll_transcript(
-                                tui,
-                                delta,
-                                usize::from(transcript_height),
-                                width,
-                            );
-                        }
-                    }
-                }
-            }
-            KeyEvent {
-                code: KeyCode::Home,
-                kind: KeyEventKind::Press | KeyEventKind::Repeat,
-                ..
-            } if self.panel_focus != PanelFocus::Sessions => {
-                if !self.transcript_cells.is_empty() {
-                    self.transcript_scroll = TranscriptScroll::Scrolled {
-                        cell_index: 0,
-                        line_in_cell: 0,
-                    };
-                    tui.frame_requester().schedule_frame();
-                }
-            }
-            KeyEvent {
-                code: KeyCode::End,
-                kind: KeyEventKind::Press | KeyEventKind::Repeat,
-                ..
-            } if self.panel_focus != PanelFocus::Sessions => {
-                self.transcript_scroll = TranscriptScroll::ToBottom;
-                tui.frame_requester().schedule_frame();
             }
             // Ctrl+C exits session tab mode (if active) without committing selection
             KeyEvent {
@@ -2888,56 +2255,6 @@ impl Drop for CxresumeIdleLoader {
 }
 
 impl App {
-    fn build_wrapped_line_meta(
-        lines: &[Line<'static>],
-        line_meta: &[TranscriptLineMeta],
-        width: u16,
-    ) -> Vec<TranscriptLineMeta> {
-        let base_opts: RtOptions<'_> = RtOptions::new(width.max(1) as usize);
-        let mut wrapped_meta: Vec<TranscriptLineMeta> = Vec::new();
-        let mut first = true;
-        let mut current_cell = None;
-        let mut current_line_in_cell = 0usize;
-
-        for (idx, line) in lines.iter().enumerate() {
-            let opts = if first {
-                base_opts.clone()
-            } else {
-                base_opts
-                    .clone()
-                    .initial_indent(base_opts.subsequent_indent.clone())
-            };
-            let seg_count = word_wrap_line(line, opts).len();
-            let meta = line_meta
-                .get(idx)
-                .copied()
-                .unwrap_or(TranscriptLineMeta::Spacer);
-
-            match meta {
-                TranscriptLineMeta::CellLine { cell_index, .. } => {
-                    if current_cell != Some(cell_index) {
-                        current_cell = Some(cell_index);
-                        current_line_in_cell = 0;
-                    }
-                    for offset in 0..seg_count {
-                        wrapped_meta.push(TranscriptLineMeta::CellLine {
-                            cell_index,
-                            line_in_cell: current_line_in_cell + offset,
-                        });
-                    }
-                    current_line_in_cell += seg_count;
-                }
-                TranscriptLineMeta::Spacer => {
-                    wrapped_meta.extend(std::iter::repeat_n(TranscriptLineMeta::Spacer, seg_count));
-                    current_cell = None;
-                }
-            }
-            first = false;
-        }
-
-        wrapped_meta
-    }
-
     fn render_lines_to_ansi(
         lines: &[Line<'static>],
         line_meta: &[TranscriptLineMeta],
@@ -2987,93 +2304,6 @@ impl App {
                 String::from_utf8(buf).unwrap_or_default()
             })
             .collect()
-    }
-
-    fn apply_transcript_selection(&self, area: Rect, buf: &mut Buffer) {
-        let (anchor, head) = match (
-            self.transcript_selection.anchor,
-            self.transcript_selection.head,
-        ) {
-            (Some(a), Some(h)) => (a, h),
-            _ => return,
-        };
-
-        if self.transcript_total_lines == 0 {
-            return;
-        }
-
-        let base_x = area.x.saturating_add(2);
-        let max_x = area.right().saturating_sub(1);
-
-        let mut start = anchor;
-        let mut end = head;
-        if (end.line_index < start.line_index)
-            || (end.line_index == start.line_index && end.column < start.column)
-        {
-            std::mem::swap(&mut start, &mut end);
-        }
-
-        let visible_start = self.transcript_view_top;
-        let visible_end = self
-            .transcript_view_top
-            .saturating_add(area.height as usize)
-            .min(self.transcript_total_lines);
-
-        for (row_index, line_index) in (visible_start..visible_end).enumerate() {
-            if line_index < start.line_index || line_index > end.line_index {
-                continue;
-            }
-
-            let y = area.y + row_index as u16;
-
-            let mut first_text_x = None;
-            let mut last_text_x = None;
-            for x in base_x..=max_x {
-                let cell = &buf[(x, y)];
-                if cell.symbol() != " " {
-                    if first_text_x.is_none() {
-                        first_text_x = Some(x);
-                    }
-                    last_text_x = Some(x);
-                }
-            }
-
-            let (text_start, text_end) = match (first_text_x, last_text_x) {
-                (Some(_), Some(e)) => (base_x, e),
-                _ => continue,
-            };
-
-            let line_start_col = if line_index == start.line_index {
-                start.column
-            } else {
-                0
-            };
-            let line_end_col = if line_index == end.line_index {
-                end.column
-            } else {
-                max_x.saturating_sub(base_x)
-            };
-
-            let row_sel_start = base_x.saturating_add(line_start_col);
-            let row_sel_end = base_x.saturating_add(line_end_col).min(max_x);
-
-            if row_sel_start > row_sel_end {
-                continue;
-            }
-
-            let from_x = row_sel_start.max(text_start);
-            let to_x = row_sel_end.min(text_end);
-
-            if from_x > to_x {
-                continue;
-            }
-
-            for x in from_x..=to_x {
-                let cell = &mut buf[(x, y)];
-                let style = cell.style();
-                cell.set_style(style.add_modifier(ratatui::style::Modifier::REVERSED));
-            }
-        }
     }
 }
 
@@ -3194,10 +2424,6 @@ mod tests {
             active_profile: None,
             file_search,
             transcript_cells: Vec::new(),
-            transcript_scroll: TranscriptScroll::default(),
-            transcript_selection: TranscriptSelection::default(),
-            transcript_view_top: 0,
-            transcript_total_lines: 0,
             overlay: None,
             deferred_history_lines: Vec::new(),
             has_emitted_history_lines: false,
@@ -3266,10 +2492,6 @@ mod tests {
                 active_profile: None,
                 file_search,
                 transcript_cells: Vec::new(),
-                transcript_scroll: TranscriptScroll::default(),
-                transcript_selection: TranscriptSelection::default(),
-                transcript_view_top: 0,
-                transcript_total_lines: 0,
                 overlay: None,
                 deferred_history_lines: Vec::new(),
                 has_emitted_history_lines: false,
@@ -3436,93 +2658,6 @@ mod tests {
         let (_, nth, prefill) = app.backtrack.pending.clone().expect("pending backtrack");
         assert_eq!(nth, 1);
         assert_eq!(prefill, "follow-up (edited)");
-    }
-
-    #[tokio::test]
-    async fn transcript_selection_moves_with_scroll() {
-        use ratatui::buffer::Buffer;
-        use ratatui::layout::Rect;
-
-        let mut app = make_test_app().await;
-        app.transcript_total_lines = 3;
-
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: 10,
-            height: 2,
-        };
-
-        // Anchor selection to logical line 1, columns 2..4.
-        app.transcript_selection = TranscriptSelection {
-            anchor: Some(TranscriptSelectionPoint {
-                line_index: 1,
-                column: 2,
-            }),
-            head: Some(TranscriptSelectionPoint {
-                line_index: 1,
-                column: 4,
-            }),
-        };
-
-        // First render: top of view is line 0, so line 1 maps to the second row.
-        app.transcript_view_top = 0;
-        let mut buf = Buffer::empty(area);
-        for x in 2..area.width {
-            buf[(x, 0)].set_symbol("A");
-            buf[(x, 1)].set_symbol("B");
-        }
-
-        app.apply_transcript_selection(area, &mut buf);
-
-        // No selection should be applied to the first row when the view is anchored at the top.
-        for x in 0..area.width {
-            let cell = &buf[(x, 0)];
-            assert!(cell.style().add_modifier.is_empty());
-        }
-
-        // After scrolling down by one line, the same logical line should now be
-        // rendered on the first row, and the highlight should move with it.
-        app.transcript_view_top = 1;
-        let mut buf_scrolled = Buffer::empty(area);
-        for x in 2..area.width {
-            buf_scrolled[(x, 0)].set_symbol("B");
-            buf_scrolled[(x, 1)].set_symbol("C");
-        }
-
-        app.apply_transcript_selection(area, &mut buf_scrolled);
-
-        // After scrolling, the selection should now be applied on the first row rather than the
-        // second.
-        for x in 0..area.width {
-            let cell = &buf_scrolled[(x, 1)];
-            assert!(cell.style().add_modifier.is_empty());
-        }
-    }
-
-    #[tokio::test]
-    async fn wrapped_line_meta_tracks_visual_lines() {
-        let lines = vec![Line::from("abcd efgh")];
-        let line_meta = vec![TranscriptLineMeta::CellLine {
-            cell_index: 0,
-            line_in_cell: 0,
-        }];
-
-        let wrapped_meta = App::build_wrapped_line_meta(&lines, &line_meta, 4);
-
-        assert_eq!(
-            wrapped_meta,
-            vec![
-                TranscriptLineMeta::CellLine {
-                    cell_index: 0,
-                    line_in_cell: 0,
-                },
-                TranscriptLineMeta::CellLine {
-                    cell_index: 0,
-                    line_in_cell: 1,
-                },
-            ],
-        );
     }
 
     #[tokio::test]

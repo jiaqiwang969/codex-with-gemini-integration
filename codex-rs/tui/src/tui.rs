@@ -16,10 +16,8 @@ use crossterm::Command;
 use crossterm::SynchronizedUpdate;
 use crossterm::event::DisableBracketedPaste;
 use crossterm::event::DisableFocusChange;
-use crossterm::event::DisableMouseCapture;
 use crossterm::event::EnableBracketedPaste;
 use crossterm::event::EnableFocusChange;
-use crossterm::event::EnableMouseCapture;
 use crossterm::event::Event;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyboardEnhancementFlags;
@@ -47,14 +45,12 @@ use crate::tui::job_control::SuspendContext;
 
 #[cfg(unix)]
 mod job_control;
-pub(crate) mod scrolling;
 
 /// A type alias for the terminal type used in this application
 pub type Terminal = CustomTerminal<CrosstermBackend<Stdout>>;
 
 pub fn set_modes() -> Result<()> {
     execute!(stdout(), EnableBracketedPaste)?;
-    let _ = execute!(stdout(), EnableMouseCapture);
 
     enable_raw_mode()?;
     // Enable keyboard enhancement flags so modifiers for keys like Enter are disambiguated.
@@ -124,7 +120,6 @@ pub fn restore() -> Result<()> {
     // Pop may fail on platforms that didn't support the push; ignore errors.
     let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
     execute!(stdout(), DisableBracketedPaste)?;
-    let _ = execute!(stdout(), DisableMouseCapture);
     let _ = execute!(stdout(), DisableFocusChange);
     disable_raw_mode()?;
     let _ = execute!(stdout(), crossterm::cursor::Show);
@@ -161,7 +156,7 @@ pub enum TuiEvent {
     Key(KeyEvent),
     Paste(String),
     Draw,
-    Mouse(crossterm::event::MouseEvent),
+    Mouse(()),
 }
 
 pub struct Tui {
@@ -286,8 +281,8 @@ impl Tui {
                             Event::Paste(pasted) => {
                                 yield TuiEvent::Paste(pasted);
                             }
-                            Event::Mouse(mouse_event) => {
-                                yield TuiEvent::Mouse(mouse_event);
+                            Event::Mouse(_) => {
+                                yield TuiEvent::Mouse(());
                             }
                             Event::FocusGained => {
                                 terminal_focused.store(true, Ordering::Relaxed);

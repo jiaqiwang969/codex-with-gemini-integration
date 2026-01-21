@@ -5084,11 +5084,6 @@ if __name__ == "__main__":
         self.bottom_pane.is_normal_backtrack_mode()
     }
 
-    /// Return true when the bottom pane currently has an active task.
-    pub(crate) fn is_task_running(&self) -> bool {
-        self.bottom_pane.is_task_running()
-    }
-
     pub(crate) fn insert_str(&mut self, text: &str) {
         self.bottom_pane.insert_str(text);
     }
@@ -5104,17 +5099,6 @@ if __name__ == "__main__":
 
     pub(crate) fn clear_esc_backtrack_hint(&mut self) {
         self.bottom_pane.clear_esc_backtrack_hint();
-    }
-
-    /// Inform the bottom pane about the current transcript scroll state.
-    pub(crate) fn set_transcript_ui_state(
-        &mut self,
-        scrolled: bool,
-        selection_active: bool,
-        scroll_position: Option<(usize, usize)>,
-    ) {
-        self.bottom_pane
-            .set_transcript_ui_state(scrolled, selection_active, scroll_position);
     }
     /// Forward an `Op` directly to codex.
     pub(crate) fn submit_op(&self, op: Op) {

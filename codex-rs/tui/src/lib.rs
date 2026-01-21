@@ -46,7 +46,6 @@ mod ascii_animation;
 mod bottom_pane;
 mod chatwidget;
 mod cli;
-mod clipboard_copy;
 mod clipboard_paste;
 mod color;
 pub mod custom_terminal;
