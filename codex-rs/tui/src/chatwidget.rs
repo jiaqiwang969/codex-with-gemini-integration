@@ -34,8 +34,8 @@ use codex_core::protocol::ExecCommandBeginEvent;
 use codex_core::protocol::ExecCommandEndEvent;
 use codex_core::protocol::ExecCommandSource;
 use codex_core::protocol::ExitedReviewModeEvent;
-use codex_core::protocol::ListSkillsResponseEvent;
 use codex_core::protocol::ListCustomPromptsResponseEvent;
+use codex_core::protocol::ListSkillsResponseEvent;
 use codex_core::protocol::McpListToolsResponseEvent;
 use codex_core::protocol::McpStartupCompleteEvent;
 use codex_core::protocol::McpStartupStatus;
@@ -62,14 +62,19 @@ use codex_core::protocol::ViewImageToolCallEvent;
 use codex_core::protocol::WarningEvent;
 use codex_core::protocol::WebSearchBeginEvent;
 use codex_core::protocol::WebSearchEndEvent;
-use codex_protocol::account::PlanType;
 use codex_protocol::ConversationId;
+use codex_protocol::account::PlanType;
 use codex_protocol::approvals::ElicitationRequestEvent;
-use codex_protocol::openai_models::ModelPreset;
-use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ModelPreset;
+use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::parse_command::ParsedCommand;
+use codex_protocol::protocol::RalphCompletionReason;
+use codex_protocol::protocol::RalphLoopCompleteEvent;
+use codex_protocol::protocol::RalphLoopContinueEvent;
+use codex_protocol::protocol::RalphLoopState;
+use codex_protocol::protocol::RalphLoopStatusEvent;
 use codex_protocol::user_input::UserInput;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -214,11 +219,12 @@ impl RateLimitWarningState {
                 self.secondary_index += 1;
             }
             if let Some(threshold) = highest_secondary {
+                let remaining = 100.0 - threshold;
                 let limit_label = secondary_window_minutes
                     .map(get_limits_duration)
                     .unwrap_or_else(|| "weekly".to_string());
                 warnings.push(format!(
-                    "Heads up, you've used over {threshold:.0}% of your {limit_label} limit. Run /status for a breakdown."
+                    "Heads up, you have less than {remaining:.0}% of your {limit_label} limit left. Run /status for a breakdown."
                 ));
             }
         }
@@ -232,11 +238,12 @@ impl RateLimitWarningState {
                 self.primary_index += 1;
             }
             if let Some(threshold) = highest_primary {
+                let remaining = 100.0 - threshold;
                 let limit_label = primary_window_minutes
                     .map(get_limits_duration)
                     .unwrap_or_else(|| "5h".to_string());
                 warnings.push(format!(
-                    "Heads up, you've used over {threshold:.0}% of your {limit_label} limit. Run /status for a breakdown."
+                    "Heads up, you have less than {remaining:.0}% of your {limit_label} limit left. Run /status for a breakdown."
                 ));
             }
         }
@@ -346,6 +353,10 @@ pub(crate) struct ChatWidget {
     // User messages queued while a turn is in progress
     queued_user_messages: VecDeque<UserMessage>,
     queued_turn_pending_start: bool,
+    // Last non-empty user message text (used by commands that default to "repeat last prompt").
+    last_user_message: Option<String>,
+    // Active Ralph loop state (if enabled via `/ralph-loop`).
+    ralph_loop_state: Option<RalphLoopState>,
     // Pending notification to show when unfocused on next Draw
     pending_notification: Option<Notification>,
     // Simple review mode flag; used to adjust layout and banners.
@@ -427,7 +438,12 @@ impl BatchImageState {
         }
     }
 
-    fn new_for_pdf(source_dir: PathBuf, images: Vec<PathBuf>, prompt: String, pdf_path: PathBuf) -> Self {
+    fn new_for_pdf(
+        source_dir: PathBuf,
+        images: Vec<PathBuf>,
+        prompt: String,
+        pdf_path: PathBuf,
+    ) -> Self {
         let total_count = images.len();
         Self {
             source_dir,
@@ -542,8 +558,7 @@ impl RefImageManager {
             (trimmed, None)
         };
 
-        let path_tokens: Vec<String> = Shlex::new(paths_raw).collect();
-        let path_tokens: Vec<String> = path_tokens.into_iter().filter(|s| !s.is_empty()).collect();
+        let path_tokens: Vec<String> = Shlex::new(paths_raw).filter(|s| !s.is_empty()).collect();
         if path_tokens.is_empty() {
             // If the user supplied only a prompt (for example `/ref-image -- tweak the style`)
             // defer image selection to the caller so it can integrate any attached images.
@@ -586,9 +601,9 @@ impl RefImageManager {
 
     fn resolve_path(raw: &str, ctx: &RefImageContext<'_>) -> PathBuf {
         // Expand ~/ prefix against the user's home directory when possible.
-        let expanded = if raw.starts_with("~/") {
+        let expanded = if let Some(stripped) = raw.strip_prefix("~/") {
             if let Some(home) = dirs::home_dir() {
-                home.join(&raw[2..])
+                home.join(stripped)
             } else {
                 PathBuf::from(raw)
             }
@@ -791,10 +806,7 @@ impl ChatWidget {
                     self.add_info_message(format!("Image quality set to {size}"), None);
                 } else {
                     self.add_info_message(
-                        format!(
-                            "Invalid image quality '{}'. Valid options: {valid_options}",
-                            size
-                        ),
+                        format!("Invalid image quality '{size}'. Valid options: {valid_options}"),
                         None,
                     );
                 }
@@ -872,19 +884,19 @@ impl ChatWidget {
         if let Ok(entries) = std::fs::read_dir(&source_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_file() {
-                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                        let ext_lower = ext.to_lowercase();
-                        // Skip already processed files
-                        if !path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .map(|s| s.ends_with("_processed"))
-                            .unwrap_or(false)
-                            && image_extensions.contains(&ext_lower.as_str())
-                        {
-                            images.push(path);
-                        }
+                if path.is_file()
+                    && let Some(ext) = path.extension().and_then(|e| e.to_str())
+                {
+                    let ext_lower = ext.to_lowercase();
+                    // Skip already processed files
+                    if !path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.ends_with("_processed"))
+                        .unwrap_or(false)
+                        && image_extensions.contains(&ext_lower.as_str())
+                    {
+                        images.push(path);
                     }
                 }
             }
@@ -1007,7 +1019,7 @@ impl ChatWidget {
         let extension = pdf_path
             .extension()
             .and_then(|e| e.to_str())
-            .map(|s| s.to_lowercase());
+            .map(str::to_lowercase);
 
         if extension.as_deref() != Some("pdf") {
             self.add_info_message(
@@ -1028,14 +1040,14 @@ impl ChatWidget {
         let session_id = self
             .conversation_id
             .as_ref()
-            .map(|id| id.to_string())
+            .map(std::string::ToString::to_string)
             .unwrap_or_else(|| "unknown".to_string());
         let images_output_dir = self
             .config
             .codex_home
             .join("images")
             .join(&session_id)
-            .join(format!("{}_images", pdf_stem));
+            .join(format!("{pdf_stem}_images"));
 
         self.add_info_message(
             format!(
@@ -1073,10 +1085,7 @@ impl ChatWidget {
 
         // Create output directory
         if let Err(e) = std::fs::create_dir_all(&images_output_dir) {
-            self.add_info_message(
-                format!("Error creating output directory: {}", e),
-                None,
-            );
+            self.add_info_message(format!("Error creating output directory: {e}"), None);
             self.pending_pdf_update = None;
             return;
         }
@@ -1162,10 +1171,7 @@ if __name__ == "__main__":
         let script_path = temp_dir.join("codex_pdf_process.py");
 
         if let Err(e) = std::fs::write(&script_path, PDF_PROCESS_SCRIPT) {
-            self.add_info_message(
-                format!("Error writing temp script: {}", e),
-                None,
-            );
+            self.add_info_message(format!("Error writing temp script: {e}"), None);
             self.pending_pdf_update = None;
             return;
         }
@@ -1182,26 +1188,17 @@ if __name__ == "__main__":
             Ok(output) => {
                 if output.status.success() {
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    self.add_info_message(
-                        format!("[PDF Update] Step 1 Complete!\n{}", stdout),
-                        None,
-                    );
+                    self.add_info_message(format!("[PDF Update] Step 1 Complete!\n{stdout}"), None);
                     // Now start batch processing
                     self.start_batch_after_pdf_processing();
                 } else {
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    self.add_info_message(
-                        format!("Error processing PDF: {}", stderr),
-                        None,
-                    );
+                    self.add_info_message(format!("Error processing PDF: {stderr}"), None);
                     self.pending_pdf_update = None;
                 }
             }
             Err(e) => {
-                self.add_info_message(
-                    format!("Error running Python script: {}", e),
-                    None,
-                );
+                self.add_info_message(format!("Error running Python script: {e}"), None);
                 self.pending_pdf_update = None;
             }
         }
@@ -1224,19 +1221,19 @@ if __name__ == "__main__":
         if let Ok(entries) = std::fs::read_dir(&source_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_file() {
-                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                        let ext_lower = ext.to_lowercase();
-                        // Skip already processed files
-                        if !path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .map(|s| s.ends_with("_processed"))
-                            .unwrap_or(false)
-                            && image_extensions.contains(&ext_lower.as_str())
-                        {
-                            images.push(path);
-                        }
+                if path.is_file()
+                    && let Some(ext) = path.extension().and_then(|e| e.to_str())
+                {
+                    let ext_lower = ext.to_lowercase();
+                    // Skip already processed files
+                    if !path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.ends_with("_processed"))
+                        .unwrap_or(false)
+                        && image_extensions.contains(&ext_lower.as_str())
+                    {
+                        images.push(path);
                     }
                 }
             }
@@ -1270,7 +1267,9 @@ if __name__ == "__main__":
         );
 
         // Initialize batch state with PDF path for final merge
-        self.batch_image_state = Some(BatchImageState::new_for_pdf(source_dir, images, prompt, pdf_path));
+        self.batch_image_state = Some(BatchImageState::new_for_pdf(
+            source_dir, images, prompt, pdf_path,
+        ));
 
         // Start processing the first image
         self.process_next_batch_image();
@@ -1291,9 +1290,10 @@ if __name__ == "__main__":
             } else {
                 // Batch is complete, extract info for PDF merge if needed
                 let completion_msg = batch_state.completion_message();
-                let pdf_info = batch_state.original_pdf_path.as_ref().map(|pdf_path| {
-                    (batch_state.source_dir.clone(), pdf_path.clone())
-                });
+                let pdf_info = batch_state
+                    .original_pdf_path
+                    .as_ref()
+                    .map(|pdf_path| (batch_state.source_dir.clone(), pdf_path.clone()));
                 (None, None, None, Some((completion_msg, pdf_info)))
             }
         };
@@ -1309,7 +1309,9 @@ if __name__ == "__main__":
             return;
         }
 
-        if let (Some(image_path), Some(progress_msg), Some(prompt)) = (image_path, progress_msg, prompt) {
+        if let (Some(image_path), Some(progress_msg), Some(prompt)) =
+            (image_path, progress_msg, prompt)
+        {
             // Show progress
             self.add_info_message(progress_msg, None);
 
@@ -1426,17 +1428,14 @@ if __name__ == "__main__":
         let output_pptx = original_pdf_path
             .parent()
             .unwrap_or(&original_pdf_path)
-            .join(format!("{}_processed.pptx", pdf_stem));
+            .join(format!("{pdf_stem}_processed.pptx"));
 
         // Write script to temp file
         let temp_dir = std::env::temp_dir();
         let script_path = temp_dir.join("codex_merge_pptx.py");
 
         if let Err(e) = std::fs::write(&script_path, MERGE_SCRIPT) {
-            self.add_info_message(
-                format!("Error writing merge script: {}", e),
-                None,
-            );
+            self.add_info_message(format!("Error writing merge script: {e}"), None);
             return;
         }
 
@@ -1463,17 +1462,11 @@ if __name__ == "__main__":
                     );
                 } else {
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    self.add_info_message(
-                        format!("Error creating PPTX: {}", stderr),
-                        None,
-                    );
+                    self.add_info_message(format!("Error creating PPTX: {stderr}"), None);
                 }
             }
             Err(e) => {
-                self.add_info_message(
-                    format!("Error running merge script: {}", e),
-                    None,
-                );
+                self.add_info_message(format!("Error running merge script: {e}"), None);
             }
         }
     }
@@ -1756,6 +1749,8 @@ if __name__ == "__main__":
         // Continue batch image processing if active
         self.on_turn_complete_for_batch();
 
+        self.on_task_complete_for_ralph_loop(&notification_response);
+
         self.maybe_send_next_queued_input();
         // Emit a notification when the turn completes (suppressed if focused).
         self.notify(Notification::AgentTurnComplete {
@@ -1763,6 +1758,65 @@ if __name__ == "__main__":
         });
 
         self.maybe_show_pending_rate_limit_prompt();
+    }
+
+    fn on_task_complete_for_ralph_loop(&mut self, last_agent_message: &str) {
+        let Some(mut state) = self.ralph_loop_state.take() else {
+            return;
+        };
+
+        let completion_detected =
+            check_completion_promise(last_agent_message, &state.completion_promise);
+        let max_reached = state.max_iterations > 0 && state.iteration >= state.max_iterations;
+
+        if !completion_detected && !max_reached {
+            state.next_iteration(truncate_string(last_agent_message, 200), false);
+
+            if let Err(err) = save_ralph_state_file(&self.config.cwd, &state) {
+                tracing::warn!("failed to save ralph state file: {err}");
+            }
+
+            let max_iterations_label = if state.max_iterations == 0 {
+                "unlimited".to_string()
+            } else {
+                state.max_iterations.to_string()
+            };
+            let completion_promise = state.completion_promise.clone();
+            let iteration = state.iteration;
+            let message = format!(
+                "🔄 Ralph iteration {iteration}/{max_iterations_label} | To stop: output <promise>{completion_promise}</promise> (ONLY when TRUE)",
+            );
+            self.add_to_history(history_cell::new_info_event(message, None));
+
+            // Re-inject the SAME original prompt (Ralph technique).
+            self.queued_user_messages
+                .push_front(state.original_prompt.clone().into());
+            self.refresh_queued_user_messages();
+
+            self.ralph_loop_state = Some(state);
+            return;
+        }
+
+        let duration_seconds = calculate_duration_seconds(&state.started_at);
+        let completion_reason = if completion_detected {
+            format!(
+                "completion promise detected (<promise>{}</promise>)",
+                state.completion_promise.as_str()
+            )
+        } else {
+            format!("max iterations reached ({})", state.max_iterations)
+        };
+        let msg = format!(
+            "✅ Ralph Loop completed: {completion_reason} ({iterations} iteration(s), {duration_seconds:.2}s).",
+            iterations = state.iteration,
+        );
+        self.add_to_history(history_cell::new_info_event(msg, None));
+
+        if let Err(err) = cleanup_ralph_state_file(&self.config.cwd) {
+            tracing::warn!("failed to cleanup ralph state file: {err}");
+        }
+
+        self.ralph_loop_state = None;
     }
 
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {
@@ -2103,10 +2157,7 @@ if __name__ == "__main__":
 
     fn on_web_search_end(&mut self, ev: WebSearchEndEvent) {
         self.flush_answer_stream_with_separator();
-        self.add_to_history(history_cell::new_web_search_call(format!(
-            "Searched: {}",
-            ev.query
-        )));
+        self.add_to_history(history_cell::new_web_search_call(ev.query));
     }
 
     fn on_get_history_entry_response(
@@ -2141,6 +2192,49 @@ if __name__ == "__main__":
         self.bottom_pane.ensure_status_indicator();
         self.bottom_pane.set_interrupt_hint_visible(true);
         self.set_status_header(message);
+    }
+
+    fn on_ralph_loop_continue(&mut self, event: RalphLoopContinueEvent) {
+        let RalphLoopContinueEvent {
+            iteration,
+            max_iterations,
+            reason,
+        } = event;
+        let hint = if reason.trim().is_empty() {
+            None
+        } else {
+            Some(reason)
+        };
+        self.add_info_message(
+            format!("Ralph Loop continuing ({iteration}/{max_iterations})"),
+            hint,
+        );
+    }
+
+    fn on_ralph_loop_status(&mut self, event: RalphLoopStatusEvent) {
+        self.add_info_message(event.message, None);
+    }
+
+    fn on_ralph_loop_complete(&mut self, event: RalphLoopCompleteEvent) {
+        let RalphLoopCompleteEvent {
+            total_iterations,
+            completion_reason,
+            duration_seconds,
+        } = event;
+        let reason = match completion_reason {
+            RalphCompletionReason::PromiseDetected => "completion promise detected",
+            RalphCompletionReason::MaxIterations => "max iterations reached",
+            RalphCompletionReason::UserInterrupt => "cancelled by user",
+            RalphCompletionReason::FatalError => "fatal error",
+        };
+        let message = format!(
+            "Ralph Loop completed: {reason} ({total_iterations} iterations, {duration_seconds:.2}s)",
+        );
+        if matches!(completion_reason, RalphCompletionReason::FatalError) {
+            self.add_error_message(message);
+        } else {
+            self.add_info_message(message, None);
+        }
     }
 
     fn on_undo_started(&mut self, event: UndoStartedEvent) {
@@ -2226,6 +2320,9 @@ if __name__ == "__main__":
     fn handle_streaming_delta(&mut self, delta: String) {
         // Before streaming agent content, flush any active exec cell group.
         self.flush_active_cell();
+        if let Some(header) = self.retry_status_header.take() {
+            self.set_status_header(header);
+        }
 
         if self.stream_controller.is_none() {
             if self.needs_final_message_separator {
@@ -2249,17 +2346,25 @@ if __name__ == "__main__":
     }
 
     pub(crate) fn handle_exec_end_now(&mut self, ev: ExecCommandEndEvent) {
-        let running = self.running_commands.remove(&ev.call_id);
-        if self.suppressed_exec_calls.remove(&ev.call_id) {
+        let ExecCommandEndEvent {
+            call_id,
+            command: end_command,
+            parsed_cmd: end_parsed,
+            source: end_source,
+            exit_code,
+            formatted_output,
+            aggregated_output,
+            duration,
+            ..
+        } = ev;
+
+        let running = self.running_commands.remove(&call_id);
+        if self.suppressed_exec_calls.remove(&call_id) {
             return;
         }
         let (command, parsed, source) = match running {
             Some(rc) => (rc.command, rc.parsed_cmd, rc.source),
-            None => (
-                vec![ev.call_id.clone()],
-                Vec::new(),
-                ExecCommandSource::Agent,
-            ),
+            None => (end_command, end_parsed, end_source),
         };
         let is_unified_exec_interaction =
             matches!(source, ExecCommandSource::UnifiedExecInteraction);
@@ -2275,7 +2380,7 @@ if __name__ == "__main__":
         if needs_new {
             self.flush_active_cell();
             self.active_cell = Some(Box::new(new_active_exec_command(
-                ev.call_id.clone(),
+                call_id.clone(),
                 command,
                 parsed,
                 source,
@@ -2291,18 +2396,18 @@ if __name__ == "__main__":
         {
             let output = if is_unified_exec_interaction {
                 CommandOutput {
-                    exit_code: ev.exit_code,
+                    exit_code,
                     formatted_output: String::new(),
                     aggregated_output: String::new(),
                 }
             } else {
                 CommandOutput {
-                    exit_code: ev.exit_code,
-                    formatted_output: ev.formatted_output.clone(),
-                    aggregated_output: ev.aggregated_output.clone(),
+                    exit_code,
+                    formatted_output,
+                    aggregated_output,
                 }
             };
-            cell.complete_call(&ev.call_id, output, ev.duration);
+            cell.complete_call(&call_id, output, duration);
             if cell.should_flush() {
                 self.flush_active_cell();
             }
@@ -2527,7 +2632,7 @@ if __name__ == "__main__":
                 skills: None,
             }),
             active_cell: None,
-            config: config.clone(),
+            config,
             model_family,
             auth_manager,
             models_manager,
@@ -2557,6 +2662,8 @@ if __name__ == "__main__":
             conversation_id: None,
             queued_user_messages: VecDeque::new(),
             queued_turn_pending_start: false,
+            last_user_message: None,
+            ralph_loop_state: None,
             show_welcome_banner: is_first_run,
             suppress_session_configured_redraw: false,
             pending_notification: None,
@@ -2633,7 +2740,7 @@ if __name__ == "__main__":
                 skills: None,
             }),
             active_cell: None,
-            config: config.clone(),
+            config,
             model_family,
             auth_manager,
             models_manager,
@@ -2663,6 +2770,8 @@ if __name__ == "__main__":
             conversation_id: ConversationId::from_string(&conversation_id).ok(),
             queued_user_messages: VecDeque::new(),
             queued_turn_pending_start: false,
+            last_user_message: None,
+            ralph_loop_state: None,
             show_welcome_banner: false,
             suppress_session_configured_redraw: true,
             pending_notification: None,
@@ -2812,6 +2921,9 @@ if __name__ == "__main__":
             SlashCommand::New => {
                 self.app_event_tx.send(AppEvent::NewSession);
             }
+            SlashCommand::Resume => {
+                self.app_event_tx.send(AppEvent::OpenResumePicker);
+            }
             SlashCommand::Init => {
                 let init_target = self.config.cwd.join(DEFAULT_PROJECT_DOC_FILENAME);
                 if init_target.exists() {
@@ -2836,6 +2948,12 @@ if __name__ == "__main__":
             }
             SlashCommand::Review => {
                 self.open_review_popup();
+            }
+            SlashCommand::RalphLoop => {
+                self.handle_ralph_loop_command(args);
+            }
+            SlashCommand::CancelRalph => {
+                self.handle_cancel_ralph_command();
             }
             SlashCommand::Model => {
                 self.open_model_popup();
@@ -3092,6 +3210,9 @@ if __name__ == "__main__":
             tracing::error!("failed to send AddHistory op: {e}");
         }
 
+        if !display_text.trim().is_empty() {
+            self.last_user_message = Some(display_text.clone());
+        }
         if !display_text.is_empty() {
             self.add_to_history(history_cell::new_user_prompt(display_text));
         }
@@ -3229,6 +3350,9 @@ if __name__ == "__main__":
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
             EventMsg::ContextCompacted(_) => self.on_agent_message("Context compacted".to_owned()),
+            EventMsg::RalphLoopContinue(ev) => self.on_ralph_loop_continue(ev),
+            EventMsg::RalphLoopStatus(ev) => self.on_ralph_loop_status(ev),
+            EventMsg::RalphLoopComplete(ev) => self.on_ralph_loop_complete(ev),
             EventMsg::ItemStarted(_)
             | EventMsg::ItemCompleted(_)
             | EventMsg::AgentMessageContentDelta(_)
@@ -3375,24 +3499,24 @@ if __name__ == "__main__":
         };
 
         // If batch processing is active, save to source directory with _processed suffix
-        if let Some(batch_state) = &self.batch_image_state {
-            if let Some(current_image) = &batch_state.current_image {
-                let source_dir = &batch_state.source_dir;
-                let original_stem = current_image
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("output");
-                let processed_filename = format!("{original_stem}_processed.{ext}");
-                let path = source_dir.join(processed_filename);
-                if let Err(err) = std::fs::write(&path, &bytes) {
-                    tracing::warn!(
-                        "failed to write batch processed image to {}: {err}",
-                        path.display()
-                    );
-                    return None;
-                }
-                return Some(path);
+        if let Some(batch_state) = &self.batch_image_state
+            && let Some(current_image) = &batch_state.current_image
+        {
+            let source_dir = &batch_state.source_dir;
+            let original_stem = current_image
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("output");
+            let processed_filename = format!("{original_stem}_processed.{ext}");
+            let path = source_dir.join(processed_filename);
+            if let Err(err) = std::fs::write(&path, &bytes) {
+                tracing::warn!(
+                    "failed to write batch processed image to {}: {err}",
+                    path.display()
+                );
+                return None;
             }
+            return Some(path);
         }
 
         // Default behavior: save to ~/.codex/images/{conversation_id}/
@@ -3668,7 +3792,7 @@ if __name__ == "__main__":
         let description = if preset.description.is_empty() {
             Some("Uses fewer credits for upcoming turns.".to_string())
         } else {
-            Some(preset.description.to_string())
+            Some(preset.description)
         };
 
         let items = vec![
@@ -3716,18 +3840,16 @@ if __name__ == "__main__":
     /// a second popup is shown to choose the reasoning effort.
     pub(crate) fn open_model_popup(&mut self) {
         let current_model = self.config.model.clone().unwrap_or_default();
-        let presets: Vec<ModelPreset> =
-            match self.models_manager.try_list_models(&self.config) {
-                Ok(models) => models,
-                Err(_) => {
-                    self.add_info_message(
-                        "Models are being updated; please try /model again in a moment."
-                            .to_string(),
-                        None,
-                    );
-                    return;
-                }
-            };
+        let presets: Vec<ModelPreset> = match self.models_manager.try_list_models(&self.config) {
+            Ok(models) => models,
+            Err(_) => {
+                self.add_info_message(
+                    "Models are being updated; please try /model again in a moment.".to_string(),
+                    None,
+                );
+                return;
+            }
+        };
 
         let current_label = presets
             .iter()
@@ -3757,7 +3879,7 @@ if __name__ == "__main__":
                     Some(preset.default_reasoning_effort),
                 );
                 SelectionItem {
-                    name: preset.display_name.clone(),
+                    name: preset.display_name,
                     description,
                     is_current: model == current_model,
                     actions,
@@ -3934,9 +4056,9 @@ if __name__ == "__main__":
 
         if choices.len() == 1 {
             if let Some(effort) = choices.first().and_then(|c| c.stored) {
-                self.apply_model_and_effort(preset.model.to_string(), Some(effort));
+                self.apply_model_and_effort(preset.model, Some(effort));
             } else {
-                self.apply_model_and_effort(preset.model.to_string(), None);
+                self.apply_model_and_effort(preset.model, None);
             }
             return;
         }
@@ -4818,6 +4940,119 @@ if __name__ == "__main__":
         self.request_redraw();
     }
 
+    pub(crate) fn handle_ralph_loop_command(&mut self, args: Option<String>) {
+        let Some(raw_args) = args else {
+            self.add_to_history(history_cell::new_info_event(
+                ralph_loop_help_text().to_string(),
+                None,
+            ));
+            self.request_redraw();
+            return;
+        };
+
+        let raw_args = raw_args.trim();
+        if raw_args.is_empty() {
+            self.add_to_history(history_cell::new_info_event(
+                ralph_loop_help_text().to_string(),
+                None,
+            ));
+            self.request_redraw();
+            return;
+        }
+
+        let parsed = match codex_protocol::slash_commands::SlashCommand::parse(&format!(
+            "/ralph-loop {raw_args}",
+        )) {
+            Ok(cmd) => cmd,
+            Err(err) => {
+                self.add_to_history(history_cell::new_error_event(format!(
+                    "Invalid /ralph-loop command: {err}",
+                )));
+                self.request_redraw();
+                return;
+            }
+        };
+
+        let codex_protocol::slash_commands::SlashCommand::RalphLoop(cmd) = parsed else {
+            self.add_to_history(history_cell::new_error_event(
+                "Unexpected command parsed for /ralph-loop.".to_string(),
+            ));
+            self.request_redraw();
+            return;
+        };
+
+        let prompt = cmd
+            .prompt
+            .clone()
+            .or_else(|| self.last_user_message.clone());
+        let Some(prompt) = prompt.filter(|p| !p.trim().is_empty()) else {
+            self.add_to_history(history_cell::new_error_event(
+                "Please provide a prompt (positional or with --prompt), or send a message first.\n\
+                 Example: /ralph-loop \"Build API. Output <promise>COMPLETE</promise> when done.\" -n 30"
+                    .to_string(),
+            ));
+            self.request_redraw();
+            return;
+        };
+
+        let state = RalphLoopState::new(prompt.clone(), cmd.max_iterations, cmd.completion_promise);
+        self.ralph_loop_state = Some(state.clone());
+
+        if let Err(err) = save_ralph_state_file(&self.config.cwd, &state) {
+            tracing::warn!("failed to save ralph state file: {err}");
+        }
+
+        let max_iterations_label = if state.max_iterations == 0 {
+            "unlimited".to_string()
+        } else {
+            state.max_iterations.to_string()
+        };
+        let truncated = truncate_string(&prompt, 100);
+        let status = format!(
+            "🔄 Ralph Loop activated!\n\
+             \n\
+             Iteration: 1\n\
+             Max iterations: {max_iterations_label}\n\
+             Completion promise: <promise>{completion_promise}</promise>\n\
+             \n\
+             To stop: output <promise>{completion_promise}</promise> (ONLY when TRUE)\n\
+             To cancel: /cancel-ralph\n\
+             \n\
+             State file: {state_file}\n\
+             \n\
+             🔄 {truncated}",
+            completion_promise = state.completion_promise,
+            state_file = ralph_state_file_path(&self.config.cwd).display(),
+        );
+        self.add_to_history(history_cell::new_info_event(status, None));
+        self.request_redraw();
+
+        self.submit_user_message(prompt.into());
+    }
+
+    pub(crate) fn handle_cancel_ralph_command(&mut self) {
+        let Some(state) = self.ralph_loop_state.take() else {
+            self.add_to_history(history_cell::new_info_event(
+                "ℹ️ There is no active Ralph loop to cancel.".to_string(),
+                None,
+            ));
+            self.request_redraw();
+            return;
+        };
+
+        if let Err(err) = cleanup_ralph_state_file(&self.config.cwd) {
+            tracing::warn!("failed to cleanup ralph state file: {err}");
+        }
+
+        let duration_seconds = calculate_duration_seconds(&state.started_at);
+        let msg = format!(
+            "🛑 Ralph Loop cancelled ({iterations} iteration(s), {duration_seconds:.2}s).",
+            iterations = state.iteration,
+        );
+        self.add_to_history(history_cell::new_info_event(msg, None));
+        self.request_redraw();
+    }
+
     /// Forward file-search results to the bottom pane.
     pub(crate) fn apply_file_search_result(&mut self, query: String, matches: Vec<FileMatch>) {
         self.bottom_pane.on_file_search_result(query, matches);
@@ -4849,6 +5084,11 @@ if __name__ == "__main__":
         self.bottom_pane.is_normal_backtrack_mode()
     }
 
+    /// Return true when the bottom pane currently has an active task.
+    pub(crate) fn is_task_running(&self) -> bool {
+        self.bottom_pane.is_task_running()
+    }
+
     pub(crate) fn insert_str(&mut self, text: &str) {
         self.bottom_pane.insert_str(text);
     }
@@ -4864,6 +5104,17 @@ if __name__ == "__main__":
 
     pub(crate) fn clear_esc_backtrack_hint(&mut self) {
         self.bottom_pane.clear_esc_backtrack_hint();
+    }
+
+    /// Inform the bottom pane about the current transcript scroll state.
+    pub(crate) fn set_transcript_ui_state(
+        &mut self,
+        scrolled: bool,
+        selection_active: bool,
+        scroll_position: Option<(usize, usize)>,
+    ) {
+        self.bottom_pane
+            .set_transcript_ui_state(scrolled, selection_active, scroll_position);
     }
     /// Forward an `Op` directly to codex.
     pub(crate) fn submit_op(&self, op: Op) {
@@ -5296,6 +5547,11 @@ if __name__ == "__main__":
         self.current_rollout_path.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn get_model_family(&self) -> ModelFamily {
+        self.model_family.clone()
+    }
+
     /// Return a reference to the widget's current config (includes any
     /// runtime overrides applied via TUI, e.g., model or approval policy).
     pub(crate) fn config_ref(&self) -> &Config {
@@ -5475,6 +5731,112 @@ async fn fetch_rate_limits(base_url: String, auth: CodexAuth) -> Option<RateLimi
             None
         }
     }
+}
+
+fn ralph_loop_help_text() -> &'static str {
+    "🔄 **Ralph Loop** - 迭代式自我修正循环\n\n\
+     **用法：**\n\
+     • `/ralph-loop \"<PROMPT>\" -n <max-iterations> -c \"<PROMISE>\"`\n\
+     • `/cancel-ralph`\n\n\
+     **示例：**\n\
+     • `/ralph-loop \"Fix all tests. Output <promise>DONE</promise> when ALL tests pass.\" -n 30 -c DONE`\n\n\
+     **工作方式：**\n\
+     1. 运行一次 `/ralph-loop ...`\n\
+     2. 每次任务完成后，如果没有检测到 `<promise>...</promise>`，会把 *同一条原始 prompt* 重新提交\n\
+     3. 直到输出的 `<promise>TEXT</promise>` 里的 `TEXT` 与 `-c/--completion-promise` **完全匹配** 才停止\n\n\
+     **注意：**\n\
+     • `-n 0` 表示无限循环（推荐始终设置一个上限避免卡死）\n\
+     • completion-promise 是精确匹配（会做空白归一化），不要用多个不同承诺值\n"
+}
+
+fn ralph_state_file_path(cwd: &Path) -> PathBuf {
+    cwd.join(".codex").join("ralph-loop.local.md")
+}
+
+fn save_ralph_state_file(cwd: &Path, state: &RalphLoopState) -> std::io::Result<()> {
+    let state_dir = cwd.join(".codex");
+    std::fs::create_dir_all(&state_dir)?;
+    std::fs::write(
+        ralph_state_file_path(cwd),
+        create_ralph_state_file_content(state),
+    )?;
+    Ok(())
+}
+
+fn cleanup_ralph_state_file(cwd: &Path) -> std::io::Result<()> {
+    let state_file = ralph_state_file_path(cwd);
+    if state_file.exists() {
+        std::fs::remove_file(state_file)?;
+    }
+    Ok(())
+}
+
+fn create_ralph_state_file_content(state: &RalphLoopState) -> String {
+    format!(
+        r#"---
+active: true
+iteration: {iteration}
+max_iterations: {max_iterations}
+completion_promise: {completion_promise}
+started_at: {started_at}
+---
+
+{original_prompt}
+"#,
+        iteration = state.iteration,
+        max_iterations = state.max_iterations,
+        completion_promise = state.completion_promise.as_str(),
+        started_at = state.started_at.as_str(),
+        original_prompt = state.original_prompt.as_str(),
+    )
+}
+
+fn truncate_string(s: &str, max_len: usize) -> String {
+    if s.chars().count() <= max_len {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_len).collect();
+        format!("{truncated}...")
+    }
+}
+
+fn check_completion_promise(output: &str, promise: &str) -> bool {
+    extract_promise_text(output).is_some_and(|found| found == promise)
+}
+
+fn extract_promise_text(output: &str) -> Option<String> {
+    let start = output.find("<promise>")?;
+    let rest = &output[start + "<promise>".len()..];
+    let end = rest.find("</promise>")?;
+    Some(normalize_promise_text(&rest[..end]))
+}
+
+fn normalize_promise_text(text: &str) -> String {
+    let mut normalized = String::new();
+    let mut last_was_space = false;
+
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !last_was_space && !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            last_was_space = true;
+        } else {
+            normalized.push(ch);
+            last_was_space = false;
+        }
+    }
+
+    normalized.trim().to_string()
+}
+
+fn calculate_duration_seconds(started_at: &str) -> f64 {
+    chrono::DateTime::parse_from_rfc3339(started_at)
+        .map(|start| {
+            let duration = chrono::Utc::now().signed_duration_since(start);
+            duration.num_milliseconds() as f64 / 1000.0
+        })
+        .unwrap_or(0.0)
 }
 
 #[cfg(test)]

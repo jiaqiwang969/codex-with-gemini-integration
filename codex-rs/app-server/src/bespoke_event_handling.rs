@@ -3,6 +3,8 @@ use crate::codex_message_processor::PendingInterrupts;
 use crate::codex_message_processor::TurnSummary;
 use crate::codex_message_processor::TurnSummaryStore;
 use crate::outgoing_message::OutgoingMessageSender;
+use crate::ralph_loop_handler::send_ralph_complete_notification;
+use crate::ralph_loop_handler::send_ralph_status_notification;
 use codex_app_server_protocol::AccountRateLimitsUpdatedNotification;
 use codex_app_server_protocol::AgentMessageDeltaNotification;
 use codex_app_server_protocol::ApplyPatchApprovalParams;
@@ -69,6 +71,7 @@ use codex_core::review_prompts;
 use codex_protocol::ConversationId;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::ReviewOutputEvent;
+use codex_protocol::user_input::UserInput;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::path::PathBuf;
@@ -92,7 +95,164 @@ pub(crate) async fn apply_bespoke_event_handling(
         msg,
     } = event;
     match msg {
-        EventMsg::TaskComplete(_ev) => {
+        EventMsg::TaskComplete(task_complete) => {
+            // ============ Ralph Loop 拦截点（类似 Claude Code 的 Stop Hook）============
+
+            // 检查是否有活跃的 Ralph Loop
+            let ralph_state_opt = {
+                let store = turn_summary_store.lock().await;
+                store
+                    .get(&conversation_id)
+                    .and_then(|s| s.ralph_loop_state.clone())
+            };
+
+            if let Some(mut ralph_state) = ralph_state_opt.filter(|state| state.enabled) {
+                // 获取最后的 agent 输出（优先使用 TaskComplete 携带的数据；fallback 到 rollout 文件）。
+                let last_output = match task_complete.last_agent_message {
+                    Some(text) => text,
+                    None => crate::ralph_loop_utils::get_last_agent_output(&conversation).await,
+                };
+
+                // 检查完成条件（使用 <promise> 标签检测）
+                let completion_detected = crate::ralph_loop_utils::check_completion_promise(
+                    &last_output,
+                    &ralph_state.completion_promise,
+                );
+
+                // 检查是否应该继续（max_iterations=0 表示无限循环）
+                let max_iterations = ralph_state.max_iterations;
+                let max_reached = max_iterations > 0 && ralph_state.iteration >= max_iterations;
+                let should_continue = !completion_detected && !max_reached;
+
+                if should_continue {
+                    // 未完成 - 继续循环（类似 Stop Hook 返回 "block"）
+                    let next_iteration = ralph_state.iteration.saturating_add(1);
+                    let max_iterations_label = if max_iterations == 0 {
+                        "unlimited".to_string()
+                    } else {
+                        max_iterations.to_string()
+                    };
+                    tracing::info!(
+                        "🔄 Ralph Loop continuing: iteration {next_iteration}/{max_iterations_label}",
+                    );
+
+                    // 检查是否有错误
+                    let had_errors = {
+                        let store = turn_summary_store.lock().await;
+                        store
+                            .get(&conversation_id)
+                            .and_then(|s| s.last_error.as_ref())
+                            .is_some()
+                    };
+
+                    // 更新迭代计数（记录本轮输出并进入下一轮）
+                    ralph_state.next_iteration(
+                        crate::ralph_loop_utils::truncate_string(&last_output, 200),
+                        had_errors,
+                    );
+
+                    // 保存更新后的状态
+                    {
+                        let mut store = turn_summary_store.lock().await;
+                        if let Some(summary) = store.get_mut(&conversation_id) {
+                            summary.ralph_loop_state = Some(ralph_state.clone());
+                        }
+                    }
+
+                    // 保存状态到文件（类似 .claude/ralph-loop.local.md）
+                    if let Err(e) =
+                        crate::ralph_loop_utils::save_ralph_state_file(&ralph_state).await
+                    {
+                        tracing::warn!("Failed to save Ralph state file: {e}");
+                    }
+
+                    let iteration = ralph_state.iteration;
+                    let completion_promise = &ralph_state.completion_promise;
+
+                    let status_event = codex_protocol::protocol::RalphLoopStatusEvent {
+                        iteration,
+                        max_iterations,
+                        message: if max_iterations == 0 {
+                            format!(
+                                "🔄 Ralph iteration {iteration} | unlimited | To stop: output <promise>{completion_promise}</promise> (ONLY when TRUE)"
+                            )
+                        } else {
+                            format!(
+                                "🔄 Ralph iteration {iteration}/{max_iterations} | To stop: output <promise>{completion_promise}</promise> (ONLY when TRUE)"
+                            )
+                        },
+                    };
+                    send_ralph_status_notification(&outgoing, conversation_id, status_event).await;
+
+                    // 结束本轮 turn（不要清除 ralph_loop_state；见 handle_turn_complete 的实现）
+                    handle_turn_complete(
+                        conversation_id,
+                        event_turn_id.clone(),
+                        &outgoing,
+                        &turn_summary_store,
+                    )
+                    .await;
+
+                    // 重新提交到 conversation（与官方 Ralph 插件一致：SAME PROMPT 原样回灌）
+                    let op = Op::UserInput {
+                        items: vec![UserInput::Text {
+                            text: ralph_state.original_prompt.clone(),
+                        }],
+                    };
+
+                    if let Err(e) = conversation.submit(op).await {
+                        tracing::error!("Failed to resubmit Ralph Loop prompt: {e}");
+                    }
+
+                    return;
+                } else {
+                    // 已完成 - 允许正常退出（类似 Stop Hook 返回 0）
+                    let reason = if completion_detected {
+                        let completion_promise = &ralph_state.completion_promise;
+                        tracing::info!(
+                            "✅ Ralph Loop completed: Detected <promise>{completion_promise}</promise>",
+                        );
+                        codex_protocol::protocol::RalphCompletionReason::PromiseDetected
+                    } else {
+                        tracing::info!(
+                            "🛑 Ralph Loop completed: Max iterations ({max_iterations}) reached",
+                        );
+                        codex_protocol::protocol::RalphCompletionReason::MaxIterations
+                    };
+
+                    // 计算持续时间
+                    let duration =
+                        crate::ralph_loop_utils::calculate_duration(&ralph_state.started_at);
+
+                    let complete_event = codex_protocol::protocol::RalphLoopCompleteEvent {
+                        total_iterations: ralph_state.iteration,
+                        completion_reason: reason,
+                        duration_seconds: duration,
+                    };
+                    send_ralph_complete_notification(&outgoing, conversation_id, complete_event)
+                        .await;
+
+                    let iterations = ralph_state.iteration;
+                    tracing::info!(
+                        "📊 Ralph Loop stats: {iterations} iterations, {duration:.2}s duration",
+                    );
+
+                    // 清理状态文件
+                    if let Err(e) = crate::ralph_loop_utils::cleanup_ralph_state_file().await {
+                        tracing::warn!("Failed to cleanup Ralph state file: {e}");
+                    }
+
+                    // 清除 Ralph Loop 状态
+                    {
+                        let mut store = turn_summary_store.lock().await;
+                        if let Some(summary) = store.get_mut(&conversation_id) {
+                            summary.ralph_loop_state = None;
+                        }
+                    }
+                }
+            }
+
+            // 正常的 TaskComplete 处理
             handle_turn_complete(
                 conversation_id,
                 event_turn_id,
@@ -862,12 +1022,31 @@ async fn maybe_emit_raw_response_item_completed(
         .await;
 }
 
-async fn find_and_remove_turn_summary(
+async fn take_turn_summary_for_completion(
     conversation_id: ConversationId,
     turn_summary_store: &TurnSummaryStore,
 ) -> TurnSummary {
     let mut map = turn_summary_store.lock().await;
-    map.remove(&conversation_id).unwrap_or_default()
+    let Some(summary) = map.get_mut(&conversation_id) else {
+        return TurnSummary::default();
+    };
+
+    let turn_summary = TurnSummary {
+        file_change_started: std::mem::take(&mut summary.file_change_started),
+        last_error: summary.last_error.take(),
+        ralph_loop_state: summary.ralph_loop_state.clone(),
+        last_user_message: summary.last_user_message.clone(),
+    };
+
+    let should_remove = summary.ralph_loop_state.is_none()
+        && summary.last_user_message.is_none()
+        && summary.file_change_started.is_empty()
+        && summary.last_error.is_none();
+    if should_remove {
+        map.remove(&conversation_id);
+    }
+
+    turn_summary
 }
 
 async fn handle_turn_complete(
@@ -876,7 +1055,7 @@ async fn handle_turn_complete(
     outgoing: &OutgoingMessageSender,
     turn_summary_store: &TurnSummaryStore,
 ) {
-    let turn_summary = find_and_remove_turn_summary(conversation_id, turn_summary_store).await;
+    let turn_summary = take_turn_summary_for_completion(conversation_id, turn_summary_store).await;
 
     let (status, error) = match turn_summary.last_error {
         Some(error) => (TurnStatus::Failed, Some(error)),
@@ -892,7 +1071,7 @@ async fn handle_turn_interrupted(
     outgoing: &OutgoingMessageSender,
     turn_summary_store: &TurnSummaryStore,
 ) {
-    find_and_remove_turn_summary(conversation_id, turn_summary_store).await;
+    take_turn_summary_for_completion(conversation_id, turn_summary_store).await;
 
     emit_turn_completed_with_status(
         conversation_id,
@@ -1345,7 +1524,8 @@ mod tests {
         )
         .await;
 
-        let turn_summary = find_and_remove_turn_summary(conversation_id, &turn_summary_store).await;
+        let turn_summary =
+            take_turn_summary_for_completion(conversation_id, &turn_summary_store).await;
         assert_eq!(
             turn_summary.last_error,
             Some(TurnError {

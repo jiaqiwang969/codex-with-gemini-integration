@@ -118,6 +118,9 @@ pub(crate) struct ChatComposer {
     context_window_used_tokens: Option<i64>,
     delegate_label: Option<String>,
     skills: Option<Vec<SkillMetadata>>,
+    transcript_scrolled: bool,
+    transcript_selection_active: bool,
+    transcript_scroll_position: Option<(usize, usize)>,
 }
 
 /// Popup state – at most one can be visible at any time.
@@ -164,6 +167,9 @@ impl ChatComposer {
             context_window_used_tokens: None,
             delegate_label: None,
             skills: None,
+            transcript_scrolled: false,
+            transcript_selection_active: false,
+            transcript_scroll_position: None,
         };
         // Apply configuration via the setter to keep side-effects centralized.
         this.set_disable_paste_burst(disable_paste_burst);
@@ -491,6 +497,17 @@ impl ChatComposer {
                                 cursor_target = Some(self.textarea.text().len());
                             }
                         }
+                        CommandItem::Passthrough(cmd) => {
+                            let name = cmd.name;
+                            let starts_with_cmd =
+                                first_line.trim_start().starts_with(&format!("/{name}"));
+                            if !starts_with_cmd {
+                                self.textarea.set_text(&format!("/{name} "));
+                            }
+                            if !self.textarea.text().is_empty() {
+                                cursor_target = Some(self.textarea.text().len());
+                            }
+                        }
                         CommandItem::UserPrompt(idx) => {
                             if let Some(prompt) = popup.prompt(idx) {
                                 match prompt_selection_action(
@@ -538,6 +555,17 @@ impl ChatComposer {
                         CommandItem::Builtin(cmd) => {
                             self.textarea.set_text("");
                             return (InputResult::Command(cmd), true);
+                        }
+                        CommandItem::Passthrough(cmd) => {
+                            let name = cmd.name;
+                            let starts_with_cmd =
+                                first_line.trim_start().starts_with(&format!("/{name}"));
+                            if !starts_with_cmd {
+                                self.textarea.set_text(&format!("/{name} "));
+                                self.textarea.set_cursor(self.textarea.text().len());
+                            }
+                            self.active_popup = ActivePopup::None;
+                            return (InputResult::None, true);
                         }
                         CommandItem::UserPrompt(idx) => {
                             if let Some(prompt) = popup.prompt(idx) {
@@ -1427,7 +1455,11 @@ impl ChatComposer {
             use_shift_enter_hint: self.use_shift_enter_hint,
             is_task_running: self.is_task_running,
             context_window_percent: self.context_window_percent,
+            context_window_used_tokens: self.context_window_used_tokens,
             delegate_label: self.delegate_label.clone(),
+            transcript_scrolled: self.transcript_scrolled,
+            transcript_selection_active: self.transcript_selection_active,
+            transcript_scroll_position: self.transcript_scroll_position,
         }
     }
 
@@ -1566,6 +1598,18 @@ impl ChatComposer {
 
         self.context_window_percent = percent;
         self.context_window_used_tokens = used_tokens;
+    }
+
+    /// Update the footer's view of transcript scroll state for the inline viewport.
+    pub(crate) fn set_transcript_ui_state(
+        &mut self,
+        scrolled: bool,
+        selection_active: bool,
+        scroll_position: Option<(usize, usize)>,
+    ) {
+        self.transcript_scrolled = scrolled;
+        self.transcript_selection_active = selection_active;
+        self.transcript_scroll_position = scroll_position;
     }
 
     pub(crate) fn set_delegate_label(&mut self, label: Option<String>) -> bool {
@@ -2404,6 +2448,9 @@ mod tests {
             ActivePopup::Command(popup) => match popup.selected_item() {
                 Some(CommandItem::Builtin(cmd)) => {
                     assert_eq!(cmd.command(), "model")
+                }
+                Some(CommandItem::Passthrough(_)) => {
+                    panic!("unexpected passthrough command selected for '/mo'")
                 }
                 Some(CommandItem::UserPrompt(_)) => {
                     panic!("unexpected prompt selected for '/mo'")

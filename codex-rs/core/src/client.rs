@@ -114,8 +114,9 @@ fn is_meaningful_thought_text(text: &str) -> bool {
 
     // If text is very long (>100 chars) and consists mostly of the same character,
     // it's likely garbage data from image processing
-    if trimmed.len() > 100 {
-        let first_char = trimmed.chars().next().unwrap();
+    if trimmed.len() > 100
+        && let Some(first_char) = trimmed.chars().next()
+    {
         let same_char_count = trimmed.chars().filter(|&c| c == first_char).count();
         let ratio = same_char_count as f64 / trimmed.len() as f64;
         if ratio > 0.9 {
@@ -397,7 +398,11 @@ impl ModelClient {
 
         let tools = build_gemini_tools(&prompt.tools);
         let tool_config = tools.as_ref().map(|_| GeminiToolConfig {
-            function_calling_config: build_gemini_tool_config(&prompt.tools, &formatted_input, api_model),
+            function_calling_config: build_gemini_tool_config(
+                &prompt.tools,
+                &formatted_input,
+                api_model,
+            ),
         });
 
         // Ensure the active loop has thought signatures on function calls so
@@ -430,7 +435,10 @@ impl ModelClient {
             // For image-capable models, enable both TEXT and IMAGE response modalities
             // and configure the output image size based on the prompt settings.
             response_modalities: if api_model.contains("image") {
-                Some(vec![GeminiResponseModality::Text, GeminiResponseModality::Image])
+                Some(vec![
+                    GeminiResponseModality::Text,
+                    GeminiResponseModality::Image,
+                ])
             } else {
                 None
             },
@@ -635,14 +643,7 @@ instead (for example: `codex -p codex`), or execute the command manually in your
             let thinking_level = match reasoning_effort {
                 Some(ReasoningEffortConfig::XHigh) => "high",
                 Some(ReasoningEffortConfig::High) => "high",
-                Some(ReasoningEffortConfig::Medium) => {
-                    // Flash supports "medium", Pro uses "medium" too
-                    if api_model.contains("flash") {
-                        "medium"
-                    } else {
-                        "medium"
-                    }
-                }
+                Some(ReasoningEffortConfig::Medium) => "medium",
                 Some(ReasoningEffortConfig::Low) => {
                     // Flash supports "minimal" for lowest, Pro uses "low"
                     if api_model.contains("flash") {
@@ -1029,7 +1030,7 @@ async fn process_gemini_sse<S>(
                             if !reasoning_item_sent {
                                 // Emit a reasoning item added notification
                                 let item = ResponseItem::Reasoning {
-                                    id: format!("gemini-thought-{}", last_response_id),
+                                    id: format!("gemini-thought-{last_response_id}"),
                                     summary: vec![],
                                     content: None,
                                     encrypted_content: None,
@@ -1322,24 +1323,18 @@ fn build_gemini_contents(
                 let args: serde_json::Value = serde_json::from_str(arguments)
                     .unwrap_or(serde_json::Value::Object(Default::default()));
 
-                // Check if the last content is a "model" role with function calls
-                // If so, append to it (parallel function calls); otherwise create new
-                let should_merge = contents
-                    .last()
-                    .map(|c| {
-                        c.role.as_deref() == Some("model")
-                            && c.parts.iter().all(|p| p.function_call.is_some())
-                    })
-                    .unwrap_or(false);
-
-                if should_merge {
+                // Check if the last content is a "model" role with function calls.
+                // If so, append to it (parallel function calls); otherwise create new.
+                if let Some(last) = contents.last_mut()
+                    && last.role.as_deref() == Some("model")
+                    && last.parts.iter().all(|p| p.function_call.is_some())
+                {
                     // Parallel function call - append to existing model content
                     // Per Gemini 3 spec: only the first functionCall has thoughtSignature
                     debug!(
                         "Gemini: merging parallel function call '{}' into existing model content (no thoughtSignature)",
                         name
                     );
-                    let last = contents.last_mut().unwrap();
                     last.parts.push(GeminiPartRequest {
                         text: None,
                         inline_data: None,
@@ -1401,17 +1396,6 @@ fn build_gemini_contents(
                     None
                 };
 
-                // Check if the last content is a "user" role with function responses (parallel responses)
-                let should_merge = contents
-                    .last()
-                    .map(|c| {
-                        c.role.as_deref() == Some("user")
-                            && c.parts
-                                .iter()
-                                .all(|p| p.function_response.is_some() || p.inline_data.is_some())
-                    })
-                    .unwrap_or(false);
-
                 // Per Gemini 3 spec: functionResponse parts should NOT have thoughtSignature
                 let response_part = GeminiPartRequest {
                     text: None,
@@ -1428,9 +1412,15 @@ fn build_gemini_contents(
                     compat_thought_signature: None,
                 };
 
-                if should_merge {
+                // Check if the last content is a "user" role with function responses (parallel responses).
+                if let Some(last) = contents.last_mut()
+                    && last.role.as_deref() == Some("user")
+                    && last
+                        .parts
+                        .iter()
+                        .all(|p| p.function_response.is_some() || p.inline_data.is_some())
+                {
                     // Parallel function response - append to existing user content
-                    let last = contents.last_mut().unwrap();
                     last.parts.push(response_part);
                     if !supports_multimodal {
                         last.parts.append(&mut inline_parts);
@@ -2385,7 +2375,9 @@ mod tests {
         assert!(is_meaningful_thought_text("12345"));
 
         // Mixed content should pass
-        assert!(is_meaningful_thought_text("The image shows 3 LEGO blocks arranged in a cross pattern."));
+        assert!(is_meaningful_thought_text(
+            "The image shows 3 LEGO blocks arranged in a cross pattern."
+        ));
     }
 
     #[test]
@@ -2625,11 +2617,7 @@ mod tests {
         // First function call has thoughtSignature
         assert!(contents[1].parts[0].function_call.is_some());
         assert_eq!(
-            contents[1].parts[0]
-                .function_call
-                .as_ref()
-                .unwrap()
-                .name,
+            contents[1].parts[0].function_call.as_ref().unwrap().name,
             "shell_command"
         );
         assert_eq!(
@@ -2640,11 +2628,7 @@ mod tests {
         // Second function call should NOT have thoughtSignature (per Gemini 3 spec)
         assert!(contents[1].parts[1].function_call.is_some());
         assert_eq!(
-            contents[1].parts[1]
-                .function_call
-                .as_ref()
-                .unwrap()
-                .name,
+            contents[1].parts[1].function_call.as_ref().unwrap().name,
             "read_file"
         );
         assert!(
@@ -2882,7 +2866,8 @@ mod tests {
             },
         ];
 
-        let config = build_gemini_tool_config_with_override(&tools, &input, Some(true), "gemini-2.5-pro");
+        let config =
+            build_gemini_tool_config_with_override(&tools, &input, Some(true), "gemini-2.5-pro");
 
         assert_eq!(config.mode, GeminiFunctionCallingMode::Auto);
         assert_eq!(config.allowed_function_names, None);
@@ -2901,7 +2886,12 @@ mod tests {
         }];
 
         // Test with Gemini 3 model - should have stream_function_call_arguments enabled
-        let config = build_gemini_tool_config_with_override(&tools, &input, Some(true), "gemini-3-pro-preview");
+        let config = build_gemini_tool_config_with_override(
+            &tools,
+            &input,
+            Some(true),
+            "gemini-3-pro-preview",
+        );
         assert_eq!(config.mode, GeminiFunctionCallingMode::Any);
         assert_eq!(
             config.allowed_function_names,
@@ -2910,7 +2900,8 @@ mod tests {
         assert_eq!(config.stream_function_call_arguments, Some(true));
 
         // Test with Gemini 2.5 model - should not have stream_function_call_arguments
-        let config = build_gemini_tool_config_with_override(&tools, &input, Some(false), "gemini-2.5-pro");
+        let config =
+            build_gemini_tool_config_with_override(&tools, &input, Some(false), "gemini-2.5-pro");
         assert_eq!(config.mode, GeminiFunctionCallingMode::Auto);
         assert_eq!(config.allowed_function_names, None);
         assert_eq!(config.stream_function_call_arguments, None);

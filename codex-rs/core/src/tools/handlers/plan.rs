@@ -228,20 +228,20 @@ fn try_parse_combined_args(arg: &str) -> Option<String> {
     // Try to find --explanation
     if let Some(exp_start) = arg.find("--explanation") {
         let after_exp = &arg[exp_start + "--explanation".len()..];
-        let after_exp = after_exp.trim_start_matches(|c| c == ' ' || c == '=');
+        let after_exp = after_exp.trim_start_matches([' ', '=']);
 
         // Find the value (quoted string)
-        if after_exp.starts_with('"') {
-            if let Some(end) = after_exp[1..].find('"') {
-                explanation = Some(after_exp[1..=end].to_string());
-            }
+        if after_exp.starts_with('"')
+            && let Some(end) = after_exp[1..].find('"')
+        {
+            explanation = Some(after_exp[1..=end].to_string());
         }
     }
 
     // Try to find --plan
     if let Some(plan_start) = arg.find("--plan") {
         let after_plan = &arg[plan_start + "--plan".len()..];
-        let after_plan = after_plan.trim_start_matches(|c| c == ' ' || c == '=');
+        let after_plan = after_plan.trim_start_matches([' ', '=']);
 
         // Find the JSON array (starts with '[')
         if let Some(bracket_start) = after_plan.find('[') {

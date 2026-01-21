@@ -1,7 +1,10 @@
 //! Process PDF tool - convert to images and remove watermarks
 
-use anyhow::{Context, Result};
-use mcp_types::{CallToolResult, ContentBlock, TextContent};
+use anyhow::Context;
+use anyhow::Result;
+use mcp_types::CallToolResult;
+use mcp_types::ContentBlock;
+use mcp_types::TextContent;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -45,7 +48,7 @@ pub async fn handle_process_pdf(args: serde_json::Value) -> Result<CallToolResul
         return Ok(CallToolResult {
             content: vec![ContentBlock::TextContent(TextContent {
                 r#type: "text".to_string(),
-                text: format!("Error creating output directory: {}", e),
+                text: format!("Error creating output directory: {e}"),
                 annotations: None,
             })],
             is_error: Some(true),
@@ -72,7 +75,7 @@ pub async fn handle_process_pdf(args: serde_json::Value) -> Result<CallToolResul
         return Ok(CallToolResult {
             content: vec![ContentBlock::TextContent(TextContent {
                 r#type: "text".to_string(),
-                text: format!("Error running process_pdf_to_images.py: {}", stderr),
+                text: format!("Error running process_pdf_to_images.py: {stderr}"),
                 annotations: None,
             })],
             is_error: Some(true),
@@ -86,7 +89,7 @@ pub async fn handle_process_pdf(args: serde_json::Value) -> Result<CallToolResul
     let image_count = std::fs::read_dir(&output_dir)
         .map(|entries| {
             entries
-                .filter_map(|e| e.ok())
+                .filter_map(std::result::Result::ok)
                 .filter(|e| {
                     e.path()
                         .extension()
@@ -122,18 +125,18 @@ fn get_scripts_dir() -> Result<PathBuf> {
         }
     }
 
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(parent) = exe_path.parent() {
-            let possible_paths = vec![
-                parent.join("../../../watermark-remover-mcp-server/scripts"),
-                parent.join("../../watermark-remover-mcp-server/scripts"),
-                parent.join("scripts"),
-            ];
+    if let Ok(exe_path) = std::env::current_exe()
+        && let Some(parent) = exe_path.parent()
+    {
+        let possible_paths = vec![
+            parent.join("../../../watermark-remover-mcp-server/scripts"),
+            parent.join("../../watermark-remover-mcp-server/scripts"),
+            parent.join("scripts"),
+        ];
 
-            for path in possible_paths {
-                if path.exists() {
-                    return Ok(path.canonicalize()?);
-                }
+        for path in possible_paths {
+            if path.exists() {
+                return Ok(path.canonicalize()?);
             }
         }
     }

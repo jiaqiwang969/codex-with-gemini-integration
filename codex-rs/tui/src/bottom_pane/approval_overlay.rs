@@ -466,8 +466,8 @@ fn exec_options(
         },
     ];
 
-    if let Some(prefix) = proposed_execpolicy_amendment
-        .filter(|_| features.enabled(Feature::ExecPolicy))
+    if let Some(prefix) =
+        proposed_execpolicy_amendment.filter(|_| features.enabled(Feature::ExecPolicy))
     {
         let rendered_prefix = strip_bash_lc_and_escape(prefix.command());
         options.push(ApprovalOption {

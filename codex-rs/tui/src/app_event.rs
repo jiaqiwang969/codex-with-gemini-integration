@@ -29,6 +29,9 @@ pub(crate) enum AppEvent {
     /// Start a new session.
     NewSession,
 
+    /// Open the resume picker overlay.
+    OpenResumePicker,
+
     /// Resume an existing session from a saved rollout file.
     ResumeSession(PathBuf),
 

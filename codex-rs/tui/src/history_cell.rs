@@ -26,12 +26,12 @@ use base64::Engine;
 use codex_common::format_env_display::format_env_display;
 use codex_core::config::Config;
 use codex_core::config::types::McpServerTransportConfig;
-use codex_protocol::openai_models::ReasoningSummaryFormat;
 use codex_core::protocol::FileChange;
 use codex_core::protocol::McpAuthStatus;
 use codex_core::protocol::McpInvocation;
 use codex_core::protocol::SessionConfiguredEvent;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
+use codex_protocol::openai_models::ReasoningSummaryFormat;
 use codex_protocol::plan_tool::PlanItemArg;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
@@ -1027,9 +1027,9 @@ pub(crate) fn new_active_mcp_tool_call(
     McpToolCallCell::new(call_id, invocation, animations_enabled)
 }
 
-pub(crate) fn new_web_search_call(query: String) -> PlainHistoryCell {
-    let lines: Vec<Line<'static>> = vec![Line::from(vec![padded_emoji("🌐").into(), query.into()])];
-    PlainHistoryCell { lines }
+pub(crate) fn new_web_search_call(query: String) -> PrefixedWrappedHistoryCell {
+    let text: Text<'static> = Line::from(vec!["Searched".bold(), " ".into(), query.into()]).into();
+    PrefixedWrappedHistoryCell::new(text, "• ".dim(), "  ")
 }
 
 /// If the first content is an image, return a new cell with the image.
@@ -1722,8 +1722,8 @@ mod tests {
         assert_eq!(
             rendered,
             vec![
-                "✔ You approved codex to".to_string(),
-                "  run echo something".to_string(),
+                "✔ You approved codex".to_string(),
+                "  to run echo something".to_string(),
                 "  really long to ensure".to_string(),
                 "  wrapping happens this".to_string(),
                 "  time".to_string(),
@@ -2422,12 +2422,13 @@ mod tests {
         let rendered = render_lines(&lines).join("\n");
         insta::assert_snapshot!(rendered);
     }
-    #[test]
-    fn reasoning_summary_block() {
-        let reasoning_format = ReasoningSummaryFormat::Experimental;
+    #[tokio::test]
+    async fn reasoning_summary_block() {
+        let mut config = test_config().await;
+        config.model_reasoning_summary_format = Some(ReasoningSummaryFormat::Experimental);
         let cell = new_reasoning_summary_block(
             "**High level reasoning**\n\nDetailed reasoning goes here.".to_string(),
-            reasoning_format,
+            &config,
         );
 
         let rendered_display = render_lines(&cell.display_lines(80));
@@ -2437,13 +2438,11 @@ mod tests {
         assert_eq!(rendered_transcript, vec!["• Detailed reasoning goes here."]);
     }
 
-    #[test]
-    fn reasoning_summary_block_returns_reasoning_cell_when_feature_disabled() {
-        let reasoning_format = ReasoningSummaryFormat::Experimental;
-        let cell = new_reasoning_summary_block(
-            "Detailed reasoning goes here.".to_string(),
-            reasoning_format,
-        );
+    #[tokio::test]
+    async fn reasoning_summary_block_returns_reasoning_cell_when_feature_disabled() {
+        let config = test_config().await;
+        let cell =
+            new_reasoning_summary_block("Detailed reasoning goes here.".to_string(), &config);
 
         let rendered = render_transcript(cell.as_ref());
         assert_eq!(rendered, vec!["• Detailed reasoning goes here."]);
@@ -2464,31 +2463,33 @@ mod tests {
 
         let cell = new_reasoning_summary_block(
             "**High level reasoning**\n\nDetailed reasoning goes here.".to_string(),
-            model_family.reasoning_summary_format,
+            &config,
         );
 
         let rendered_display = render_lines(&cell.display_lines(80));
         assert_eq!(rendered_display, vec!["• Detailed reasoning goes here."]);
     }
 
-    #[test]
-    fn reasoning_summary_block_falls_back_when_header_is_missing() {
-        let reasoning_format = ReasoningSummaryFormat::Experimental;
+    #[tokio::test]
+    async fn reasoning_summary_block_falls_back_when_header_is_missing() {
+        let mut config = test_config().await;
+        config.model_reasoning_summary_format = Some(ReasoningSummaryFormat::Experimental);
         let cell = new_reasoning_summary_block(
             "**High level reasoning without closing".to_string(),
-            reasoning_format,
+            &config,
         );
 
         let rendered = render_transcript(cell.as_ref());
         assert_eq!(rendered, vec!["• **High level reasoning without closing"]);
     }
 
-    #[test]
-    fn reasoning_summary_block_falls_back_when_summary_is_missing() {
-        let reasoning_format = ReasoningSummaryFormat::Experimental;
+    #[tokio::test]
+    async fn reasoning_summary_block_falls_back_when_summary_is_missing() {
+        let mut config = test_config().await;
+        config.model_reasoning_summary_format = Some(ReasoningSummaryFormat::Experimental);
         let cell = new_reasoning_summary_block(
             "**High level reasoning without closing**".to_string(),
-            reasoning_format.clone(),
+            &config,
         );
 
         let rendered = render_transcript(cell.as_ref());
@@ -2496,19 +2497,20 @@ mod tests {
 
         let cell = new_reasoning_summary_block(
             "**High level reasoning without closing**\n\n  ".to_string(),
-            reasoning_format,
+            &config,
         );
 
         let rendered = render_transcript(cell.as_ref());
         assert_eq!(rendered, vec!["• High level reasoning without closing"]);
     }
 
-    #[test]
-    fn reasoning_summary_block_splits_header_and_summary_when_present() {
-        let reasoning_format = ReasoningSummaryFormat::Experimental;
+    #[tokio::test]
+    async fn reasoning_summary_block_splits_header_and_summary_when_present() {
+        let mut config = test_config().await;
+        config.model_reasoning_summary_format = Some(ReasoningSummaryFormat::Experimental);
         let cell = new_reasoning_summary_block(
             "**High level plan**\n\nWe should fix the bug next.".to_string(),
-            reasoning_format,
+            &config,
         );
 
         let rendered_display = render_lines(&cell.display_lines(80));

@@ -404,6 +404,8 @@ async fn make_chatwidget_manual(
         show_welcome_banner: true,
         queued_user_messages: VecDeque::new(),
         queued_turn_pending_start: false,
+        last_user_message: None,
+        ralph_loop_state: None,
         suppress_session_configured_redraw: false,
         pending_notification: None,
         is_review_mode: false,
@@ -423,6 +425,8 @@ async fn make_chatwidget_manual(
         next_generated_image_index: 0,
         last_generated_image_path: None,
         ref_images: RefImageManager::new(),
+        batch_image_state: None,
+        pending_pdf_update: None,
     };
     (widget, rx, op_rx)
 }

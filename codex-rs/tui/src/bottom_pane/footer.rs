@@ -1,6 +1,7 @@
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
 use crate::render::line_utils::prefix_lines;
+use crate::status::format_tokens_compact;
 use crate::ui_consts::FOOTER_INDENT_COLS;
 use crossterm::event::KeyCode;
 use ratatui::buffer::Buffer;
@@ -18,7 +19,11 @@ pub(crate) struct FooterProps {
     pub(crate) use_shift_enter_hint: bool,
     pub(crate) is_task_running: bool,
     pub(crate) context_window_percent: Option<i64>,
+    pub(crate) context_window_used_tokens: Option<i64>,
     pub(crate) delegate_label: Option<String>,
+    pub(crate) transcript_scrolled: bool,
+    pub(crate) transcript_selection_active: bool,
+    pub(crate) transcript_scroll_position: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,7 +92,10 @@ fn footer_lines(props: &FooterProps) -> Vec<Line<'static>> {
                 spans.push(format!("In {label}").cyan());
                 spans.push(" · ".dim());
             }
-            let context_line = context_window_line(props.context_window_percent);
+            let context_line = context_window_line(
+                props.context_window_percent,
+                props.context_window_used_tokens,
+            );
             for span in context_line {
                 spans.push(span);
             }
@@ -96,6 +104,27 @@ fn footer_lines(props: &FooterProps) -> Vec<Line<'static>> {
                 key_hint::plain(KeyCode::Char('?')).into(),
                 " for shortcuts".dim(),
             ]);
+            if props.transcript_scrolled {
+                spans.push(" · ".dim());
+                spans.push(key_hint::plain(KeyCode::PageUp).into());
+                spans.push("/".into());
+                spans.push(key_hint::plain(KeyCode::PageDown).into());
+                spans.push(" scroll".dim());
+                spans.push(" · ".dim());
+                spans.push(key_hint::plain(KeyCode::Home).into());
+                spans.push("/".into());
+                spans.push(key_hint::plain(KeyCode::End).into());
+                spans.push(" jump".dim());
+                if let Some((current, total)) = props.transcript_scroll_position {
+                    spans.push(" · ".dim());
+                    spans.push(Span::from(format!("{current}/{total}")).dim());
+                }
+            }
+            if props.transcript_selection_active {
+                spans.push(" · ".dim());
+                spans.push(key_hint::ctrl(KeyCode::Char('y')).into());
+                spans.push(" copy selection".dim());
+            }
             vec![Line::from(spans)]
         }
         FooterMode::ShortcutOverlay => shortcut_overlay_lines(ShortcutsState {
@@ -109,7 +138,10 @@ fn footer_lines(props: &FooterProps) -> Vec<Line<'static>> {
                 spans.push(format!("In {label}").cyan());
                 spans.push(" · ".dim());
             }
-            let context_line = context_window_line(props.context_window_percent);
+            let context_line = context_window_line(
+                props.context_window_percent,
+                props.context_window_used_tokens,
+            );
             for span in context_line {
                 spans.push(span);
             }
@@ -241,9 +273,18 @@ fn build_columns(entries: Vec<Line<'static>>) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn context_window_line(percent: Option<i64>) -> Line<'static> {
-    let percent = percent.unwrap_or(100).clamp(0, 100);
-    Line::from(vec![Span::from(format!("{percent}% context left")).dim()])
+fn context_window_line(percent: Option<i64>, used_tokens: Option<i64>) -> Line<'static> {
+    if let Some(percent) = percent {
+        let percent = percent.clamp(0, 100);
+        return Line::from(vec![Span::from(format!("{percent}% context left")).dim()]);
+    }
+
+    if let Some(tokens) = used_tokens {
+        let used_fmt = format_tokens_compact(tokens);
+        return Line::from(vec![Span::from(format!("{used_fmt} used")).dim()]);
+    }
+
+    Line::from(vec![Span::from("100% context left").dim()])
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -420,7 +461,11 @@ mod tests {
                 use_shift_enter_hint: false,
                 is_task_running: false,
                 context_window_percent: None,
+                context_window_used_tokens: None,
                 delegate_label: None,
+                transcript_scrolled: false,
+                transcript_selection_active: false,
+                transcript_scroll_position: None,
             },
         );
 
@@ -432,7 +477,11 @@ mod tests {
                 use_shift_enter_hint: true,
                 is_task_running: false,
                 context_window_percent: None,
+                context_window_used_tokens: None,
                 delegate_label: None,
+                transcript_scrolled: false,
+                transcript_selection_active: false,
+                transcript_scroll_position: None,
             },
         );
 
@@ -444,7 +493,11 @@ mod tests {
                 use_shift_enter_hint: false,
                 is_task_running: false,
                 context_window_percent: None,
+                context_window_used_tokens: None,
                 delegate_label: None,
+                transcript_scrolled: false,
+                transcript_selection_active: false,
+                transcript_scroll_position: None,
             },
         );
 
@@ -456,7 +509,11 @@ mod tests {
                 use_shift_enter_hint: false,
                 is_task_running: true,
                 context_window_percent: None,
+                context_window_used_tokens: None,
                 delegate_label: None,
+                transcript_scrolled: false,
+                transcript_selection_active: false,
+                transcript_scroll_position: None,
             },
         );
 
@@ -468,7 +525,11 @@ mod tests {
                 use_shift_enter_hint: false,
                 is_task_running: false,
                 context_window_percent: None,
+                context_window_used_tokens: None,
                 delegate_label: None,
+                transcript_scrolled: false,
+                transcript_selection_active: false,
+                transcript_scroll_position: None,
             },
         );
 
@@ -480,7 +541,11 @@ mod tests {
                 use_shift_enter_hint: false,
                 is_task_running: false,
                 context_window_percent: None,
+                context_window_used_tokens: None,
                 delegate_label: None,
+                transcript_scrolled: false,
+                transcript_selection_active: false,
+                transcript_scroll_position: None,
             },
         );
 
@@ -492,7 +557,11 @@ mod tests {
                 use_shift_enter_hint: false,
                 is_task_running: true,
                 context_window_percent: Some(72),
+                context_window_used_tokens: None,
                 delegate_label: None,
+                transcript_scrolled: false,
+                transcript_selection_active: false,
+                transcript_scroll_position: None,
             },
         );
 
@@ -504,7 +573,11 @@ mod tests {
                 use_shift_enter_hint: false,
                 is_task_running: false,
                 context_window_percent: Some(85),
+                context_window_used_tokens: None,
                 delegate_label: Some("#critic".to_string()),
+                transcript_scrolled: false,
+                transcript_selection_active: false,
+                transcript_scroll_position: None,
             },
         );
     }

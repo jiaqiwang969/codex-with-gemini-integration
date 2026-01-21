@@ -221,10 +221,21 @@ fn gemini_3_flash_preview_gemini() -> ModelPreset {
         model: "gemini-3-flash-preview-gemini".to_string(),
         display_name: "gemini-3-flash-preview-gemini".to_string(),
         description: "Google Gemini 3 Flash preview.".to_string(),
-        default_reasoning_effort: ReasoningEffort::Low,
+        default_reasoning_effort: ReasoningEffort::High,
         supported_reasoning_efforts: vec![
-            effort(ReasoningEffort::Low, "Lower-cost Gemini thinking."),
-            effort(ReasoningEffort::High, "Higher-quality Gemini thinking."),
+            effort(
+                ReasoningEffort::Minimal,
+                "Fastest responses with minimal reasoning (Flash-exclusive)",
+            ),
+            effort(ReasoningEffort::Low, "Lower-cost Gemini thinking"),
+            effort(
+                ReasoningEffort::Medium,
+                "Balanced reasoning depth for general tasks",
+            ),
+            effort(
+                ReasoningEffort::High,
+                "Higher-quality Gemini thinking for complex problems",
+            ),
         ],
         is_default: false,
         upgrade: None,
@@ -240,10 +251,17 @@ fn gemini_3_pro_preview_codex() -> ModelPreset {
         display_name: "gemini-3-pro-preview-codex".to_string(),
         description: "Gemini 3 Pro preview with Germini-style system prompt and Codex tooling."
             .to_string(),
-        default_reasoning_effort: ReasoningEffort::Low,
+        default_reasoning_effort: ReasoningEffort::High,
         supported_reasoning_efforts: vec![
-            effort(ReasoningEffort::Low, "Lower-cost Gemini thinking."),
-            effort(ReasoningEffort::High, "Higher-quality Gemini thinking."),
+            effort(ReasoningEffort::Low, "Lower-cost Gemini thinking"),
+            effort(
+                ReasoningEffort::Medium,
+                "Balanced reasoning depth for general tasks",
+            ),
+            effort(
+                ReasoningEffort::High,
+                "Higher-quality Gemini thinking for complex problems",
+            ),
         ],
         is_default: false,
         upgrade: None,

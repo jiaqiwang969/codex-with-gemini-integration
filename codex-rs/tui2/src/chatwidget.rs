@@ -2141,7 +2141,10 @@ impl ChatWidget {
             | EventMsg::ItemCompleted(_)
             | EventMsg::AgentMessageContentDelta(_)
             | EventMsg::ReasoningContentDelta(_)
-            | EventMsg::ReasoningRawContentDelta(_) => {}
+            | EventMsg::ReasoningRawContentDelta(_)
+            | EventMsg::RalphLoopContinue(_)
+            | EventMsg::RalphLoopStatus(_)
+            | EventMsg::RalphLoopComplete(_) => {}
         }
     }
 
@@ -3439,16 +3442,10 @@ impl ChatWidget {
             Some(size) => {
                 if matches!(size.as_str(), "1K" | "2K" | "4K") {
                     self.submit_op(Op::SetImageQuality { size: size.clone() });
-                    self.add_info_message(
-                        format!("Image quality set to {size}"),
-                        None,
-                    );
+                    self.add_info_message(format!("Image quality set to {size}"), None);
                 } else {
                     self.add_info_message(
-                        format!(
-                            "Invalid image quality '{}'. Valid options: {valid_options}",
-                            size
-                        ),
+                        format!("Invalid image quality '{size}'. Valid options: {valid_options}"),
                         None,
                     );
                 }

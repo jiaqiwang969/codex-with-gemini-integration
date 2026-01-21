@@ -15,10 +15,22 @@ use codex_protocol::custom_prompts::CustomPrompt;
 use codex_protocol::custom_prompts::PROMPTS_CMD_PREFIX;
 use std::collections::HashSet;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PassthroughCommand {
+    pub(crate) name: &'static str,
+    pub(crate) description: &'static str,
+}
+
+// Commands implemented server-side (app-server) that we still want in the TUI popup.
+const PASSTHROUGH_COMMANDS: &[PassthroughCommand] = &[
+    // Intentionally empty for now.
+];
+
 /// A selectable item in the popup: either a built-in command or a user prompt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CommandItem {
     Builtin(SlashCommand),
+    Passthrough(PassthroughCommand),
     // Index into `prompts`
     UserPrompt(usize),
 }
@@ -26,6 +38,7 @@ pub(crate) enum CommandItem {
 pub(crate) struct CommandPopup {
     command_filter: String,
     builtins: Vec<(&'static str, SlashCommand)>,
+    passthrough: &'static [PassthroughCommand],
     prompts: Vec<CustomPrompt>,
     state: ScrollState,
 }
@@ -33,13 +46,19 @@ pub(crate) struct CommandPopup {
 impl CommandPopup {
     pub(crate) fn new(mut prompts: Vec<CustomPrompt>) -> Self {
         let builtins = built_in_slash_commands();
+        let passthrough = PASSTHROUGH_COMMANDS;
         // Exclude prompts that collide with builtin command names and sort by name.
-        let exclude: HashSet<String> = builtins.iter().map(|(n, _)| (*n).to_string()).collect();
+        let exclude: HashSet<String> = builtins
+            .iter()
+            .map(|(n, _)| (*n).to_string())
+            .chain(passthrough.iter().map(|cmd| cmd.name.to_string()))
+            .collect();
         prompts.retain(|p| !exclude.contains(&p.name));
         prompts.sort_by(|a, b| a.name.cmp(&b.name));
         Self {
             command_filter: String::new(),
             builtins,
+            passthrough,
             prompts,
             state: ScrollState::new(),
         }
@@ -50,6 +69,7 @@ impl CommandPopup {
             .builtins
             .iter()
             .map(|(n, _)| (*n).to_string())
+            .chain(self.passthrough.iter().map(|cmd| cmd.name.to_string()))
             .collect();
         prompts.retain(|p| !exclude.contains(&p.name));
         prompts.sort_by(|a, b| a.name.cmp(&b.name));
@@ -111,6 +131,10 @@ impl CommandPopup {
             for (_, cmd) in self.builtins.iter() {
                 out.push((CommandItem::Builtin(*cmd), None, 0));
             }
+            // Then passthrough server-side commands.
+            for cmd in self.passthrough {
+                out.push((CommandItem::Passthrough(*cmd), None, 0));
+            }
             // Then prompts, already sorted by name.
             for idx in 0..self.prompts.len() {
                 out.push((CommandItem::UserPrompt(idx), None, 0));
@@ -121,6 +145,11 @@ impl CommandPopup {
         for (_, cmd) in self.builtins.iter() {
             if let Some((indices, score)) = fuzzy_match(cmd.command(), filter) {
                 out.push((CommandItem::Builtin(*cmd), Some(indices), score));
+            }
+        }
+        for cmd in self.passthrough {
+            if let Some((indices, score)) = fuzzy_match(cmd.name, filter) {
+                out.push((CommandItem::Passthrough(*cmd), Some(indices), score));
             }
         }
         // Support both search styles:
@@ -137,10 +166,12 @@ impl CommandPopup {
             a.2.cmp(&b.2).then_with(|| {
                 let an = match a.0 {
                     CommandItem::Builtin(c) => c.command(),
+                    CommandItem::Passthrough(c) => c.name,
                     CommandItem::UserPrompt(i) => &self.prompts[i].name,
                 };
                 let bn = match b.0 {
                     CommandItem::Builtin(c) => c.command(),
+                    CommandItem::Passthrough(c) => c.name,
                     CommandItem::UserPrompt(i) => &self.prompts[i].name,
                 };
                 an.cmp(bn)
@@ -163,6 +194,10 @@ impl CommandPopup {
                 let (name, description) = match item {
                     CommandItem::Builtin(cmd) => {
                         (format!("/{}", cmd.command()), cmd.description().to_string())
+                    }
+                    CommandItem::Passthrough(cmd) => {
+                        let name = cmd.name;
+                        (format!("/{name}"), cmd.description.to_string())
                     }
                     CommandItem::UserPrompt(i) => {
                         let prompt = &self.prompts[i];
@@ -242,6 +277,7 @@ mod tests {
         let matches = popup.filtered_items();
         let has_init = matches.iter().any(|item| match item {
             CommandItem::Builtin(cmd) => cmd.command() == "init",
+            CommandItem::Passthrough(_) => false,
             CommandItem::UserPrompt(_) => false,
         });
         assert!(
@@ -260,6 +296,9 @@ mod tests {
         let selected = popup.selected_item();
         match selected {
             Some(CommandItem::Builtin(cmd)) => assert_eq!(cmd.command(), "init"),
+            Some(CommandItem::Passthrough(_)) => {
+                panic!("unexpected passthrough command selected for '/init'")
+            }
             Some(CommandItem::UserPrompt(_)) => panic!("unexpected prompt selected for '/init'"),
             None => panic!("expected a selected command for exact match"),
         }
@@ -272,6 +311,9 @@ mod tests {
         let matches = popup.filtered_items();
         match matches.first() {
             Some(CommandItem::Builtin(cmd)) => assert_eq!(cmd.command(), "model"),
+            Some(CommandItem::Passthrough(_)) => {
+                panic!("unexpected passthrough command ranked before '/model' for '/mo'")
+            }
             Some(CommandItem::UserPrompt(_)) => {
                 panic!("unexpected prompt ranked before '/model' for '/mo'")
             }

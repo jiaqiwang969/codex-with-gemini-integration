@@ -117,10 +117,6 @@ impl SessionState {
         self.image_size
     }
 
-    pub(crate) fn set_aspect_ratio(&mut self, ratio: Option<GeminiAspectRatio>) {
-        self.aspect_ratio = ratio;
-    }
-
     pub(crate) fn aspect_ratio(&self) -> Option<GeminiAspectRatio> {
         self.aspect_ratio
     }

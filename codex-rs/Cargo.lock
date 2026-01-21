@@ -1672,6 +1672,7 @@ name = "codex-protocol"
 version = "0.76.0-alpha.7"
 dependencies = [
  "anyhow",
+ "chrono",
  "codex-git",
  "codex-utils-absolute-path",
  "codex-utils-image",
@@ -1685,6 +1686,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
+ "shlex",
  "strum 0.27.2",
  "strum_macros 0.27.2",
  "sys-locale",

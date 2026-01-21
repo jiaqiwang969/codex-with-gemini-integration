@@ -5,22 +5,17 @@ expression: popup
   Select Model and Effort
   Access legacy models by running codex -m <model_name> or in your config.toml
 
-› 1. gpt-5.1-codex                          Optimized for codex.
-  2. gpt-5.1-codex-mini                     Optimized for codex. Cheaper,
-                                            faster, but less capable.
-  3. gpt-5.1                                Broad world knowledge with strong
-                                            general reasoning.
-  4. gemini-3-pro-preview                   Google Gemini 3 Pro preview.
-  5. gemini-3-pro-preview-codex             Gemini 3 Pro preview with Codex-
-                                            optimized behaviour for code and
-                                            tools.
-  6. gemini-3-pro-preview-thinking          Google Gemini 3 Pro preview with
-                                            thinking capability.
-  7. gemini-3-pro-preview-thinking-codex    Gemini 3 Pro preview with thinking
-                                            capability and Codex-optimized
-                                            behaviour.
-  8. gemini-3-pro-preview-thinking-germini  Gemini 3 Pro preview with thinking
-                                            capability and Germini-style
-                                            system prompt.
+› 1. gpt-5.2-codex                  Latest frontier agentic coding model.
+  2. gpt-5.1-codex-max              Codex-optimized flagship for deep and
+                                    fast reasoning.
+  3. gpt-5.1-codex-mini             Optimized for codex. Cheaper, faster, but
+                                    less capable.
+  4. gpt-5.2                        Latest frontier model with improvements
+                                    across knowledge, reasoning and coding
+  5. gemini-3-flash-preview-gemini  Google Gemini 3 Flash preview.
+  6. gemini-3-pro-preview-codex     Gemini 3 Pro preview with Germini-style
+                                    system prompt and Codex tooling.
+  7. gemini-3-pro-image-preview     Gemini 3 Pro image preview for text, image
+                                    understanding, and image generation.
 
   Press enter to select reasoning effort, or esc to dismiss.

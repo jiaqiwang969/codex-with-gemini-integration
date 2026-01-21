@@ -1,7 +1,10 @@
 //! PDF to Images tool - converts PDF pages to PNG images
 
-use anyhow::{Context, Result};
-use mcp_types::{CallToolResult, ContentBlock, TextContent};
+use anyhow::Context;
+use anyhow::Result;
+use mcp_types::CallToolResult;
+use mcp_types::ContentBlock;
+use mcp_types::TextContent;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -38,13 +41,19 @@ pub async fn handle_pdf_to_images(args: serde_json::Value) -> Result<CallToolRes
         PathBuf::from(dir)
     } else {
         let stem = pdf_path.file_stem().unwrap_or_default().to_string_lossy();
-        pdf_path.parent().unwrap_or(&pdf_path).join(format!("{}_pages", stem))
+        pdf_path
+            .parent()
+            .unwrap_or(&pdf_path)
+            .join(format!("{stem}_pages"))
     };
 
     // Create output directory
     tokio::fs::create_dir_all(&output_dir).await?;
 
-    info!("Converting PDF to images: {} -> {:?}", args.pdf_path, output_dir);
+    info!(
+        "Converting PDF to images: {} -> {:?}",
+        args.pdf_path, output_dir
+    );
 
     // Get the scripts directory (relative to the binary)
     let scripts_dir = get_scripts_dir()?;
@@ -67,7 +76,7 @@ pub async fn handle_pdf_to_images(args: serde_json::Value) -> Result<CallToolRes
         return Ok(CallToolResult {
             content: vec![ContentBlock::TextContent(TextContent {
                 r#type: "text".to_string(),
-                text: format!("Error running pdf_to_images.py: {}", stderr),
+                text: format!("Error running pdf_to_images.py: {stderr}"),
                 annotations: None,
             })],
             is_error: Some(true),

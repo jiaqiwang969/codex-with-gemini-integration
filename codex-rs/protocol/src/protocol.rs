@@ -688,6 +688,15 @@ pub enum EventMsg {
     AgentMessageContentDelta(AgentMessageContentDeltaEvent),
     ReasoningContentDelta(ReasoningContentDeltaEvent),
     ReasoningRawContentDelta(ReasoningRawContentDeltaEvent),
+
+    /// Ralph loop continuation - signals that the loop should continue
+    RalphLoopContinue(RalphLoopContinueEvent),
+
+    /// Ralph loop status update
+    RalphLoopStatus(RalphLoopStatusEvent),
+
+    /// Ralph loop completed
+    RalphLoopComplete(RalphLoopCompleteEvent),
 }
 
 /// Codex errors that we expose to clients.
@@ -1982,6 +1991,160 @@ mod tests {
         assert_eq!(expected, serde_json::to_value(&event)?);
         Ok(())
     }
+}
+
+// ============================================================================
+// Ralph Loop Event Structures
+// ============================================================================
+
+/// Event emitted when Ralph loop decides to continue
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RalphLoopContinueEvent {
+    pub iteration: u32,
+    pub max_iterations: u32,
+    pub reason: String,
+}
+
+/// Event emitted for Ralph loop progress updates
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RalphLoopStatusEvent {
+    pub iteration: u32,
+    pub max_iterations: u32,
+    pub message: String,
+}
+
+/// Event emitted when Ralph loop completes
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RalphLoopCompleteEvent {
+    pub total_iterations: u32,
+    pub completion_reason: RalphCompletionReason,
+    pub duration_seconds: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum RalphCompletionReason {
+    /// Completion promise detected in output
+    PromiseDetected,
+    /// Reached maximum iterations
+    MaxIterations,
+    /// User interrupted
+    UserInterrupt,
+    /// Fatal error occurred
+    FatalError,
+}
+
+/// Ralph loop state stored in conversation
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RalphLoopState {
+    /// Is Ralph loop currently active?
+    pub enabled: bool,
+
+    /// Current iteration number (1-indexed)
+    pub iteration: u32,
+
+    /// Maximum iterations allowed
+    pub max_iterations: u32,
+
+    /// String to detect in output for completion
+    pub completion_promise: String,
+
+    /// The original user prompt to repeat
+    pub original_prompt: String,
+
+    /// When the loop started (ISO 8601 timestamp)
+    pub started_at: String,
+
+    /// History of iteration results
+    pub iteration_history: Vec<IterationRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct IterationRecord {
+    pub iteration: u32,
+    pub timestamp: String,
+    pub had_errors: bool,
+    pub output_summary: String,
+}
+
+impl RalphLoopState {
+    pub fn new(prompt: String, max_iterations: u32, completion_promise: String) -> Self {
+        Self {
+            enabled: true,
+            iteration: 1,
+            max_iterations,
+            completion_promise,
+            original_prompt: prompt,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            iteration_history: Vec::new(),
+        }
+    }
+
+    /// Check if loop should continue based on output
+    pub fn should_continue(&self, agent_output: &str) -> bool {
+        // A max_iterations of 0 means "unlimited" (matches claude-code plugin behavior).
+        if self.max_iterations > 0 && self.iteration >= self.max_iterations {
+            return false;
+        }
+
+        // Check completion promise. We only match the contents of the first
+        // `<promise>...</promise>` tag (whitespace-normalized) against the
+        // configured promise string.
+        if extract_promise_text(agent_output).is_some_and(|found| found == self.completion_promise)
+        {
+            return false;
+        }
+
+        true
+    }
+
+    /// Advance to next iteration
+    pub fn next_iteration(&mut self, output_summary: String, had_errors: bool) {
+        self.iteration_history.push(IterationRecord {
+            iteration: self.iteration,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            had_errors,
+            output_summary,
+        });
+        self.iteration = self.iteration.saturating_add(1);
+    }
+}
+
+fn extract_promise_text(output: &str) -> Option<String> {
+    let start = output.find("<promise>")?;
+    let rest = &output[start + "<promise>".len()..];
+    let end = rest.find("</promise>")?;
+    let raw = &rest[..end];
+    Some(normalize_promise_text(raw))
+}
+
+fn normalize_promise_text(text: &str) -> String {
+    let mut normalized = String::new();
+    let mut last_was_space = false;
+
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !last_was_space && !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            last_was_space = true;
+        } else {
+            normalized.push(ch);
+            last_was_space = false;
+        }
+    }
+
+    normalized.trim().to_string()
+}
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+    use anyhow::Result;
 
     #[test]
     fn vec_u8_as_base64_serialization_and_deserialization() -> Result<()> {

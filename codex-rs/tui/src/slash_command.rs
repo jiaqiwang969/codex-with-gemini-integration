@@ -15,7 +15,10 @@ pub enum SlashCommand {
     Model,
     Approvals,
     Review,
+    RalphLoop,
+    CancelRalph,
     New,
+    Resume,
     Init,
     Tumix,
     TumixStop,
@@ -46,9 +49,12 @@ impl SlashCommand {
         match self {
             SlashCommand::Feedback => "send logs to maintainers",
             SlashCommand::New => "start a new chat during a conversation",
+            SlashCommand::Resume => "resume a saved chat",
             SlashCommand::Init => "create an AGENTS.md file with instructions for Codex",
             SlashCommand::Tumix => "run TUMIX multi-agent parallel execution (Round 1)",
             SlashCommand::TumixStop => "stop running TUMIX agents (optionally specify a session)",
+            SlashCommand::RalphLoop => "start a Ralph loop that repeats the same prompt until done",
+            SlashCommand::CancelRalph => "cancel the active Ralph loop",
             SlashCommand::Compact => "summarize conversation to prevent hitting the context limit",
             SlashCommand::Review => "review my current changes and find issues",
             SlashCommand::Undo => "ask Codex to undo a turn",
@@ -57,7 +63,9 @@ impl SlashCommand {
             SlashCommand::OpenImage => "open the most recently generated image",
             SlashCommand::RefImage => "set reference images for image models",
             SlashCommand::RefImageBatch => "batch process images in a folder with same prompt",
-            SlashCommand::PdfUpdate => "process PDF: remove watermark + batch image processing (requires watermark-remover MCP server)",
+            SlashCommand::PdfUpdate => {
+                "process PDF: remove watermark + batch image processing (requires watermark-remover MCP server)"
+            }
             SlashCommand::ImageQuality => "set output image quality (1K, 2K, 4K)",
             SlashCommand::ClearRef => "clear active reference images",
             SlashCommand::Mention => "mention a file",
@@ -78,15 +86,16 @@ impl SlashCommand {
     /// `InputResult::CommandWithArgs` so their handlers can parse it in a
     /// context-aware way.
     pub fn accepts_args(self) -> bool {
-        match self {
+        matches!(
+            self,
             SlashCommand::Tumix
-            | SlashCommand::TumixStop
-            | SlashCommand::RefImage
-            | SlashCommand::RefImageBatch
-            | SlashCommand::PdfUpdate
-            | SlashCommand::ImageQuality => true,
-            _ => false,
-        }
+                | SlashCommand::TumixStop
+                | SlashCommand::RalphLoop
+                | SlashCommand::RefImage
+                | SlashCommand::RefImageBatch
+                | SlashCommand::PdfUpdate
+                | SlashCommand::ImageQuality
+        )
     }
 
     /// Command string without the leading '/'. Provided for compatibility with
@@ -99,8 +108,10 @@ impl SlashCommand {
     pub fn available_during_task(self) -> bool {
         match self {
             SlashCommand::New
+            | SlashCommand::Resume
             | SlashCommand::Init
             | SlashCommand::Tumix
+            | SlashCommand::RalphLoop
             | SlashCommand::Compact
             | SlashCommand::Undo
             | SlashCommand::Model
@@ -119,6 +130,7 @@ impl SlashCommand {
             | SlashCommand::Status
             | SlashCommand::Mcp
             | SlashCommand::TumixStop
+            | SlashCommand::CancelRalph
             | SlashCommand::Feedback
             | SlashCommand::Quit
             | SlashCommand::Exit => true,

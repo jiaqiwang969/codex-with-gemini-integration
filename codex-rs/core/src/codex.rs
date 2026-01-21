@@ -2038,7 +2038,10 @@ mod handlers {
             "2K" => Some(GeminiImageSize::Size2K),
             "4K" => Some(GeminiImageSize::Size4K),
             _ => {
-                warn!("Invalid image quality '{}'. Valid options: 1K, 2K, 4K", size);
+                warn!(
+                    "Invalid image quality '{}'. Valid options: 1K, 2K, 4K",
+                    size
+                );
                 return;
             }
         };

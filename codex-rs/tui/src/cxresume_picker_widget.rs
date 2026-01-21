@@ -1508,10 +1508,14 @@ fn format_relative_time(mtime: u64) -> String {
 }
 
 /// Get sessions in current working directory with enhanced metadata
-pub fn get_cwd_sessions() -> Result<Vec<SessionInfo>, String> {
-    let cwd_raw = get_cwd()?;
-    let cwd = cwd_raw.canonicalize().unwrap_or(cwd_raw);
-    let sessions_dir = get_sessions_dir()?;
+pub(crate) fn get_cwd_sessions_for(
+    codex_home: &Path,
+    cwd_raw: &Path,
+) -> Result<Vec<SessionInfo>, String> {
+    let cwd = cwd_raw
+        .canonicalize()
+        .unwrap_or_else(|_| cwd_raw.to_path_buf());
+    let sessions_dir = codex_home.join("sessions");
     let mut sessions = Vec::new();
 
     fn find_sessions(
@@ -1575,6 +1579,17 @@ pub fn get_cwd_sessions() -> Result<Vec<SessionInfo>, String> {
     sessions.truncate(100);
 
     Ok(sessions)
+}
+
+pub fn get_cwd_sessions() -> Result<Vec<SessionInfo>, String> {
+    let cwd_raw = get_cwd()?;
+    let cwd = cwd_raw.canonicalize().unwrap_or(cwd_raw);
+    let codex_home = get_sessions_dir()?
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "Failed to get codex home".to_string())?;
+
+    get_cwd_sessions_for(&codex_home, &cwd)
 }
 
 fn should_include_session(session_cwd: &str, cwd: &Path) -> bool {

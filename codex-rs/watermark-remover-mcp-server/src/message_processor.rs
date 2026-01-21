@@ -221,10 +221,9 @@ impl MessageProcessor {
         match handle_tool_call(request).await {
             Ok(result) => match serde_json::to_value(result) {
                 Ok(val) => self.sender.send_response(id, val),
-                Err(e) => {
-                    self.sender
-                        .send_error(id, -32000, format!("Serialization error: {e}"))
-                }
+                Err(e) => self
+                    .sender
+                    .send_error(id, -32000, format!("Serialization error: {e}")),
             },
             Err(e) => {
                 let result = CallToolResult {
@@ -238,9 +237,10 @@ impl MessageProcessor {
                 };
                 match serde_json::to_value(result) {
                     Ok(val) => self.sender.send_response(id, val),
-                    Err(e) => self
-                        .sender
-                        .send_error(id, -32000, format!("Serialization error: {e}")),
+                    Err(e) => {
+                        self.sender
+                            .send_error(id, -32000, format!("Serialization error: {e}"))
+                    }
                 }
             }
         }

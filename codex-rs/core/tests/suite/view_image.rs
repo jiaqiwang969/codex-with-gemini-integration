@@ -207,7 +207,8 @@ async fn view_image_tool_attaches_local_image() -> anyhow::Result<()> {
     // Multimodal response returns array with InputText containing "Image file: {path} ({size} KB)"
     // The text comes from content_items array, not the content field
     assert!(
-        output_text.contains("Image file:") && output_text.contains(&abs_path.to_string_lossy().to_string()),
+        output_text.contains("Image file:")
+            && output_text.contains(&abs_path.to_string_lossy().to_string()),
         "expected output to contain 'Image file:' and path, got: {output_text}"
     );
 

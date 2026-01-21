@@ -49,7 +49,9 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         Tool {
             name: "remove_watermark".to_string(),
             title: None,
-            description: Some("去除图片右下角的水印（如NotebookLM水印）。支持单张图片或整个目录。".to_string()),
+            description: Some(
+                "去除图片右下角的水印（如NotebookLM水印）。支持单张图片或整个目录。".to_string(),
+            ),
             annotations: None,
             output_schema: None,
             input_schema: ToolInputSchema {

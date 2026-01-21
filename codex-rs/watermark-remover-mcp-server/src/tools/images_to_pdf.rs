@@ -1,7 +1,10 @@
 //! Images to PDF tool - merges images into a PDF
 
-use anyhow::{Context, Result};
-use mcp_types::{CallToolResult, ContentBlock, TextContent};
+use anyhow::Context;
+use anyhow::Result;
+use mcp_types::CallToolResult;
+use mcp_types::ContentBlock;
+use mcp_types::TextContent;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -57,7 +60,7 @@ pub async fn handle_images_to_pdf(args: serde_json::Value) -> Result<CallToolRes
         return Ok(CallToolResult {
             content: vec![ContentBlock::TextContent(TextContent {
                 r#type: "text".to_string(),
-                text: format!("Error running images_to_pdf.py: {}", stderr),
+                text: format!("Error running images_to_pdf.py: {stderr}"),
                 annotations: None,
             })],
             is_error: Some(true),
@@ -70,10 +73,7 @@ pub async fn handle_images_to_pdf(args: serde_json::Value) -> Result<CallToolRes
     Ok(CallToolResult {
         content: vec![ContentBlock::TextContent(TextContent {
             r#type: "text".to_string(),
-            text: format!(
-                "Successfully created PDF: {}\n{}",
-                args.output_path, stdout
-            ),
+            text: format!("Successfully created PDF: {}\n{}", args.output_path, stdout),
             annotations: None,
         })],
         is_error: Some(false),
@@ -82,18 +82,18 @@ pub async fn handle_images_to_pdf(args: serde_json::Value) -> Result<CallToolRes
 }
 
 fn get_scripts_dir() -> Result<PathBuf> {
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(parent) = exe_path.parent() {
-            let possible_paths = vec![
-                parent.join("../../../watermark-remover-mcp-server/scripts"),
-                parent.join("../../watermark-remover-mcp-server/scripts"),
-                parent.join("scripts"),
-            ];
+    if let Ok(exe_path) = std::env::current_exe()
+        && let Some(parent) = exe_path.parent()
+    {
+        let possible_paths = vec![
+            parent.join("../../../watermark-remover-mcp-server/scripts"),
+            parent.join("../../watermark-remover-mcp-server/scripts"),
+            parent.join("scripts"),
+        ];
 
-            for path in possible_paths {
-                if path.exists() {
-                    return Ok(path.canonicalize()?);
-                }
+        for path in possible_paths {
+            if path.exists() {
+                return Ok(path.canonicalize()?);
             }
         }
     }

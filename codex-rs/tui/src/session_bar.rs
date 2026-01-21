@@ -18,7 +18,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::cxresume_picker_widget::SessionInfo;
 use crate::cxresume_picker_widget::TumixState;
-use crate::cxresume_picker_widget::get_cwd_sessions;
+use crate::cxresume_picker_widget::get_cwd_sessions_for;
 use crate::cxresume_picker_widget::last_user_snippet;
 use crate::cxresume_picker_widget::load_tumix_status_index;
 use crate::key_hint; // Unify key-hint rendering
@@ -27,6 +27,8 @@ use crossterm::event::KeyCode;
 
 /// Bottom session bar (similar to tmux)
 pub struct SessionBar {
+    codex_home: PathBuf,
+    cwd: PathBuf,
     /// List of sessions in current working directory
     sessions: Vec<SessionInfo>,
     /// Currently selected session index
@@ -50,8 +52,10 @@ pub struct SessionBar {
 }
 
 impl SessionBar {
-    pub fn new(_cwd: PathBuf) -> Self {
+    pub fn new(cwd: PathBuf, codex_home: PathBuf) -> Self {
         let mut bar = Self {
+            codex_home,
+            cwd,
             sessions: Vec::new(),
             selected_index: 0,
             selected_on_new: false,
@@ -74,7 +78,7 @@ impl SessionBar {
         self.loading = true;
         self.error = None;
 
-        match get_cwd_sessions() {
+        match get_cwd_sessions_for(&self.codex_home, &self.cwd) {
             Ok(mut sessions) => {
                 // Add tumix status if available
                 let tumix_index = load_tumix_status_index();

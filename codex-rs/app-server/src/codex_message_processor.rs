@@ -183,6 +183,10 @@ pub(crate) type PendingInterrupts = Arc<Mutex<HashMap<ConversationId, PendingInt
 pub(crate) struct TurnSummary {
     pub(crate) file_change_started: HashSet<String>,
     pub(crate) last_error: Option<TurnError>,
+    /// Ralph loop state for this conversation
+    pub(crate) ralph_loop_state: Option<codex_protocol::protocol::RalphLoopState>,
+    /// Latest user message text (for Ralph Loop defaults)
+    pub(crate) last_user_message: Option<String>,
 }
 
 pub(crate) type TurnSummaryStore = Arc<Mutex<HashMap<ConversationId, TurnSummary>>>;
@@ -2564,6 +2568,40 @@ impl CodexMessageProcessor {
             return;
         };
 
+        if let Some(text) = single_text_item(&items) {
+            match crate::ralph_loop_handler::handle_slash_command(
+                text,
+                conversation_id,
+                &self.turn_summary_store,
+                &self.outgoing,
+            )
+            .await
+            {
+                Ok(true) => {
+                    self.outgoing
+                        .send_response(request_id, SendUserMessageResponse {})
+                        .await;
+                    return;
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    let error = JSONRPCErrorError {
+                        code: INTERNAL_ERROR_CODE,
+                        message: format!("failed to handle slash command: {err}"),
+                        data: None,
+                    };
+                    self.outgoing.send_error(request_id, error).await;
+                    return;
+                }
+            }
+        }
+
+        if let Some(message) = collect_text_items(&items) {
+            let mut store = self.turn_summary_store.lock().await;
+            let summary = store.entry(conversation_id).or_default();
+            summary.last_user_message = Some(message);
+        }
+
         let mapped_items: Vec<CoreInputItem> = items
             .into_iter()
             .map(|item| match item {
@@ -2611,6 +2649,40 @@ impl CodexMessageProcessor {
             self.outgoing.send_error(request_id, error).await;
             return;
         };
+
+        if let Some(text) = single_text_item(&items) {
+            match crate::ralph_loop_handler::handle_slash_command(
+                text,
+                conversation_id,
+                &self.turn_summary_store,
+                &self.outgoing,
+            )
+            .await
+            {
+                Ok(true) => {
+                    self.outgoing
+                        .send_response(request_id, SendUserTurnResponse {})
+                        .await;
+                    return;
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    let error = JSONRPCErrorError {
+                        code: INTERNAL_ERROR_CODE,
+                        message: format!("failed to handle slash command: {err}"),
+                        data: None,
+                    };
+                    self.outgoing.send_error(request_id, error).await;
+                    return;
+                }
+            }
+        }
+
+        if let Some(message) = collect_text_items(&items) {
+            let mut store = self.turn_summary_store.lock().await;
+            let summary = store.entry(conversation_id).or_default();
+            summary.last_user_message = Some(message);
+        }
 
         let mapped_items: Vec<CoreInputItem> = items
             .into_iter()
@@ -3408,6 +3480,30 @@ async fn read_summary_from_rollout(
         source: session_meta.source,
         git_info,
     })
+}
+
+fn single_text_item(items: &[WireInputItem]) -> Option<&str> {
+    if let [WireInputItem::Text { text }] = items {
+        Some(text.as_str())
+    } else {
+        None
+    }
+}
+
+fn collect_text_items(items: &[WireInputItem]) -> Option<String> {
+    let texts: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            WireInputItem::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    if texts.is_empty() {
+        None
+    } else {
+        Some(texts.join("\n"))
+    }
 }
 
 fn extract_conversation_summary(

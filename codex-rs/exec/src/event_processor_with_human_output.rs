@@ -603,6 +603,9 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             | EventMsg::AgentMessageContentDelta(_)
             | EventMsg::ReasoningContentDelta(_)
             | EventMsg::ReasoningRawContentDelta(_)
+            | EventMsg::RalphLoopContinue(_)
+            | EventMsg::RalphLoopStatus(_)
+            | EventMsg::RalphLoopComplete(_)
             | EventMsg::SkillsUpdateAvailable
             | EventMsg::UndoCompleted(_)
             | EventMsg::UndoStarted(_) => {}

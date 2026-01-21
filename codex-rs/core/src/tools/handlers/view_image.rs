@@ -95,12 +95,14 @@ impl ToolHandler for ViewImageHandler {
         // Build content_items for multimodal function response (Gemini 3)
         let content_items = if let Some(mime) = mime_type {
             let base64_data = base64::engine::general_purpose::STANDARD.encode(&image_data);
-            let data_url = format!("data:{};base64,{}", mime, base64_data);
+            let data_url = format!("data:{mime};base64,{base64_data}");
             Some(vec![
                 FunctionCallOutputContentItem::InputText {
                     text: format!("Image file: {} ({} KB)", abs_path.display(), file_size_kb),
                 },
-                FunctionCallOutputContentItem::InputImage { image_url: data_url },
+                FunctionCallOutputContentItem::InputImage {
+                    image_url: data_url,
+                },
             ])
         } else {
             None
@@ -411,7 +413,7 @@ mod tests {
                 assert!(msg.contains("unable to locate image"));
             }
             Ok(_) => panic!("Expected error for nonexistent file"),
-            Err(other) => panic!("Expected RespondToModel error, got {:?}", other),
+            Err(other) => panic!("Expected RespondToModel error, got {other:?}"),
         }
 
         Ok(())

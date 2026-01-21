@@ -159,15 +159,24 @@ async fn list_models_returns_all_models_with_large_limit() -> Result<()> {
             description: "Google Gemini 3 Flash preview.".to_string(),
             supported_reasoning_efforts: vec![
                 ReasoningEffortOption {
+                    reasoning_effort: ReasoningEffort::Minimal,
+                    description: "Fastest responses with minimal reasoning (Flash-exclusive)"
+                        .to_string(),
+                },
+                ReasoningEffortOption {
                     reasoning_effort: ReasoningEffort::Low,
-                    description: "Lower-cost Gemini thinking.".to_string(),
+                    description: "Lower-cost Gemini thinking".to_string(),
+                },
+                ReasoningEffortOption {
+                    reasoning_effort: ReasoningEffort::Medium,
+                    description: "Balanced reasoning depth for general tasks".to_string(),
                 },
                 ReasoningEffortOption {
                     reasoning_effort: ReasoningEffort::High,
-                    description: "Higher-quality Gemini thinking.".to_string(),
+                    description: "Higher-quality Gemini thinking for complex problems".to_string(),
                 },
             ],
-            default_reasoning_effort: ReasoningEffort::Low,
+            default_reasoning_effort: ReasoningEffort::High,
             is_default: false,
         },
         Model {
@@ -179,14 +188,18 @@ async fn list_models_returns_all_models_with_large_limit() -> Result<()> {
             supported_reasoning_efforts: vec![
                 ReasoningEffortOption {
                     reasoning_effort: ReasoningEffort::Low,
-                    description: "Lower-cost Gemini thinking.".to_string(),
+                    description: "Lower-cost Gemini thinking".to_string(),
+                },
+                ReasoningEffortOption {
+                    reasoning_effort: ReasoningEffort::Medium,
+                    description: "Balanced reasoning depth for general tasks".to_string(),
                 },
                 ReasoningEffortOption {
                     reasoning_effort: ReasoningEffort::High,
-                    description: "Higher-quality Gemini thinking.".to_string(),
+                    description: "Higher-quality Gemini thinking for complex problems".to_string(),
                 },
             ],
-            default_reasoning_effort: ReasoningEffort::Low,
+            default_reasoning_effort: ReasoningEffort::High,
             is_default: false,
         },
         Model {

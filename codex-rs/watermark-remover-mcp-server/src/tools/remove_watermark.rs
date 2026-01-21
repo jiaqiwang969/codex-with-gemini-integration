@@ -1,7 +1,10 @@
 //! Remove Watermark tool - removes watermarks from images
 
-use anyhow::{Context, Result};
-use mcp_types::{CallToolResult, ContentBlock, TextContent};
+use anyhow::Context;
+use anyhow::Result;
+use mcp_types::CallToolResult;
+use mcp_types::ContentBlock;
+use mcp_types::TextContent;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -43,7 +46,7 @@ pub async fn handle_remove_watermark(args: serde_json::Value) -> Result<CallTool
             return Ok(CallToolResult {
                 content: vec![ContentBlock::TextContent(TextContent {
                     r#type: "text".to_string(),
-                    text: format!("Error: Image file not found: {}", image_path),
+                    text: format!("Error: Image file not found: {image_path}"),
                     annotations: None,
                 })],
                 is_error: Some(true),
@@ -58,7 +61,7 @@ pub async fn handle_remove_watermark(args: serde_json::Value) -> Result<CallTool
             return Ok(CallToolResult {
                 content: vec![ContentBlock::TextContent(TextContent {
                     r#type: "text".to_string(),
-                    text: format!("Error: Directory not found: {}", image_dir),
+                    text: format!("Error: Directory not found: {image_dir}"),
                     annotations: None,
                 })],
                 is_error: Some(true),
@@ -86,7 +89,7 @@ pub async fn handle_remove_watermark(args: serde_json::Value) -> Result<CallTool
         return Ok(CallToolResult {
             content: vec![ContentBlock::TextContent(TextContent {
                 r#type: "text".to_string(),
-                text: format!("Error running remove_watermark.py: {}", stderr),
+                text: format!("Error running remove_watermark.py: {stderr}"),
                 annotations: None,
             })],
             is_error: Some(true),
@@ -99,7 +102,7 @@ pub async fn handle_remove_watermark(args: serde_json::Value) -> Result<CallTool
     Ok(CallToolResult {
         content: vec![ContentBlock::TextContent(TextContent {
             r#type: "text".to_string(),
-            text: format!("Successfully removed watermarks.\n{}", stdout),
+            text: format!("Successfully removed watermarks.\n{stdout}"),
             annotations: None,
         })],
         is_error: Some(false),
@@ -108,18 +111,18 @@ pub async fn handle_remove_watermark(args: serde_json::Value) -> Result<CallTool
 }
 
 fn get_scripts_dir() -> Result<PathBuf> {
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(parent) = exe_path.parent() {
-            let possible_paths = vec![
-                parent.join("../../../watermark-remover-mcp-server/scripts"),
-                parent.join("../../watermark-remover-mcp-server/scripts"),
-                parent.join("scripts"),
-            ];
+    if let Ok(exe_path) = std::env::current_exe()
+        && let Some(parent) = exe_path.parent()
+    {
+        let possible_paths = vec![
+            parent.join("../../../watermark-remover-mcp-server/scripts"),
+            parent.join("../../watermark-remover-mcp-server/scripts"),
+            parent.join("scripts"),
+        ];
 
-            for path in possible_paths {
-                if path.exists() {
-                    return Ok(path.canonicalize()?);
-                }
+        for path in possible_paths {
+            if path.exists() {
+                return Ok(path.canonicalize()?);
             }
         }
     }
