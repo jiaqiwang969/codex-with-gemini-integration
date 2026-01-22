@@ -161,8 +161,9 @@ fn generate_with_git_graph<P: AsRef<Path>>(repo_path: P) -> Result<Vec<Line<'sta
         compact: true,
         colored: true,
         include_remote: true,
-        // Compact commit summary similar to `--oneline`.
-        format: CommitFormat::Short,
+        // Custom format: hash, refs, subject, relative time, author
+        // %h = abbreviated hash, %d = refs, %s = subject, %ar = relative time, %an = author
+        format: CommitFormat::Format("%h%d %s (%ar) <%an>".to_string()),
         // Let our TUI pager handle wrapping.
         wrapping: None,
         characters: Characters::round(),
