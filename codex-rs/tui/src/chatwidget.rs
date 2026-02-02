@@ -1783,17 +1783,37 @@ if __name__ == "__main__":
             };
             let completion_promise = state.completion_promise.clone();
             let iteration = state.iteration;
-            let message = format!(
-                "🔄 Ralph iteration {iteration}/{max_iterations_label} | To stop: output <promise>{completion_promise}</promise> (ONLY when TRUE)",
-            );
-            self.add_to_history(history_cell::new_info_event(message, None));
+            let delay_seconds = state.delay_seconds;
 
-            // Re-inject the SAME original prompt (Ralph technique).
-            self.queued_user_messages
-                .push_front(state.original_prompt.clone().into());
-            self.refresh_queued_user_messages();
+            // Check if we need to delay before the next iteration
+            if delay_seconds > 0 {
+                let message = format!(
+                    "🔄 Ralph iteration {iteration}/{max_iterations_label} | Waiting {delay_seconds}s before next iteration... | To stop: output <promise>{completion_promise}</promise> (ONLY when TRUE)",
+                );
+                self.add_to_history(history_cell::new_info_event(message, None));
 
-            self.ralph_loop_state = Some(state);
+                // Store state and schedule delayed continuation
+                self.ralph_loop_state = Some(state);
+
+                // Schedule the delayed continuation via AppEvent
+                let app_event_tx = self.app_event_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(delay_seconds)).await;
+                    app_event_tx.send(crate::app_event::AppEvent::RalphLoopDelayedContinue);
+                });
+            } else {
+                let message = format!(
+                    "🔄 Ralph iteration {iteration}/{max_iterations_label} | To stop: output <promise>{completion_promise}</promise> (ONLY when TRUE)",
+                );
+                self.add_to_history(history_cell::new_info_event(message, None));
+
+                // Re-inject the SAME original prompt (Ralph technique).
+                self.queued_user_messages
+                    .push_front(state.original_prompt.clone().into());
+                self.refresh_queued_user_messages();
+
+                self.ralph_loop_state = Some(state);
+            }
             return;
         }
 
@@ -4995,7 +5015,12 @@ if __name__ == "__main__":
             return;
         };
 
-        let state = RalphLoopState::new(prompt.clone(), cmd.max_iterations, cmd.completion_promise);
+        let state = RalphLoopState::new_with_delay(
+            prompt.clone(),
+            cmd.max_iterations,
+            cmd.completion_promise,
+            cmd.delay_seconds,
+        );
         self.ralph_loop_state = Some(state.clone());
 
         if let Err(err) = save_ralph_state_file(&self.config.cwd, &state) {
@@ -5007,6 +5032,11 @@ if __name__ == "__main__":
         } else {
             state.max_iterations.to_string()
         };
+        let delay_label = if state.delay_seconds > 0 {
+            format!("{}s", state.delay_seconds)
+        } else {
+            "none".to_string()
+        };
         let truncated = truncate_string(&prompt, 100);
         let status = format!(
             "🔄 Ralph Loop activated!\n\
@@ -5014,6 +5044,7 @@ if __name__ == "__main__":
              Iteration: 1\n\
              Max iterations: {max_iterations_label}\n\
              Completion promise: <promise>{completion_promise}</promise>\n\
+             Delay between iterations: {delay_label}\n\
              \n\
              To stop: output <promise>{completion_promise}</promise> (ONLY when TRUE)\n\
              To cancel: /cancel-ralph\n\
@@ -5050,6 +5081,22 @@ if __name__ == "__main__":
             iterations = state.iteration,
         );
         self.add_to_history(history_cell::new_info_event(msg, None));
+        self.request_redraw();
+    }
+
+    /// Handle the delayed continuation of Ralph Loop after the configured delay.
+    pub(crate) fn handle_ralph_loop_delayed_continue(&mut self) {
+        let Some(state) = self.ralph_loop_state.as_ref() else {
+            // Ralph loop was cancelled during the delay
+            return;
+        };
+
+        let prompt = state.original_prompt.clone();
+
+        // Re-inject the SAME original prompt (Ralph technique).
+        self.queued_user_messages.push_front(prompt.into());
+        self.refresh_queued_user_messages();
+        self.maybe_send_next_queued_input();
         self.request_redraw();
     }
 
@@ -5720,16 +5767,24 @@ async fn fetch_rate_limits(base_url: String, auth: CodexAuth) -> Option<RateLimi
 fn ralph_loop_help_text() -> &'static str {
     "🔄 **Ralph Loop** - 迭代式自我修正循环\n\n\
      **用法：**\n\
-     • `/ralph-loop \"<PROMPT>\" -n <max-iterations> -c \"<PROMISE>\"`\n\
+     • `/ralph-loop \"<PROMPT>\" -n <max-iterations> -c \"<PROMISE>\" -d <delay-seconds>`\n\
      • `/cancel-ralph`\n\n\
+     **参数：**\n\
+     • `-n, --max-iterations <num>` - 最大迭代次数（默认: 50，0 表示无限）\n\
+     • `-c, --completion-promise <str>` - 完成信号（默认: \"COMPLETE\"）\n\
+     • `-d, --delay <seconds>` - 每轮迭代前的延迟秒数（默认: 0）\n\
+     • `-p, --prompt <text>` - 要重复的提示词\n\n\
      **示例：**\n\
-     • `/ralph-loop \"Fix all tests. Output <promise>DONE</promise> when ALL tests pass.\" -n 30 -c DONE`\n\n\
+     • `/ralph-loop \"Fix all tests. Output <promise>DONE</promise> when ALL tests pass.\" -n 30 -c DONE`\n\
+     • `/ralph-loop \"Build API\" -n 20 -d 300` - 每轮迭代前等待 5 分钟\n\n\
      **工作方式：**\n\
      1. 运行一次 `/ralph-loop ...`\n\
      2. 每次任务完成后，如果没有检测到 `<promise>...</promise>`，会把 *同一条原始 prompt* 重新提交\n\
-     3. 直到输出的 `<promise>TEXT</promise>` 里的 `TEXT` 与 `-c/--completion-promise` **完全匹配** 才停止\n\n\
+     3. 如果设置了 `-d` 延迟，会在下一轮迭代前等待指定秒数\n\
+     4. 直到输出的 `<promise>TEXT</promise>` 里的 `TEXT` 与 `-c/--completion-promise` **完全匹配** 才停止\n\n\
      **注意：**\n\
      • `-n 0` 表示无限循环（推荐始终设置一个上限避免卡死）\n\
+     • `-d` 延迟适用于需要时间解决问题的场景（如等待外部修复）\n\
      • completion-promise 是精确匹配（会做空白归一化），不要用多个不同承诺值\n"
 }
 
@@ -5762,6 +5817,7 @@ active: true
 iteration: {iteration}
 max_iterations: {max_iterations}
 completion_promise: {completion_promise}
+delay_seconds: {delay_seconds}
 started_at: {started_at}
 ---
 
@@ -5770,6 +5826,7 @@ started_at: {started_at}
         iteration = state.iteration,
         max_iterations = state.max_iterations,
         completion_promise = state.completion_promise.as_str(),
+        delay_seconds = state.delay_seconds,
         started_at = state.started_at.as_str(),
         original_prompt = state.original_prompt.as_str(),
     )

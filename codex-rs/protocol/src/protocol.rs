@@ -2061,6 +2061,10 @@ pub struct RalphLoopState {
 
     /// History of iteration results
     pub iteration_history: Vec<IterationRecord>,
+
+    /// Delay in seconds before starting next iteration (default: 0)
+    #[serde(default)]
+    pub delay_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS)]
@@ -2082,6 +2086,25 @@ impl RalphLoopState {
             original_prompt: prompt,
             started_at: chrono::Utc::now().to_rfc3339(),
             iteration_history: Vec::new(),
+            delay_seconds: 0,
+        }
+    }
+
+    pub fn new_with_delay(
+        prompt: String,
+        max_iterations: u32,
+        completion_promise: String,
+        delay_seconds: u64,
+    ) -> Self {
+        Self {
+            enabled: true,
+            iteration: 1,
+            max_iterations,
+            completion_promise,
+            original_prompt: prompt,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            iteration_history: Vec::new(),
+            delay_seconds,
         }
     }
 

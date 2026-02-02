@@ -33,6 +33,10 @@ pub struct RalphLoopCommand {
     /// Optional: specific prompt to repeat
     /// If None, use the last user message
     pub prompt: Option<String>,
+
+    /// Delay in seconds before starting next iteration (default: 0)
+    /// Useful when errors occur and need time to be resolved
+    pub delay_seconds: u64,
 }
 
 impl Default for RalphLoopCommand {
@@ -41,6 +45,7 @@ impl Default for RalphLoopCommand {
             max_iterations: 50,
             completion_promise: "COMPLETE".to_string(),
             prompt: None,
+            delay_seconds: 0,
         }
     }
 }
@@ -90,6 +95,7 @@ fn parse_ralph_loop_args(args: &[String]) -> Result<RalphLoopCommand> {
     let mut max_iterations = 50;
     let mut completion_promise = "COMPLETE".to_string();
     let mut prompt = None;
+    let mut delay_seconds = 0u64;
     let mut positional_prompt_parts: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -113,6 +119,18 @@ fn parse_ralph_loop_args(args: &[String]) -> Result<RalphLoopCommand> {
                     completion_promise = args[i].clone();
                 } else {
                     return Err(anyhow!("--completion-promise requires a value"));
+                }
+            }
+
+            "--delay" | "-d" => {
+                i += 1;
+                if i < args.len() {
+                    let value = args[i].as_str();
+                    delay_seconds = value
+                        .parse()
+                        .map_err(|_| anyhow!("Invalid delay value: {value}"))?;
+                } else {
+                    return Err(anyhow!("--delay requires a value"));
                 }
             }
 
@@ -174,13 +192,14 @@ fn parse_ralph_loop_args(args: &[String]) -> Result<RalphLoopCommand> {
         max_iterations,
         completion_promise,
         prompt,
+        delay_seconds,
     })
 }
 
 fn is_ralph_loop_option(token: &str) -> bool {
     matches!(
         token,
-        "--max-iterations" | "-n" | "--completion-promise" | "-c" | "--prompt" | "-p"
+        "--max-iterations" | "-n" | "--completion-promise" | "-c" | "--prompt" | "-p" | "--delay" | "-d"
     )
 }
 
@@ -282,5 +301,55 @@ mod tests {
     fn test_parse_not_slash_command() {
         let result = SlashCommand::parse("regular message");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_ralph_loop_with_delay() {
+        let cmd = SlashCommand::parse("/ralph-loop --delay 300").unwrap();
+        match cmd {
+            SlashCommand::RalphLoop(ralph) => {
+                assert_eq!(ralph.delay_seconds, 300);
+                assert_eq!(ralph.max_iterations, 50); // default
+            }
+            _ => panic!("Expected RalphLoop command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ralph_loop_with_delay_short() {
+        let cmd = SlashCommand::parse("/ralph-loop -d 60 -n 20").unwrap();
+        match cmd {
+            SlashCommand::RalphLoop(ralph) => {
+                assert_eq!(ralph.delay_seconds, 60);
+                assert_eq!(ralph.max_iterations, 20);
+            }
+            _ => panic!("Expected RalphLoop command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ralph_loop_with_all_options() {
+        let cmd =
+            SlashCommand::parse("/ralph-loop \"Build API\" -n 30 -c DONE -d 300").unwrap();
+        match cmd {
+            SlashCommand::RalphLoop(ralph) => {
+                assert_eq!(ralph.prompt, Some("Build API".to_string()));
+                assert_eq!(ralph.max_iterations, 30);
+                assert_eq!(ralph.completion_promise, "DONE");
+                assert_eq!(ralph.delay_seconds, 300);
+            }
+            _ => panic!("Expected RalphLoop command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ralph_loop_default_delay() {
+        let cmd = SlashCommand::parse("/ralph-loop -n 10").unwrap();
+        match cmd {
+            SlashCommand::RalphLoop(ralph) => {
+                assert_eq!(ralph.delay_seconds, 0); // default is 0
+            }
+            _ => panic!("Expected RalphLoop command"),
+        }
     }
 }

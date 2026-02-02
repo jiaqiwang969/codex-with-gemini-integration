@@ -237,6 +237,9 @@ pub(crate) enum AppEvent {
         session_id: String,
         alias: String,
     },
+
+    /// Trigger the next Ralph Loop iteration after a delay.
+    RalphLoopDelayedContinue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

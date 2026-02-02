@@ -1388,6 +1388,9 @@ impl App {
             AppEvent::InsertUserTextMessage(text) => {
                 self.chat_widget.submit_text_message(text);
             }
+            AppEvent::RalphLoopDelayedContinue => {
+                self.chat_widget.handle_ralph_loop_delayed_continue();
+            }
             AppEvent::OpenReviewBranchPicker(cwd) => {
                 self.chat_widget.show_review_branch_picker(&cwd).await;
             }
