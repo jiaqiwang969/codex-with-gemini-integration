@@ -357,6 +357,8 @@ pub(crate) struct ChatWidget {
     last_user_message: Option<String>,
     // Active Ralph loop state (if enabled via `/ralph-loop`).
     ralph_loop_state: Option<RalphLoopState>,
+    // Track if current turn had errors (for ralph loop delay logic)
+    ralph_loop_turn_had_error: bool,
     // Pending notification to show when unfocused on next Draw
     pending_notification: Option<Notification>,
     // Simple review mode flag; used to adjust layout and banners.
@@ -1723,6 +1725,8 @@ if __name__ == "__main__":
         self.set_status_header(String::from("Working"));
         self.full_reasoning_buffer.clear();
         self.reasoning_buffer.clear();
+        // Reset error flag at the start of each turn
+        self.ralph_loop_turn_had_error = false;
         self.request_redraw();
     }
 
@@ -1770,7 +1774,9 @@ if __name__ == "__main__":
         let max_reached = state.max_iterations > 0 && state.iteration >= state.max_iterations;
 
         if !completion_detected && !max_reached {
-            state.next_iteration(truncate_string(last_agent_message, 200), false);
+            // Check if this turn had errors
+            let had_errors = self.ralph_loop_turn_had_error;
+            state.next_iteration(truncate_string(last_agent_message, 200), had_errors);
 
             if let Err(err) = save_ralph_state_file(&self.config.cwd, &state) {
                 tracing::warn!("failed to save ralph state file: {err}");
@@ -1785,10 +1791,10 @@ if __name__ == "__main__":
             let iteration = state.iteration;
             let delay_seconds = state.delay_seconds;
 
-            // Check if we need to delay before the next iteration
-            if delay_seconds > 0 {
+            // Only delay if there was an error in this turn
+            if had_errors && delay_seconds > 0 {
                 let message = format!(
-                    "🔄 Ralph iteration {iteration}/{max_iterations_label} | Waiting {delay_seconds}s before next iteration... | To stop: output <promise>{completion_promise}</promise> (ONLY when TRUE)",
+                    "🔄 Ralph iteration {iteration}/{max_iterations_label} | ⚠️ Error detected, waiting {delay_seconds}s before retry... | To stop: output <promise>{completion_promise}</promise> (ONLY when TRUE)",
                 );
                 self.add_to_history(history_cell::new_info_event(message, None));
 
@@ -1969,6 +1975,9 @@ if __name__ == "__main__":
         self.finalize_turn();
         self.add_to_history(history_cell::new_error_event(message));
         self.request_redraw();
+
+        // Mark that this turn had an error (for ralph loop delay logic)
+        self.ralph_loop_turn_had_error = true;
 
         // After an error ends the turn, try sending the next queued input.
         self.maybe_send_next_queued_input();
@@ -2684,6 +2693,7 @@ if __name__ == "__main__":
             queued_turn_pending_start: false,
             last_user_message: None,
             ralph_loop_state: None,
+            ralph_loop_turn_had_error: false,
             show_welcome_banner: is_first_run,
             suppress_session_configured_redraw: false,
             pending_notification: None,
@@ -2792,6 +2802,7 @@ if __name__ == "__main__":
             queued_turn_pending_start: false,
             last_user_message: None,
             ralph_loop_state: None,
+            ralph_loop_turn_had_error: false,
             show_welcome_banner: false,
             suppress_session_configured_redraw: true,
             pending_notification: None,
