@@ -45,7 +45,7 @@ impl Default for RalphLoopCommand {
             max_iterations: 50,
             completion_promise: "COMPLETE".to_string(),
             prompt: None,
-            delay_seconds: 0,
+            delay_seconds: 300, // 默认 5 分钟
         }
     }
 }
@@ -95,7 +95,7 @@ fn parse_ralph_loop_args(args: &[String]) -> Result<RalphLoopCommand> {
     let mut max_iterations = 50;
     let mut completion_promise = "COMPLETE".to_string();
     let mut prompt = None;
-    let mut delay_seconds = 0u64;
+    let mut delay_seconds = 300u64; // 默认 5 分钟
     let mut positional_prompt_parts: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -347,7 +347,7 @@ mod tests {
         let cmd = SlashCommand::parse("/ralph-loop -n 10").unwrap();
         match cmd {
             SlashCommand::RalphLoop(ralph) => {
-                assert_eq!(ralph.delay_seconds, 0); // default is 0
+                assert_eq!(ralph.delay_seconds, 300); // default is 300s (5 min)
             }
             _ => panic!("Expected RalphLoop command"),
         }
